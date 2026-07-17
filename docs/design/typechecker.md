@@ -205,10 +205,32 @@ branches, arms, arguments and elements.
 ### 10. Narrowing
 
 `match s { is Circle => ... }` refines `s` to `Circle` inside the arm; `if p != null` does
-the same for the else branch. Narrowing is a separate pass over patterns and conditions,
-and it is a *set* operation — the arm's binding is `s ∧ Circle`, the fallthrough is
-`s ∧ ¬Circle`. This is where the set-theoretic representation pays for itself, and where
-exhaustiveness falls out: the match is exhaustive iff `s ∧ ¬(⋁ arms)` is empty.
+the same for the else branch. Narrowing is a *set* operation — the arm's binding is
+`s ∧ Circle`, the fallthrough is `s ∧ ¬Circle`. It is a set of queries the checker makes
+inline, not a pass of its own.
+
+Exhaustiveness falls out: the match covers `s` iff `s ∧ ¬(⋁ arms)` is empty, and the
+residual of that subtraction is a *type* naming exactly what was missed. Redundancy is the
+same query — an arm is redundant iff `arm ∧ s ∧ ¬(⋁ earlier)` is empty, which catches both
+"an earlier arm already took it" and "the subject was never that", because those are one
+fact.
+
+**The union is over the *exact* arms only, and getting this wrong makes the check
+worthless.** An arm is exact when matching it proves the value is *every* value of its
+type: `is T`, `:ok`, `null`, `_`. A literal is not. `match n { 1 => ... }` has an arm of
+type `i64`, but it matches one `i64` — count it as covering `i64` and the match reports
+exhaustive with every other integer unhandled. So an inexact arm contributes `never` to
+coverage and subtracts nothing from the fallthrough. A **guard** makes any arm inexact, for
+the same reason: it can always decline.
+
+Atoms and `null` are exact because they are genuine singletons. That is the same property
+that makes `:ok | :err` exhaustiveness work at all, and it is why `decisions.md` refuses to
+widen an atom to its carrier type.
+
+**An empty branch is a diagnostic, never silently-dead code** — see the rigid-variable
+section below for why that is a soundness rule and not a nicety. `narrow.rs` enforces it by
+construction: a refinement's branches are unreadable except through `classify`, which hands
+back `ThenImpossible` / `ElseImpossible` rather than an empty type a caller could bind.
 
 ### 11. Protocols and dispatch
 
