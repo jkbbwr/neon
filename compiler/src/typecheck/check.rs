@@ -384,13 +384,59 @@ impl Checker<'_> {
 
             ExprKind::Error => self.poison(),
 
+            ExprKind::Lambda { params, body } => self.lambda(module, e, params, body, expected),
+
             // Not yet: each needs something that does not exist. A guess here is
             // exactly the fallback this design has no room for.
-            ExprKind::Index { .. }
-            | ExprKind::RecordLit { .. }
-            | ExprKind::Lambda { .. }
-            | ExprKind::Try { .. } => expected.unwrap_or_else(|| self.poison()),
+            ExprKind::Index { .. } | ExprKind::RecordLit { .. } | ExprKind::Try { .. } => {
+                expected.unwrap_or_else(|| self.poison())
+            }
         }
+    }
+
+    /// A lambda, in checking mode. Its parameter types come from their annotations,
+    /// or from the expected arrow flowing in — `map(xs, (x) => x + 1)` gets `x: i64`
+    /// from `map`'s parameter. A parameter with neither is an error, not a guess:
+    /// inferring it from a later use, or from the body, is unification, which this
+    /// bidirectional checker does not do. See `decisions.md` on Castagna.
+    fn lambda(
+        &mut self,
+        module: &[String],
+        e: &Expr,
+        params: &[ast::LambdaParam],
+        body: &Expr,
+        expected: Option<TyId>,
+    ) -> TyId {
+        let scope = Scope::new(module);
+        let want = expected.and_then(|t| self.env.solver.t.as_arrow(t));
+
+        self.locals.push(vec![]);
+        let mut param_tys = Vec::with_capacity(params.len());
+        for (i, p) in params.iter().enumerate() {
+            let t = match (&p.ty, want.as_ref().and_then(|a| a.params.get(i))) {
+                (Some(spec), _) => self.env.resolve(&scope, spec),
+                (None, Some(&pt)) => pt,
+                (None, None) => {
+                    self.error(e.span.clone(), TypeErrorKind::LambdaParamNeedsType(p.name.clone()));
+                    self.poison()
+                }
+            };
+            self.bind(&p.name, t);
+            param_tys.push(t);
+        }
+
+        // A lambda has no `throws` clause, so it cannot throw. Check its body in a
+        // context that says so, and restore the enclosing one after.
+        let want_ret = want.as_ref().map(|a| a.ret);
+        let never = self.env.solver.t.never();
+        let saved = self.throws.replace(never);
+        let ret = self.expr(module, body, want_ret);
+        self.throws = saved;
+        self.locals.pop();
+
+        let arrow = self.env.solver.t.arrow(param_tys, never, ret);
+        self.result.set_lambda(e.id, arrow);
+        arrow
     }
 
     fn path(&mut self, module: &[String], e: &Expr, p: &[String]) -> TyId {

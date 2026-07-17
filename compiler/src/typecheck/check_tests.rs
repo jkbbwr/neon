@@ -403,3 +403,57 @@ fn a_local_shadows_a_module_fn_when_called() {
          fn f(g: (i64) -> i64) -> i64 { g(1) }",
     );
 }
+
+// ---- lambdas: checking mode ----
+
+#[test]
+fn a_lambda_argument_infers_its_param_from_the_callee() {
+    clean(
+        "fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }
+         fn f() -> i64 { apply_it((x) => x + 1, 5) }",
+    );
+}
+
+#[test]
+fn a_lambda_body_is_checked_against_the_expected_return() {
+    // Expected `(i64) -> i64`, but the body is a str.
+    mismatch(
+        r#"fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }
+           fn f() -> i64 { apply_it((x) => "s", 5) }"#,
+    );
+}
+
+#[test]
+fn a_lambda_param_takes_the_expected_type_not_a_narrower_one() {
+    // Expected `(i64|str) -> str`, so `x: i64|str` inside — a str body is fine.
+    clean(
+        r#"fn g(f: (i64 | str) -> str) -> str { f(1) }
+           fn f() -> str { g((x) => "hi") }"#,
+    );
+}
+
+#[test]
+fn a_lambda_bound_with_an_annotation_checks() {
+    clean("fn f() -> i64 { let a: (i64) -> i64 = (x) => x + 1; a(33) }");
+}
+
+#[test]
+fn a_lambda_param_annotation_lets_it_synthesize() {
+    clean("fn f() -> i64 { let a = (x: i64) => x + 1; a(33) }");
+}
+
+#[test]
+fn a_lambda_param_with_no_type_and_no_context_is_an_error() {
+    // The example this design deliberately does not infer: a bare binding with no
+    // annotation, disambiguated only by a later use. That is unification.
+    let e = check("fn f() -> i64 { let a = (x) => x + 1; a(33) }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::LambdaParamNeedsType(_))), "{e:?}");
+}
+
+#[test]
+fn a_lambda_of_the_wrong_arity_is_rejected() {
+    mismatch(
+        "fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }
+         fn f() -> i64 { apply_it((a, b) => a, 5) }",
+    );
+}

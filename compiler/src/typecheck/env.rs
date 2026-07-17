@@ -74,6 +74,8 @@ pub enum TypeErrorKind {
     NoField { field: String, on: String },
     /// A call whose callee is not a function.
     NotCallable { what: String, ty: String },
+    /// A lambda parameter with no annotation and no expected type to infer it from.
+    LambdaParamNeedsType(String),
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
     /// TYPE nothing declares — `unknown type println` is not a sentence.
     UnknownName(String),
@@ -165,6 +167,12 @@ impl fmt::Display for TypeError {
             TypeErrorKind::NotCallable { what, ty } => {
                 write!(f, "{what} is a `{ty}`, which is not a function and cannot be called")
             }
+            TypeErrorKind::LambdaParamNeedsType(n) => write!(
+                f,
+                "the type of `{n}` cannot be inferred here; annotate it, as `({n}: T)`. \
+                 Inferring a lambda parameter from how the lambda is later used is not \
+                 supported"
+            ),
             TypeErrorKind::OrphanInLibrary(n) => write!(
                 f,
                 "`orphan impl {n}` may only appear in the root application: a library \
