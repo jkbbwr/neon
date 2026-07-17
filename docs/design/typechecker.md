@@ -297,8 +297,10 @@ it is checked *against*, which is also what makes `[[1.0], ["a"]] : Json` work a
 - **The expansion of nominal-to-structural interacts with `opaque` and with contractivity**
   — the same nominal is a data constructor in its own module and an atom outside. Emptiness
   queries are therefore module-relative, which is unusual and easy to forget.
-- **Protocol dispatch is unspecified here** and is the biggest remaining hole. It is also
-  where the previous implementation's `resolved_calls` was last-write-wins.
+- **Protocol dispatch** is specified in `dispatch.md`. It leans on emptiness harder than
+  anything else here — every candidate impl is an `S ∧ target ≠ ∅` query — and bounded-impl
+  discharge adds a *second* coinductive fixpoint alongside the one in `empty.rs`. Two
+  interacting assumption stacks is the subtlest thing in the checker.
 - **Covariance plus `expected` propagation may hide inference gaps.** Covariance makes many
   checks succeed that invariance would have rejected, so a missing `expected` thread shows
   up later and further away than it otherwise would.
