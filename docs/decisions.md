@@ -105,10 +105,23 @@ diagnostic when it appears as a declaration, because people will type it.
 - **"A Color and nothing narrower" is inexpressible.** A bare `Red` is accepted where
   `Color` is expected (`Red <: Red | Green` — correct set-theoretically).
 
-### Type erasure only where the user wrote `any`
+### `any` is ⊤, and there is no such thing as an erased type
 
-`any` is the one legitimate erasure boundary. Anywhere else a type cannot be pinned, that
-is a diagnostic — never a silent fallback.
+`any` is the type inhabited by every value — the top type. It is **not** a marker for "the
+checker could not work it out", and the type language cannot express that idea at all.
+
+This is structural rather than a rule to remember: the checker's type representation has no
+erased variant, so there is nothing to fall back *to*. Where a type cannot be determined,
+the checker emits a diagnostic; it does not return a type, because no type means "unknown".
+
+Erasure is a **lowering** concern. A value of type ⊤ needs a uniform runtime
+representation — that is a consequence of ⊤, not its meaning, and it is decided in codegen.
+
+*Against conflating them* (`any` → an `Erased` type, as a prior implementation did): once
+"the top type" and "I could not work it out" are the same value, every unknown silently
+becomes `any`, and nothing distinguishes a deliberate `any` from a failure. In that
+implementation roughly 70 of ~108 erased types were fallbacks rather than decisions, and
+the consequences ran all the way to a stack-buffer-overflow on every `list::new()`.
 
 ---
 
