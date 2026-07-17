@@ -1,71 +1,84 @@
-use color_eyre::eyre::{bail, Context, Result};
-use std::path::PathBuf;
+mod sysroot;
 
-/// Locates `include/`, `lib/libneon_rt.a` and `stdlib/`.
-///
-/// Resolved at runtime, never baked in: a compile-time path describes the
-/// machine that built the compiler, not the one running it.
-pub struct Sysroot(PathBuf);
+use clap::{Parser, Subcommand};
+use color_eyre::eyre::{Context, Result};
+use neon_compiler::lexer;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use sysroot::Sysroot;
 
-impl Sysroot {
-    fn probe(dir: PathBuf) -> Option<Self> {
-        dir.join("lib/libneon_rt.a").is_file().then_some(Sysroot(dir))
-    }
+#[derive(Parser)]
+#[command(name = "neon", version, about = "The Neon toolchain")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    pub fn find() -> Result<Self> {
-        if let Some(dir) = std::env::var_os("NEON_SYSROOT") {
-            let dir = PathBuf::from(dir);
-            return Self::probe(dir.clone()).ok_or_else(|| {
-                eyre::eyre!("no lib/libneon_rt.a under '{}'", dir.display())
-                    .wrap_err("NEON_SYSROOT does not point at a Neon sysroot")
-            });
-        }
+#[derive(Subcommand)]
+enum Command {
+    /// Lex a source file and print its tokens.
+    Lex {
+        /// OsString, not PathBuf-from-String: a path need not be UTF-8, and
+        /// rejecting one at the arg parser is a worse error than failing to
+        /// open it.
+        file: OsString,
+        /// Print byte spans alongside each token.
+        #[arg(long)]
+        spans: bool,
+    },
+    /// Print the resolved sysroot.
+    Sysroot,
+}
 
-        let exe = std::env::current_exe().wrap_err("cannot locate the neon binary")?;
-        let exe_dir = exe
-            .parent()
-            .ok_or_else(|| eyre::eyre!("the neon binary has no parent directory"))?;
+fn read_source(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("cannot read '{}'", path.display()))
+}
 
-        // exe_dir: dev (target/<profile>). exe_dir/..: installed (prefix/bin).
-        let candidates = [exe_dir.to_path_buf(), exe_dir.join("..")];
-        for dir in &candidates {
-            if let Some(found) = Self::probe(dir.clone()) {
-                return Ok(found);
+fn cmd_lex(file: &OsString, spans: bool) -> Result<()> {
+    let path = PathBuf::from(file);
+    let src = read_source(&path)?;
+
+    match lexer::lex(&src) {
+        Ok(tokens) => {
+            for t in tokens {
+                if spans {
+                    println!("{:>5}..{:<5} {:?}", t.span.start, t.span.end, t.token);
+                } else {
+                    println!("{:?}", t.token);
+                }
             }
+            Ok(())
         }
-
-        bail!(
-            "cannot find the Neon sysroot: no lib/libneon_rt.a under {}.\n\
-             Set NEON_SYSROOT to override.",
-            candidates
-                .iter()
-                .map(|p| format!("'{}'", p.display()))
-                .collect::<Vec<_>>()
-                .join(" or ")
-        )
+        Err(errors) => {
+            // Every error, not just the first: the lexer accumulates so a
+            // diagnostics pass can show them all.
+            for e in &errors {
+                eprintln!("{}:{}: error: {}", path.display(), line_of(&src, e.span.start), e);
+            }
+            std::process::exit(1);
+        }
     }
+}
 
-    pub fn include(&self) -> PathBuf {
-        self.0.join("include")
-    }
+/// 1-based line number for a byte offset. Placeholder until diagnostics land.
+fn line_of(src: &str, offset: usize) -> usize {
+    src[..offset.min(src.len())].bytes().filter(|b| *b == b'\n').count() + 1
+}
 
-    pub fn runtime_lib(&self) -> PathBuf {
-        self.0.join("lib/libneon_rt.a")
-    }
-
-    pub fn stdlib(&self) -> PathBuf {
-        self.0.join("stdlib")
-    }
+fn cmd_sysroot() -> Result<()> {
+    let s = Sysroot::find().wrap_err("failed to locate the toolchain")?;
+    println!("{}", s.root().display());
+    println!("  include: {}", s.include().display());
+    println!("  runtime: {}", s.runtime_lib().display());
+    println!("  stdlib:  {}", s.stdlib().display());
+    Ok(())
 }
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-
-    let sysroot = Sysroot::find().wrap_err("failed to set up the toolchain")?;
-    println!("neon {}", neon_compiler::version());
-    println!("sysroot: {}", sysroot.0.display());
-    println!("  include: {}", sysroot.include().display());
-    println!("  runtime: {}", sysroot.runtime_lib().display());
-    println!("  stdlib:  {}", sysroot.stdlib().display());
-    Ok(())
+    match Cli::parse().command {
+        Command::Lex { file, spans } => cmd_lex(&file, spans),
+        Command::Sysroot => cmd_sysroot(),
+    }
 }

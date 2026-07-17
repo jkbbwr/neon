@@ -188,6 +188,26 @@ fn unterminated_interpolation_and_string() {
 }
 
 #[test]
+fn a_missing_close_brace_blames_the_interpolation() {
+    // `"value: #{n"` — the closing quote is consumed as the OPENING quote of a
+    // string inside the hole, so the stack ends [Code, Str, Interp, Str] and the
+    // innermost failure is that inner string. The actual mistake is the missing
+    // `}`, so an unclosed interpolation outranks a string.
+    let e = lex(r#"("value: #{n")"#).expect_err("fails");
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].kind, LexErrorKind::UnterminatedInterp);
+    // And it points at the `#{`, not at EOF.
+    assert_eq!(e[0].span, 9..11);
+}
+
+#[test]
+fn unterminated_string_points_at_its_opening_quote() {
+    let e = lex(r#"let s = "abc"#).expect_err("fails");
+    assert_eq!(e[0].kind, LexErrorKind::UnterminatedString);
+    assert_eq!(e[0].span, 8..9);
+}
+
+#[test]
 fn string_escapes() {
     assert_eq!(toks(r#""\n\t\\\"\x41\u{1F600}""#), vec![
         Token::StrStart,
@@ -298,6 +318,26 @@ fn unicode_that_cannot_start_an_identifier() {
     // An emoji is XID_Continue-less and XID_Start-less: not an identifier, and
     // not punctuation either.
     assert_eq!(errs("let 🦀 = 1"), vec![LexErrorKind::UnexpectedChar('🦀')]);
+}
+
+#[test]
+fn identifiers_are_nfc_normalized() {
+    // Composed U+00E9 and decomposed `e` + U+0301 render identically. Without
+    // normalization they are different identifiers, which is a way to smuggle a
+    // second definition past a reader.
+    let composed = "caf\u{e9}";
+    let decomposed = "cafe\u{301}";
+    assert_ne!(composed, decomposed, "the test inputs must differ as bytes");
+    assert_eq!(toks(composed), toks(decomposed));
+    assert_eq!(toks(decomposed), vec![Token::Ident(composed.into())]);
+    // Atoms too — they share the identifier rules.
+    assert_eq!(toks(":cafe\u{301}"), vec![Token::Atom(composed.into())]);
+}
+
+#[test]
+fn nfc_does_not_disturb_ascii() {
+    // The fast path: ASCII words skip normalization entirely.
+    assert_eq!(toks("hello_world2"), vec![Token::Ident("hello_world2".into())]);
 }
 
 #[test]

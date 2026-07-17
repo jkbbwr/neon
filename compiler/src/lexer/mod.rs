@@ -7,15 +7,20 @@ mod tests;
 pub use error::{LexError, LexErrorKind};
 pub use token::{Span, Spanned, Token};
 
+use unicode_normalization::UnicodeNormalization;
+
 /// Where the lexer is. Interpolation nests — `"a #{f("b")} c"` puts a string
 /// inside a hole inside a string — so this is a stack, not a flag.
+///
+/// Each mode remembers where it was opened, so an unterminated construct can
+/// point at its opener rather than at EOF.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
     Code,
-    Str,
+    Str { open: usize },
     /// Inside `#{ ... }`, counting braces so a record literal in a hole
     /// (`#{Point { x: 1 }}`) finds its own `}` before the hole's.
-    Interp { depth: usize },
+    Interp { open: usize, depth: usize },
 }
 
 pub fn lex(source: &str) -> Result<Vec<Spanned>, Vec<LexError>> {
@@ -54,21 +59,41 @@ impl<'a> Lexer<'a> {
         while self.pos < self.src.len() {
             match self.mode() {
                 Mode::Code | Mode::Interp { .. } => self.code_token(),
-                Mode::Str => self.string_body(),
+                Mode::Str { .. } => self.string_body(),
             }
         }
 
-        // Anything still open at EOF was never closed.
-        match self.mode() {
-            Mode::Str => self.err_here(LexErrorKind::UnterminatedString),
-            Mode::Interp { .. } => self.err_here(LexErrorKind::UnterminatedInterp),
-            Mode::Code => {}
-        }
+        self.report_unclosed();
 
         if self.errors.is_empty() {
             Ok(self.out)
         } else {
             Err(self.errors)
+        }
+    }
+
+    /// Report whatever was still open at EOF, blaming the right thing.
+    ///
+    /// `"value: #{n"` leaves the stack as [Code, Str, Interp, Str]: the closing
+    /// quote was consumed as the *opening* quote of a string inside the hole.
+    /// The innermost failure is that inner string, but the actual mistake is the
+    /// missing `}` — so an unclosed interpolation anywhere outranks a string,
+    /// and we point at its `#{` rather than at EOF.
+    fn report_unclosed(&mut self) {
+        let interp = self.modes.iter().find_map(|m| match m {
+            Mode::Interp { open, .. } => Some(*open),
+            _ => None,
+        });
+        if let Some(open) = interp {
+            self.err(LexErrorKind::UnterminatedInterp, open..open + 2);
+            return;
+        }
+        let string = self.modes.iter().find_map(|m| match m {
+            Mode::Str { open } => Some(*open),
+            _ => None,
+        });
+        if let Some(open) = string {
+            self.err(LexErrorKind::UnterminatedString, open..open + 1);
         }
     }
 
@@ -109,11 +134,6 @@ impl<'a> Lexer<'a> {
         self.errors.push(LexError::new(kind, span));
     }
 
-    fn err_here(&mut self, kind: LexErrorKind) {
-        let span = self.pos..self.pos;
-        self.err(kind, span);
-    }
-
     // ---- code mode ----
 
     fn code_token(&mut self) {
@@ -128,7 +148,7 @@ impl<'a> Lexer<'a> {
             b'"' => {
                 self.pos += 1;
                 self.push(Token::StrStart, start);
-                self.modes.push(Mode::Str);
+                self.modes.push(Mode::Str { open: start });
             }
             b'\'' => self.rune(start),
             b'0'..=b'9' => self.number(start),
@@ -220,8 +240,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The identifier at `pos`, normalized to NFC.
+    ///
+    /// Without normalization `café` (U+00E9) and `café` (`e` + U+0301) are
+    /// different identifiers that render identically — a supply-chain hazard,
+    /// not a curiosity. NFC is skipped entirely for pure-ASCII words, which is
+    /// almost all of them and cannot need it.
     fn take_ident_text(&mut self) -> String {
         let start = self.pos;
+        let mut ascii_only = true;
         loop {
             match self.peek() {
                 // ASCII is the overwhelming majority; keep it a byte compare.
@@ -233,13 +260,21 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(_) => match self.peek_char() {
-                    Some(c) if unicode_ident::is_xid_continue(c) => self.pos += c.len_utf8(),
+                    Some(c) if unicode_ident::is_xid_continue(c) => {
+                        self.pos += c.len_utf8();
+                        ascii_only = false;
+                    }
                     _ => break,
                 },
                 None => break,
             }
         }
-        self.text[start..self.pos].to_string()
+        let raw = &self.text[start..self.pos];
+        if ascii_only {
+            raw.to_string()
+        } else {
+            raw.nfc().collect()
+        }
     }
 
     /// A non-ASCII character that cannot start an identifier.
@@ -330,21 +365,21 @@ impl<'a> Lexer<'a> {
             b'[' => Token::LBracket,
             b']' => Token::RBracket,
             b'{' => {
-                if let Mode::Interp { depth } = self.mode() {
-                    *self.modes.last_mut().expect("mode") = Mode::Interp { depth: depth + 1 };
+                if let Mode::Interp { open, depth } = self.mode() {
+                    *self.modes.last_mut().expect("mode") = Mode::Interp { open, depth: depth + 1 };
                 }
                 Token::LBrace
             }
             b'}' => {
                 match self.mode() {
                     // Depth 0 inside a hole: this `}` closes the hole itself.
-                    Mode::Interp { depth: 0 } => {
+                    Mode::Interp { depth: 0, .. } => {
                         self.modes.pop();
                         self.push(Token::InterpEnd, start);
                         return;
                     }
-                    Mode::Interp { depth } => {
-                        *self.modes.last_mut().expect("mode") = Mode::Interp { depth: depth - 1 };
+                    Mode::Interp { open, depth } => {
+                        *self.modes.last_mut().expect("mode") = Mode::Interp { open, depth: depth - 1 };
                     }
                     _ => {}
                 }
@@ -394,7 +429,7 @@ impl<'a> Lexer<'a> {
                     let h = self.pos;
                     self.pos += 2;
                     self.push(Token::InterpStart, h);
-                    self.modes.push(Mode::Interp { depth: 0 });
+                    self.modes.push(Mode::Interp { open: h, depth: 0 });
                     return;
                 }
                 Some(b'\\') => {
