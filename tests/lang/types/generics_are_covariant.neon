@@ -1,0 +1,22 @@
+// A union of instantiations is contained by the instantiation at the union:
+// `Box[i64] | Box[str]` is a `Box[i64 | str]`. Both directions of this matter.
+//
+// It is why one generic impl can cover a receiver that spans several
+// instantiations with a single T, instead of needing one instantiation per arm
+// and a runtime switch between them.
+
+use std::io;
+use std::string;
+
+record Box[T] { item: T }
+
+fn show(b: Box[i64 | str]) -> str {
+    if b.item is i64 { string::int_to_str(b.item as i64) } else { b.item as str }
+}
+
+fn main() {
+    let n: Box[i64] = Box { item: 7 };
+    let s: Box[str] = Box { item: "hi" };
+    io::println(show(n));
+    io::println(show(s));
+}

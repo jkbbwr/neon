@@ -1,0 +1,25 @@
+// Generic arguments are COVARIANT, so a `List[Circle]` is a `List[Shape]`.
+//
+// Invariance was the old rule, and it was a codegen constraint wearing a type
+// system costume: `List_I64` and `List_Any` are different C structs, so the two
+// instantiations could not be interchanged at runtime. That is a fact about
+// lowering, not about values. A List is an immutable value, so widening the view
+// cannot write a Square into the narrower list, and covariance is sound.
+
+use std::io;
+use std::string;
+use std::collections::list;
+
+record Circle { radius: i64 }
+record Square { side: i64 }
+type Shape = Circle | Square
+
+fn count(xs: List[Shape]) -> i64 { list::len(xs) }
+
+fn main() {
+    let circles: List[Circle] = [Circle { radius: 1 }, Circle { radius: 2 }];
+    io::println(string::int_to_str(count(circles)));
+
+    let mixed: List[Shape] = [Circle { radius: 3 }, Square { side: 4 }];
+    io::println(string::int_to_str(count(mixed)));
+}

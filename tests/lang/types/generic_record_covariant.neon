@@ -1,0 +1,24 @@
+// Generic arguments are COVARIANT: a `Box[Circle]` IS a `Box[Shape]`, because
+// `Circle <: Shape`. It is sound here because a Box is a value — there is no
+// mutation through the wider view that could smuggle a Square into the narrower
+// box. Covariance for a mutable container would be Java's array bug.
+
+use std::io;
+
+record Circle { radius: i64 }
+record Square { side: i64 }
+type Shape = Circle | Square
+
+record Box[T] { item: T }
+
+fn name(b: Box[Shape]) -> str {
+    if b.item is Circle { "circle" } else { "square" }
+}
+
+fn main() {
+    let c: Box[Circle] = Box { item: Circle { radius: 1 } };
+    io::println(name(c));
+
+    let s: Box[Square] = Box { item: Square { side: 2 } };
+    io::println(name(s));
+}
