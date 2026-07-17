@@ -112,7 +112,16 @@ fn the_corpus_round_trips() {
         failures.join("\n")
     );
     assert_eq!(round_tripped, parsed);
-    assert_eq!(round_tripped, 189, "the corpus round-trip number, and it only goes up");
-    // The ratchet: the two that do not parse are compile-fail tests.
+
+    // A floor, not a pin. The comment here used to say "it only goes up" over an
+    // `==`, which does the opposite: it goes stale on every corpus addition, and it
+    // did — `a06da10` added two files and left this red for two commits. `>=` catches
+    // the regression this is for (corpus files quietly stopping working) without
+    // demanding a bump for the growth it is not for.
+    assert!(
+        round_tripped >= 189,
+        "the corpus shrank: {round_tripped} files round-trip, was at least 189"
+    );
+    // Only the compile-fail tests are expected not to parse.
     assert_eq!(files.len() - parsed, 2, "a different set of files parses now");
 }
