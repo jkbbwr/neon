@@ -23,9 +23,21 @@ neither blank nor a `//` comment. Anything later is ignored.
 
     //@ exit: <n>                expected exit code of the binary. Default 0.
     //@ compile-fail             compilation must fail. No .stdout needed; binary never run.
-    //@ error-contains: <substr> checked against compiler stderr. Repeatable; all must
-                                 match. ANSI codes are stripped first, so match the plain
-                                 text you would read on screen. Only with compile-fail.
+    //@ error-contains: <substr> checked against the diagnostic MESSAGES. Repeatable; all
+                                 must match. ANSI codes are stripped first. Only with
+                                 compile-fail.
+
+                                 Messages, NOT the rendered output. The render carries the
+                                 file path and echoes the offending source line, so any
+                                 substring occurring in either matches whatever the
+                                 compiler actually said. `error-contains: main` in
+                                 main_throws_clause_is_fixed.neon passed on the strength of
+                                 its own filename, while the real error was `unknown
+                                 protocol Error`. Five files were passing that way.
+
+                                 So: match text that can only come from a message. A
+                                 substring that also appears in the program, the path or a
+                                 keyword you wrote is asserting nothing.
 
 ## The ratchet: expected-pass.txt
 

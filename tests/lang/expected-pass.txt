@@ -1,0 +1,166 @@
+# The ratchet. See README.md.
+#
+# These corpus files must pass. Listed and failing is a regression and fails the
+# build; passing and unlisted also fails the build, with "add it to
+# expected-pass.txt". Absent and failing is fine — not built yet.
+#
+# WHAT "PASS" MEANS ON THIS LIST, TODAY: much less than the README's harness
+# describes. There is no backend — nothing is codegen'd, linked or run — so
+# `compiler/tests/corpus_check.rs` verifies only the front end:
+#
+#   compile-fail file : compilation fails, and every `//@ error-contains:`
+#                       substring appears in a diagnostic MESSAGE. Not in the
+#                       rendered output: that carries the file path and echoes
+#                       the offending source line, so `error-contains: main` was
+#                       satisfied by the filename main_throws_clause_is_fixed.neon
+#                       no matter what the compiler said. Five files passed that
+#                       way and are now off this list, honestly failing.
+#   any other file    : it checks clean. Nothing more. Its `.stdout` is never
+#                       read and its `//@ exit:` is never verified.
+#
+# So a file listed here is NOT known to produce the right output. When the
+# backend lands, "pass" gains stdout and the exit code, and every file below
+# must be re-verified against that stronger meaning — expect some to come off
+# the list. Do not read this list as more than it is.
+basics/atom_equality.neon
+basics/atom_literals.neon
+basics/block_expression.neon
+basics/block_scope.neon
+basics/bool_literals.neon
+basics/comments.neon
+basics/float_literals.neon
+basics/hello.neon
+basics/int_literals.neon
+basics/let_binding.neon
+basics/null_literal.neon
+basics/rebinding.neon
+basics/rebind_writes_through_scope.neon
+basics/shadowing_changes_type.neon
+basics/shadowing.neon
+basics/str_literals.neon
+closures/capture_is_by_value_and_sealed.neon
+closures/capture_local.neon
+closures/closure_outlives_its_scope.neon
+closures/closure_types.neon
+closures/lambda_basics.neon
+closures/shadowing_a_captured_name_is_fine.neon
+collections/list_construction.neon
+collections/list_index_negative_traps.neon
+collections/list_index_out_of_bounds_traps.neon
+collections/list_iteration.neon
+collections/map_get_missing_throws.neon
+collections/map_index_missing_key_traps.neon
+collections/map_iteration.neon
+control/for_break_continue.neon
+control/for_list.neon
+control/for_range.neon
+control/if_else_value.neon
+control/if_evaluates_one_branch.neon
+control/if_missing_else_null_return.neon
+control/if_statement_no_else.neon
+control/loop_break_value.neon
+control/loop_break_value_union.neon
+control/nested_loops.neon
+control/while_break_continue.neon
+control/while_condition_false_never_runs.neon
+control/while_loop.neon
+errors/try_soften_orelse.neon
+functions/declaration.neon
+functions/generic_identity.neon
+functions/higher_order.neon
+functions/mutual_recursion.neon
+functions/named_function_as_value.neon
+functions/optional_params_are_records.neon
+functions/pipe_operator.neon
+functions/unbound_generic_method_call.neon
+integers/div_by_zero.neon
+integers/div_min_by_neg_one.neon
+integers/min_literal.neon
+integers/mod_by_zero.neon
+integers/mod_min_by_neg_one.neon
+integers/shift_mask.neon
+integers/shift_negative_amount.neon
+integers/wrapping_add_sub.neon
+integers/wrapping_mul.neon
+integers/wrapping_neg.neon
+match/guards.neon
+match/is_sum_type.neon
+match/literal_patterns.neon
+match/null_union.neon
+match/record_pattern_binds_fields.neon
+match/sum_type_destructure.neon
+operators/and_or_precedence.neon
+operators/bitwise.neon
+operators/bool_ops.neon
+operators/comparison.neon
+operators/float_arith.neon
+operators/float_special_values.neon
+operators/int_arith.neon
+operators/orelse_chain.neon
+operators/orelse_union.neon
+operators/orelse_zero_is_not_null.neon
+operators/pipe_chain.neon
+operators/pipe.neon
+operators/pipe_orelse_precedence.neon
+operators/precedence_arith.neon
+operators/precedence_ladder.neon
+operators/shift.neon
+operators/short_circuit.neon
+protocols/ambiguity_resolved_by_qualification.neon
+protocols/declare_and_impl.neon
+protocols/dispatch_on_receiver.neon
+protocols/generic_impl.neon
+protocols/impl_for_primitive.neon
+protocols/local_name_shadows_protocol_method.neon
+protocols/orphan_impl_fills_a_gap.neon
+protocols/orphan_impl_may_not_steal_covered_values.neon
+records/declare_construct_access.neon
+records/generic.neon
+records/nested.neon
+records/nullable_field.neon
+records/recursive_mutual.neon
+records/recursive_self.neon
+records/structural_param_accepts_nominal.neon
+records/union_typed_field.neon
+records/unit_record.neon
+records/value_and_heap_records_same_semantics.neon
+records/value_record_through_any.neon
+strings/interpolation_basic.neon
+strings/interpolation_literal_braces.neon
+strings/interpolation_unterminated_fails.neon
+strings/literals_and_escapes.neon
+strings/utf8_find_is_byte_offset.neon
+strings/utf8_len_is_bytes.neon
+strings/utf8_slice_splits_sequence.neon
+types/alias_is_transparent.neon
+types/any_is_the_only_erasure.neon
+types/arrow_type_throws.neon
+types/as_cast_recovers_the_narrow_type.neon
+types/atom_singleton_type.neon
+types/atom_union_mixed_with_other_types.neon
+types/atom_union.neon
+types/generic_record_covariant.neon
+types/generics_are_covariant.neon
+types/intersection_flattens.neon
+types/is_narrows_the_binding.neon
+types/missing_field_satisfies_nullable_field.neon
+types/mu_type_in_arrow_parameter.neon
+types/mu_type_in_arrow_throws_parameter.neon
+types/mu_type_mutual_recursion_unsupported.neon
+types/mu_type_not_contractive.neon
+types/mu_type_through_arrow_return.neon
+types/mu_type_through_arrow_that_throws.neon
+types/mu_type_under_negation.neon
+types/mu_type_without_recursion.neon
+types/newtype_is_nominally_distinct.neon
+types/nominal_record_satisfies_opts_type.neon
+types/no_one_element_tuple.neon
+types/nullable.neon
+types/opaque_record_is_an_atom_beyond_its_parent.neon
+types/opaque_record_is_module_scoped.neon
+types/structural_record_width.neon
+types/throws_binds_below_the_arrow.neon
+types/type_alias_recursive_rejected.neon
+types/union_of_primitives.neon
+types/union_of_records_is_a_sum_type.neon
+types/union_variant_is_a_subtype_of_the_union.neon
