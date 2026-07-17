@@ -140,12 +140,44 @@ made covariance sound.
   until it exists — that, and first-class calls (`g(1)` on an arrow-typed local, which
   the checker currently rejects), are the two real blockers.
 - **`Error` vs `Display`.** `Error` declares `message(e) -> str`; `Display` declares
-  `to_string(v) -> str`. For an error those are the same string, and Neon has no
-  protocol inheritance to say so. Either `Error: Display` needs designing, or `message`
-  should go and errors should just be `Display`.
-- **Does `==` dispatch?** The checker types it `bool` without dispatching. If `==` on a
-  record means `Eq::eq`, that is a lowering of an operator to a protocol call and it
-  needs specifying — including what `==` means with no impl.
+  `to_string(v) -> str`. For an error those are the same string. Protocol supertraits
+  exist (`protocol Ord for T where T: Eq`, pinned by the corpus), so the answer is
+  `protocol Error for T where T: Display`: a marker requiring `Display`, `message`
+  deleted, `to_string(e)` is the error text. Left here only because the corpus still
+  writes `message` and the migration has not happened.
 - **`@native`.** Every leaf here bottoms out in the runtime. The annotation exists and
   the parser accepts a body-less `@native fn`; nothing checks that one has a native
   symbol behind it.
+
+## Decided: delivery, layout, comparison operators
+
+- **On disk, path-mapped.** `stdlib/std/io.neon` is `std::io`; see `decisions.md`. The
+  loader derives the module prefix from the path and declares each file before the user
+  module. Chosen so an LSP can open real stdlib files.
+- **`==`/`!=` desugar to `Eq::eq`; `<`/`<=`/`>`/`>=` to `Ord::cmp`.** No primitive
+  operator beside a protocol. The prelude ships `impl Eq`/`impl Ord` for every primitive,
+  bottoming out in `@native` intrinsics (the leaf cannot be `a == b`). A record needs
+  `impl Eq` to use `==`; no impl is a diagnostic, not a structural default. This is the
+  `to_string` shape: one mechanism, `impl`-or-error. See `decisions.md`.
+
+## The build order
+
+Four phases, each green on its own.
+
+1. **Loading.** Decompose `Env::build` so the driver pushes several modules — the stdlib
+   files, then the user's — through the declare phase before anything resolves. Stays out
+   of `Env::build` itself, so the unit tests keep their bare, stdlib-free envs. This one
+   phase turns most of the 154 `unknown name` failures around, before a line of stdlib is
+   written, by making `use std::io` resolve to decls that are actually present.
+2. **The source.** Write `stdlib/std/**.neon`: `io`, `string` (with `byte_len`), the
+   `list`/`map` generics, and the prelude — `type Ordering`, `protocol Display`/`Eq`/`Ord`/
+   `Error`, and `impl Eq`/`impl Ord` for the primitives. All `@native` at the leaves; it
+   type-checks with no backend.
+3. **Desugaring.** `#{x}` → `to_string(x)`; the comparison operators → `Eq`/`Ord`
+   dispatch, replacing the checker's current hardcoded `bool`. Both depend on the prelude,
+   so they land after phase 1. Risk to verify: dispatch on a primitive target
+   (`impl Display for i64`) — believed fine, an emptiness query like any other, unproven.
+4. **Migration.** Rewrite the corpus to the decided surface: `string::int_to_str(x)` →
+   `#{x}`, `eq(a, b)` → `a == b`, `message` → `to_string`, drop redundant `concat`.
+   Coupled to phases 2–3, because deleting `int_to_str` breaks 289 sites until they move.
+   This is where the corpus stops specifying a language that works around a fixed bug.

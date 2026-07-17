@@ -324,6 +324,25 @@ here after invariance and `T | null`.
 `string::to_int` stays: parsing is not stringifying, and it throws. The pair is
 asymmetric on purpose — `to_string` is total, `to_int` is partial.
 
+### Comparison operators are protocol calls
+
+`==` and `!=` desugar to `Eq::eq`; `<`, `<=`, `>`, `>=` desugar to `Ord::cmp` (which
+returns `Ordering`, an atom union). There is no primitive `==` beside a protocol `eq` —
+that is the `int_to_str` shape, and this is the one operator family where it would
+otherwise creep back in.
+
+So `1 == 2` is a dispatch, and the prelude ships `impl Eq` and `impl Ord` for every
+primitive, whose methods bottom out in `@native` intrinsics — the leaf cannot be `a == b`
+without regress. After monomorphisation and inlining a primitive compare is a single
+instruction again; only the checker routes through dispatch.
+
+*Consequence, stated because it bites:* `==` requires `Eq` in scope, so it does not work
+without the prelude, and a record with no `impl Eq` cannot use `==` — that is a
+diagnostic, not a structural fallback. Equality *has* a canonical fieldwise meaning, so a
+structural default was on the table; it was declined to keep one mechanism, matching
+`to_string`, whose parallel `impl`-or-error this mirrors. `Ord` is not optional either way
+— a record has no canonical order — so requiring `Eq` too keeps the two consistent.
+
 ### Names count what they say
 
 `string::byte_len`, not `string::len`. It counts bytes — `byte_len("é")` is 2 — and a
@@ -523,3 +542,16 @@ library receives them already read.
 Nothing is baked in at compile time. The sysroot is resolved at runtime relative to the
 executable, so dev and installed builds share one code path, and a relocated binary fails
 with a clear error rather than pointing at a build directory that does not exist.
+
+**The stdlib source lives on disk, not embedded.** `stdlib/std/io.neon` is the module
+`std::io`, by path — no `mod std { mod io { } }` wrapper. It is loaded as real files with
+real paths, because an LSP resolving go-to-definition into `println` must be able to open
+an actual file and show a span in it. Embedding the source in the binary would make every
+stdlib location synthetic, and the stdlib will hold real Neon code, not only `@native`
+signatures, before long. Tests reach it the way `corpus_roundtrip` reaches the corpus —
+a `CARGO_MANIFEST_DIR`-relative path — so no sysroot is needed under `cargo test`.
+
+Module path is derived from file path: this is the one place a file-to-module mapping
+exists, and it costs nothing, because `Env::declare` already takes a module prefix (it is
+how nested `mod` blocks work). The loader walks `stdlib/`, turns `std/io.neon` into the
+prefix `std::io`, and declares each file's decls under it before the user's module.
