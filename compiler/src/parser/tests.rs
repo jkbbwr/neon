@@ -89,14 +89,44 @@ fn a_throws_with_no_arrow_is_rejected() {
     errs("type H = (i64) throws :error");
 }
 
-/// A thrown type is read by the full type parser, which claims a trailing `->`
-/// for itself — so a parenthesised one eats the arrow it was meant to precede
-/// and leaves the outer type without one. Harmless in practice: a thrown type is
-/// an error record, never an arrow or a tuple. `fn` declarations inherit the same
-/// ambiguity, and there it misparses silently rather than erroring.
 #[test]
-fn a_parenthesised_throws_cannot_be_written_in_an_arrow_type() {
-    errs("type H = (i64) throws (str) -> i64");
+fn a_parenthesised_throws_is_not_the_return() {
+    // `throws` parses below the arrow, so `(str)` is the thrown type and `i64` the
+    // return. Parsed at the full type level, `(str) -> i64` would be read as the
+    // thrown type and the return would silently vanish.
+    let m = ok("type H = (i64) throws (str) -> i64");
+    let DeclKind::TypeAlias(a) = &m.decls[0].kind else { panic!("a type alias") };
+    let TypeSpecKind::Fn { params, throws, ret } = &a.value.kind else { panic!("an arrow") };
+    assert_eq!(params.len(), 1);
+    assert!(matches!(&throws.as_deref().expect("a throws").kind,
+        TypeSpecKind::Named { path, .. } if path == &["str"]));
+    assert!(matches!(&ret.kind, TypeSpecKind::Named { path, .. } if path == &["i64"]));
+}
+
+#[test]
+fn a_fn_decl_throws_does_not_swallow_its_return() {
+    // The same ambiguity in declaration position, where it used to misparse in
+    // silence: `throws=((str) -> i64), ret=None`.
+    let m = ok("fn f() throws (str) -> i64 { 0 }");
+    let DeclKind::Fn(f) = &m.decls[0].kind else { panic!("a fn") };
+    assert!(matches!(&f.throws.as_ref().expect("a throws").kind,
+        TypeSpecKind::Named { path, .. } if path == &["str"]));
+    assert!(matches!(&f.ret.as_ref().expect("a return").kind,
+        TypeSpecKind::Named { path, .. } if path == &["i64"]));
+}
+
+#[test]
+fn a_thrown_arrow_needs_its_own_parens() {
+    // The restriction is only on a TOP-LEVEL arrow, so an arrow is still thrown by
+    // grouping it or putting it under a constructor.
+    ok("fn f() throws ((str) -> i64) -> i64 { 0 }");
+    ok("fn g() throws Handler[(i64) -> i64] -> i64 { 0 }");
+}
+
+#[test]
+fn a_throws_union_still_parses() {
+    ok("fn f() throws :err | :other -> i64 { 0 }");
+    ok("type H = (i64) throws :err | :other -> i64");
 }
 
 #[test]

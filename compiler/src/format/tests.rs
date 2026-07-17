@@ -579,3 +579,32 @@ fn main() {
 fn an_empty_file_formats_to_nothing() {
     pin("", "");
 }
+
+#[test]
+fn a_thrown_arrow_keeps_its_parentheses() {
+    // Dropping them prints `throws (str) -> i64 -> i64`, which does not reparse:
+    // the thrown arrow rebinds to the clause's own `->`. `check` runs the
+    // round-trip, so this fails on the tree, not on the text.
+    let out = check("fn j() throws ((str) -> i64) -> i64 { 0 }");
+    assert!(out.contains("throws ((str) -> i64) ->"), "{out}");
+
+    let out = check("type H = (i64) throws ((str) -> i64) -> i64");
+    assert!(out.contains("throws ((str) -> i64) ->"), "{out}");
+}
+
+#[test]
+fn a_thrown_type_that_needs_no_parentheses_gets_none() {
+    assert_eq!(check("fn f() throws str -> i64 { 0 }"), "fn f() throws str -> i64 { 0 }\n");
+    // A union sits at the throws level, so it needs no grouping either.
+    assert_eq!(
+        check("fn f() throws :err | :other -> i64 { 0 }"),
+        "fn f() throws :err | :other -> i64 { 0 }\n"
+    );
+}
+
+#[test]
+fn a_parenthesised_thrown_type_loses_redundant_parentheses() {
+    // `(str)` is a grouping, not a tuple, so the parser never built a node for it
+    // and the formatter has nothing to print. The tree is what round-trips.
+    assert_eq!(check("fn f() throws (str) -> i64 { 0 }"), "fn f() throws str -> i64 { 0 }\n");
+}

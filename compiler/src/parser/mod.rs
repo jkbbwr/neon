@@ -78,9 +78,10 @@ where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
     let ty = type_spec();
+    let throws = throws_type_spec(ty.clone());
     let (expr, block) = expr_and_block(ty.clone());
 
-    decl(ty, expr, block)
+    decl(ty, throws, expr, block)
         .repeated()
         .collect::<Vec<_>>()
         .map(|decls| Module { decls })
@@ -92,6 +93,7 @@ where
 
 fn decl<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
+    throws: impl P<'t, I, TypeSpec> + 't,
     expr: impl P<'t, I, Expr> + 't,
     block: impl P<'t, I, Block> + 't,
 ) -> impl P<'t, I, Decl>
@@ -100,10 +102,10 @@ where
 {
     recursive(|decl| {
         let inner = choice((
-            fn_like(ty.clone(), block.clone(), false).map(DeclKind::Fn),
+            fn_like(ty.clone(), throws.clone(), block.clone(), false).map(DeclKind::Fn),
             record_decl(ty.clone()).map(DeclKind::Record),
-            protocol_decl(ty.clone(), block.clone()).map(DeclKind::Protocol),
-            impl_decl(ty.clone(), block.clone()).map(DeclKind::Impl),
+            protocol_decl(ty.clone(), throws.clone(), block.clone()).map(DeclKind::Protocol),
+            impl_decl(ty.clone(), throws.clone(), block.clone()).map(DeclKind::Impl),
             mu_type_decl(ty.clone()),
             type_alias_decl(ty.clone()),
             newtype_decl(ty.clone()),
@@ -203,6 +205,7 @@ where
 /// rest with something better than a syntax error.
 fn fn_like<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
+    throws: impl P<'t, I, TypeSpec> + 't,
     block: impl P<'t, I, Block> + 't,
     _body_required: bool,
 ) -> impl P<'t, I, FnDecl>
@@ -222,8 +225,9 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
         )
-        // `throws E` is written before `->`.
-        .then(just(Token::Throws).ignore_then(ty.clone()).or_not())
+        // `throws E` is written before `->`, and must not swallow it: see
+        // `throws_type_spec`.
+        .then(just(Token::Throws).ignore_then(throws).or_not())
         .then(just(Token::Arrow).ignore_then(ty.clone()).or_not())
         .then(where_clauses(ty))
         .then(body)
@@ -292,6 +296,7 @@ where
 
 fn protocol_decl<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
+    throws: impl P<'t, I, TypeSpec> + 't,
     block: impl P<'t, I, Block> + 't,
 ) -> impl P<'t, I, ProtocolDecl>
 where
@@ -315,7 +320,7 @@ where
         .then_ignore(just(Token::For))
         .then(subject)
         .then(
-            fn_like(ty, block, false)
+            fn_like(ty, throws, block, false)
                 .repeated()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
@@ -331,6 +336,7 @@ where
 
 fn impl_decl<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
+    throws: impl P<'t, I, TypeSpec> + 't,
     block: impl P<'t, I, Block> + 't,
 ) -> impl P<'t, I, ImplDecl>
 where
@@ -342,7 +348,7 @@ where
         .then_ignore(just(Token::For))
         .then(ty.clone())
         .then(
-            fn_like(ty, block, true)
+            fn_like(ty, throws, block, true)
                 .repeated()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
@@ -479,46 +485,145 @@ where
 
 // ---- types ----
 
+/// `(A, B)` — the items of a parenthesised type, before deciding what it is.
+fn paren_items<'t, I>(ty: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, Vec<TypeSpec>>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    ty.separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .boxed()
+}
+
+/// A tuple, or a grouping when there is one item. Never an arrow.
+fn paren_plain<'t, I>(ty: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, TypeSpecKind>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    paren_items(ty)
+        .map(|items| {
+            if items.len() == 1 {
+                items.into_iter().next().expect("len 1").kind
+            } else {
+                TypeSpecKind::Tuple(items)
+            }
+        })
+        .boxed()
+}
+
+/// The atomic types. `parens` is the parameter because it is the only part that
+/// differs between the full grammar, where a parenthesised list may become an
+/// arrow, and the `throws` grammar, where it may not.
+fn atomic_type<'t, I>(
+    ty: impl P<'t, I, TypeSpec> + 't,
+    parens: impl P<'t, I, TypeSpecKind> + 't,
+) -> impl P<'t, I, TypeSpec>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    let named = path()
+        .then(
+            ty.clone()
+                .separated_by(just(Token::Comma))
+                .allow_trailing()
+                .collect::<Vec<_>>()
+                .delimited_by(just(Token::LBracket), just(Token::RBracket))
+                .or_not()
+                .map(Option::unwrap_or_default),
+        )
+        .map(|(path, args)| TypeSpecKind::Named { path, args });
+
+    let structural = field(ty)
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LBrace), just(Token::RBrace))
+        .map(TypeSpecKind::Struct);
+
+    let atom = select! { Token::Atom(a) => TypeSpecKind::Atom(a) };
+    let null = just(Token::Null).to(TypeSpecKind::Null);
+    let any = ident_named("any").to(TypeSpecKind::Any);
+
+    choice((null, any, atom, structural, parens, named))
+        .map_with(|kind, e| TypeSpec { kind, span: e.span() })
+        .boxed()
+}
+
+/// `!` binds tightest, then `&`, then `|`: a union of intersections is the shape
+/// people mean.
+fn bool_type<'t, I>(atomic: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, TypeSpec>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    let negated = just(Token::Bang)
+        .repeated()
+        .foldr_with(atomic, |_, ty, e| TypeSpec {
+            kind: TypeSpecKind::Negate(Box::new(ty)),
+            span: e.span(),
+        })
+        .boxed();
+
+    let intersect = negated
+        .separated_by(just(Token::Ampersand))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map_with(|mut v, e| {
+            if v.len() == 1 {
+                v.pop().expect("len 1")
+            } else {
+                TypeSpec { kind: TypeSpecKind::Intersect(v), span: e.span() }
+            }
+        })
+        .boxed();
+
+    intersect
+        .separated_by(just(Token::Bar))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .map_with(|mut v, e| {
+            if v.len() == 1 {
+                v.pop().expect("len 1")
+            } else {
+                TypeSpec { kind: TypeSpecKind::Union(v), span: e.span() }
+            }
+        })
+        .labelled("a type")
+        .boxed()
+}
+
+/// The type of a `throws` clause: everything except a top-level arrow.
+///
+/// A thrown value is an error — a record or an atom — never a function. Allowing
+/// an arrow here makes `throws` swallow the `->` that follows it, so
+/// `fn f() throws (str) -> i64` reads as throwing `(str) -> i64` and returning
+/// nothing, silently and with no error. Nested arrows are still reachable through
+/// any constructor: `throws Handler[(i64) -> i64]`, `throws ((i64) -> i64)`.
+fn throws_type_spec<'t, I>(ty: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, TypeSpec>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    let parens = paren_plain(ty.clone());
+    bool_type(atomic_type(ty, parens))
+}
+
 fn type_spec<'t, I>() -> impl P<'t, I, TypeSpec>
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
     recursive(|ty| {
-        let named = path()
-            .then(
-                ty.clone()
-                    .separated_by(just(Token::Comma))
-                    .allow_trailing()
-                    .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LBracket), just(Token::RBracket))
-                    .or_not()
-                    .map(Option::unwrap_or_default),
-            )
-            .map(|(path, args)| TypeSpecKind::Named { path, args });
-
-        let structural = field(ty.clone())
-            .separated_by(just(Token::Comma))
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .delimited_by(just(Token::LBrace), just(Token::RBrace))
-            .map(TypeSpecKind::Struct);
-
         // `throws E` binds to the `->` that follows it, so a `throws` with no arrow
         // is an error rather than a tuple that silently ate its clause.
         let codomain = just(Token::Throws)
-            .ignore_then(ty.clone())
+            .ignore_then(throws_type_spec(ty.clone()))
             .or_not()
             .then_ignore(just(Token::Arrow))
             .then(ty.clone())
             .or_not();
 
         // `(A, B) throws E -> C`, `(A, B) -> C` and `(A, B)`; `(A)` is just a grouping.
-        let parenthesised = ty
-            .clone()
-            .separated_by(just(Token::Comma))
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
+        let parens = paren_items(ty.clone())
             .then(codomain)
             .map(|(items, codomain)| match codomain {
                 Some((throws, ret)) => TypeSpecKind::Fn {
@@ -528,52 +633,10 @@ where
                 },
                 None if items.len() == 1 => items.into_iter().next().expect("len 1").kind,
                 None => TypeSpecKind::Tuple(items),
-            });
-
-        let atom = select! { Token::Atom(a) => TypeSpecKind::Atom(a) };
-        let null = just(Token::Null).to(TypeSpecKind::Null);
-        let any = ident_named("any").to(TypeSpecKind::Any);
-
-        let atomic = choice((null, any, atom, structural, parenthesised, named))
-            .map_with(|kind, e| TypeSpec { kind, span: e.span() })
-            .boxed();
-
-        // `!` binds tightest, then `&`, then `|`: a union of intersections is
-        // the shape people mean.
-        let negated = just(Token::Bang)
-            .repeated()
-            .foldr_with(atomic, |_, ty, e| TypeSpec {
-                kind: TypeSpecKind::Negate(Box::new(ty)),
-                span: e.span(),
             })
             .boxed();
 
-        let intersect = negated
-            .separated_by(just(Token::Ampersand))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .map_with(|mut v, e| {
-                if v.len() == 1 {
-                    v.pop().expect("len 1")
-                } else {
-                    TypeSpec { kind: TypeSpecKind::Intersect(v), span: e.span() }
-                }
-            })
-            .boxed();
-
-        intersect
-            .separated_by(just(Token::Bar))
-            .at_least(1)
-            .collect::<Vec<_>>()
-            .map_with(|mut v, e| {
-                if v.len() == 1 {
-                    v.pop().expect("len 1")
-                } else {
-                    TypeSpec { kind: TypeSpecKind::Union(v), span: e.span() }
-                }
-            })
-            .labelled("a type")
-            .boxed()
+        bool_type(atomic_type(ty, parens))
     })
 }
 

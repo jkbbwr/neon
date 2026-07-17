@@ -591,10 +591,11 @@ impl<'a> Fmt<'a> {
         );
         self.push(")");
 
-        // `throws E` comes before `->`.
+        // `throws E` comes before `->`, and a bare arrow would rebind to that `->`
+        // rather than stay the thrown type. Same rule as the arrow-type printer.
         if let Some(t) = &f.throws {
             self.push(" throws ");
-            self.ty(t, TP_ANY);
+            self.ty(t, TP_UNION);
         }
         if let Some(t) = &f.ret {
             self.push(" -> ");

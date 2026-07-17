@@ -1,0 +1,24 @@
+// `throws E` is written before `->`, so E must not swallow that arrow. A thrown
+// value is an error — a record or an atom — never a function, so the throws
+// clause parses at a level with no top-level arrow.
+//
+// Without that, `throws (str) -> i64` reads as throwing `(str) -> i64` and
+// returning nothing. Silently: there is no error, the return type just vanishes.
+//
+// An arrow can still be thrown by grouping it, which is the sibling case below.
+
+use std::io;
+
+record Failure { why: str }
+
+fn parse_it(s: str) throws Failure -> i64 { 0 }
+
+fn takes_a_thrower(f: (str) throws Failure -> i64) -> i64 { 0 }
+
+fn several(s: str) throws :err | :other -> i64 { 0 }
+
+fn thrown_arrow() throws ((str) -> i64) -> i64 { 0 }
+
+fn main() {
+    io::println("ok");
+}
