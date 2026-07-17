@@ -126,6 +126,58 @@ diagnostic when it appears as a declaration, because people will type it.
 - **"A Color and nothing narrower" is inexpressible.** A bare `Red` is accepted where
   `Color` is expected (`Red <: Red | Green` — correct set-theoretically).
 
+### Impls: own the protocol or the type; orphans only in the root application
+
+    // a library may write:
+    impl AnyProtocol for MyType      { }   // it owns the type
+    impl MyProtocol for AnyType      { }   // it owns the protocol
+
+    // it may not write:
+    impl TheirProtocol for TheirType { }   // owns neither
+
+    // the root application, and only the root application, may write:
+    orphan impl TheirProtocol for TheirType { }
+
+Coherence is only violated when two *dependencies* disagree about the same pair. There is
+exactly one root application, so it cannot disagree with itself, and nothing can depend on
+it and inherit the choice unknowingly. The escape hatch is therefore safe exactly where it
+sits and unsafe anywhere else. `orphan` is explicit — the author says out loud that they
+own neither side — and a library carrying one is rejected when used as a dependency.
+
+**An orphan impl may only fill a gap.** Its target must be disjoint from every existing
+impl of that protocol: `target ∧ ⋁ existing = ∅`. If something already covers those values,
+the orphan is rejected — it cannot specialize, override, or steal them.
+
+So orphans are strictly *additive*. They can make a protocol work for a type nobody
+covered; they can never change what an existing impl does. Specialization by nesting is a
+right reserved to whoever owns the protocol or the type — the only parties who can see the
+whole picture. Without this, the root could quietly hijack a library's `impl Display for
+Shape` for Circle values, and the library's own code would stop taking its own path.
+
+**Targets may overlap only when nested**, one a subtype of the other, and the more specific
+wins. `impl Area for Circle` and `impl Area for Shape` (`type Shape = Circle | Square`)
+coexist; Circle values take Circle's impl. Partial overlap — `Circle | Square` and
+`Square | Triangle`, meeting on Square — is rejected at declaration, because no value could
+say which applies.
+
+Specificity resolves **per value, not per static type**:
+
+    let c: Circle = ...
+    area(c)              // Circle's impl
+    let s: Shape = c     // the same value, widened
+    area(s)              // ...must still be Circle's impl
+
+One value, one impl, regardless of what the checker happened to know. Nested-only overlap
+is what makes "most specific" well defined: for any value the applicable impls form a
+chain, so a unique minimum always exists.
+
+*Against disjoint-only:* a library writing `impl Display for any` would lock every other
+module out of `Display` permanently — the first wide impl wins and nobody else can ever
+participate. Not a trade-off, a defect.
+
+*Against no orphan rule:* adding a dependency could silently change which impl your values
+take, and two libraries could impl the same pair with no principled winner.
+
 ### `any` is ⊤, and there is no such thing as an erased type
 
 `any` is the type inhabited by every value — the top type. It is **not** a marker for "the

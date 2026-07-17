@@ -27,6 +27,16 @@ enum Command {
     },
     /// Parse a source file and print its syntax tree.
     Parse { file: OsString },
+    /// Format a source file. Prints the result to stdout by default.
+    Fmt {
+        file: OsString,
+        /// Write the result back to the file instead of printing it.
+        #[arg(long, conflicts_with = "check")]
+        write: bool,
+        /// Print nothing; exit 1 if the file is not already formatted.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the resolved sysroot.
     Sysroot,
 }
@@ -36,6 +46,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Lex { file, spans } => cmd::lex::run(&file, spans),
         Command::Parse { file } => cmd::parse::run(&file),
+        Command::Fmt { file, write, check } => cmd::fmt::run(&file, write, check),
         Command::Sysroot => cmd::sysroot::run(),
     }
 }

@@ -2,6 +2,10 @@
 //!
 //! Spans are carried on every node a diagnostic can point at.
 
+mod spans;
+
+pub use spans::strip_spans;
+
 use crate::lexer::Span;
 
 #[derive(Debug, Clone, PartialEq)]

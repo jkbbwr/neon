@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chumsky = { version = "0.13.0", features = ["pratt"] }
+chumsky = { version = "0.13.0" }
 unicode-ident = "1.0.24"
 unicode-normalization = "0.1.25"

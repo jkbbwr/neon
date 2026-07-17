@@ -7,8 +7,8 @@ pub use error::{Expected, ParseError, ParseErrorKind, Span};
 
 use crate::ast::*;
 use crate::lexer::{Spanned, Token};
+use crate::ops;
 use chumsky::input::{Input, ValueInput};
-use chumsky::pratt::{infix, left};
 use chumsky::prelude::*;
 
 type Extra = extra::Err<ParseError>;
@@ -93,7 +93,7 @@ where
 {
     recursive(|decl| {
         let inner = choice((
-            fn_like(ty.clone(), block.clone(), true).map(DeclKind::Fn),
+            fn_like(ty.clone(), block.clone(), false).map(DeclKind::Fn),
             record_decl(ty.clone()).map(DeclKind::Record),
             protocol_decl(ty.clone(), block.clone()).map(DeclKind::Protocol),
             impl_decl(ty.clone(), block.clone()).map(DeclKind::Impl),
@@ -186,21 +186,23 @@ where
         .boxed()
 }
 
-/// A function. `body_required` is false for a protocol's methods, which may stop
-/// at the signature or supply a default body.
+/// A function.
+///
+/// The body is always optional at parse time. A protocol's method may stop at
+/// the signature, and so may an `@native` declaration — `@native("neon_str_len")
+/// fn len(s: str) -> i64` is a signature whose implementation is in the runtime.
+/// Whether a *given* body-less fn is legal is a question about its annotations
+/// and its context, which the parser does not have; a later pass rejects the
+/// rest with something better than a syntax error.
 fn fn_like<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
     block: impl P<'t, I, Block> + 't,
-    body_required: bool,
+    _body_required: bool,
 ) -> impl P<'t, I, FnDecl>
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
-    let body = if body_required {
-        block.map(Some).boxed()
-    } else {
-        block.or_not().boxed()
-    };
+    let body = block.or_not().boxed();
 
     annotations()
         .then_ignore(just(Token::Fn))
@@ -592,6 +594,11 @@ where
     let mut expr = Recursive::declare();
     let mut cond = Recursive::declare();
     let mut block = Recursive::declare();
+    // `try`'s body binds at the unary level, not the full expression. With the
+    // full parser it swallows what follows: `try? get(m, k) orelse 30` became
+    // `try? (get(m, k) orelse 30)` — an orelse on a non-nullable type, which is
+    // a no-op, so the default silently never applied.
+    let mut unary = Recursive::declare();
 
     // A block is a run of items; the last one, if it is an expression with no
     // semicolon, is the block's value.
@@ -638,11 +645,23 @@ where
             .boxed(),
     );
 
-    expr.define({
-        let atom = atom_expr(expr.clone(), cond.clone(), block.clone(), ty.clone(), true).boxed();
-        let postfixed = postfix_ops(atom, expr.clone(), ty.clone()).boxed();
-        binary_ops(postfixed).boxed()
+    // Order matters: postfix binds tighter than prefix, so `-x.f` is `-(x.f)`.
+    // Folding the prefix operators before postfix ran gave `(-x).f`.
+    unary.define({
+        let core = atom_expr(
+            expr.clone(),
+            cond.clone(),
+            block.clone(),
+            unary.clone(),
+            ty.clone(),
+            true,
+        )
+        .boxed();
+        let postfixed = postfix_ops(core, expr.clone(), ty.clone()).boxed();
+        prefix_ops(postfixed).boxed()
     });
+
+    expr.define(binary_ops(unary.clone()).boxed());
 
     // The condition of `if`/`while`/`for` and a match scrutinee sit directly
     // before a `{`, so a record literal there is ambiguous with the body:
@@ -655,9 +674,17 @@ where
     // consume-then-rewind in the record literal — more machinery than the copy
     // costs, now that the grammar is built once rather than five times.
     cond.define({
-        let atom = atom_expr(expr.clone(), cond.clone(), block.clone(), ty.clone(), false).boxed();
-        let postfixed = postfix_ops(atom, expr.clone(), ty).boxed();
-        binary_ops(postfixed).boxed()
+        let core = atom_expr(
+            expr.clone(),
+            cond.clone(),
+            block.clone(),
+            unary.clone(),
+            ty.clone(),
+            false,
+        )
+        .boxed();
+        let postfixed = postfix_ops(core, expr.clone(), ty).boxed();
+        binary_ops(prefix_ops(postfixed).boxed()).boxed()
     });
 
     (expr, block)
@@ -842,6 +869,7 @@ fn atom_expr<'t, I>(
     expr: impl P<'t, I, Expr> + 't,
     cond: impl P<'t, I, Expr> + 't,
     block: impl P<'t, I, Block> + 't,
+    unary: impl P<'t, I, Expr> + 't,
     ty: impl P<'t, I, TypeSpec> + 't,
     allow_record_lit: bool,
 ) -> impl P<'t, I, Expr>
@@ -964,7 +992,7 @@ where
         .map(|v| ExprKind::Throw(Box::new(v)))
         .boxed();
 
-    let try_expr = try_forms(expr.clone(), block.clone()).boxed();
+    let try_expr = try_forms(unary, block.clone()).boxed();
 
     let assert_expr = choice((
         just(Token::Assert).to(AssertKind::Assert),
@@ -985,13 +1013,7 @@ where
     let block_expr = block.map(ExprKind::Block).boxed();
     let path_expr = path().map(ExprKind::Path).boxed();
 
-    let unary = choice((
-        just(Token::Minus).to(UnOp::Neg),
-        just(Token::Bang).to(UnOp::Not),
-        just(Token::Bnot).to(UnOp::Bnot),
-    ));
-
-    let core = choice((
+    choice((
         // Keyword-led forms first: they can never be a path.
         if_expr,
         match_expr,
@@ -1018,15 +1040,25 @@ where
     ))
     .map_with(|kind, e| Expr { kind, span: e.span() })
     .labelled("an expression")
-    .boxed();
+    .boxed()
+}
 
-    unary
-        .repeated()
-        .foldr_with(core, |op, rhs, e| Expr {
-            kind: ExprKind::Unary { op, rhs: Box::new(rhs) },
-            span: e.span(),
-        })
-        .boxed()
+/// Prefix operators, applied AFTER postfix so `-x.f` is `-(x.f)`.
+fn prefix_ops<'t, I>(postfixed: impl P<'t, I, Expr> + 't) -> impl P<'t, I, Expr>
+where
+    I: ValueInput<'t, Token = Token, Span = Span>,
+{
+    choice((
+        just(Token::Minus).to(UnOp::Neg),
+        just(Token::Bang).to(UnOp::Not),
+        just(Token::Bnot).to(UnOp::Bnot),
+    ))
+    .repeated()
+    .foldr_with(postfixed, |op, rhs, e| Expr {
+        kind: ExprKind::Unary { op, rhs: Box::new(rhs) },
+        span: e.span(),
+    })
+    .boxed()
 }
 
 /// `if c { .. } else if d { .. } else { .. }`. `else` is optional here; whether
@@ -1067,8 +1099,13 @@ where
 /// `try e`, `try? e`, `try! e`, `try e catch (x) { .. }`. All forms accept a
 /// block, so `try { a(); b() } catch (e) { .. }` covers every throwing call
 /// inside.
+///
+/// `body` is the **unary-level** parser, not the full expression: `try` must
+/// bind tighter than any binary operator, or `try? get(m, k) orelse 30` reads as
+/// `try? (get(m, k) orelse 30)` — an orelse on a non-nullable type, a no-op, so
+/// the default silently never applies. That idiom is the documented easy path.
 fn try_forms<'t, I>(
-    expr: impl P<'t, I, Expr> + 't,
+    body: impl P<'t, I, Expr> + 't,
     block: impl P<'t, I, Block> + 't,
 ) -> impl P<'t, I, ExprKind>
 where
@@ -1080,7 +1117,7 @@ where
             just(Token::Bang).to(TryForm::Assert),
             empty().to(TryForm::Propagate),
         )))
-        .then(expr)
+        .then(body)
         .then(
             just(Token::Catch)
                 .ignore_then(ident().delimited_by(just(Token::LParen), just(Token::RParen)))
@@ -1161,72 +1198,45 @@ where
     .boxed()
 }
 
-/// The precedence ladder, loosest first.
+/// The precedence ladder, read out of `crate::ops`.
 ///
-/// `and` binds tighter than `or`. `|>` binds tighter than comparison — a pipe is
-/// a call, and `x |> f() == 3` means `(x |> f()) == 3`; piping into a comparison
-/// could never be a valid pipe target.
+/// Nothing about the ladder is written here: the levels, the operators in each
+/// and their spellings all come from `ops::BINARY_OPS`, which the formatter also
+/// reads. A ladder duplicated in the formatter is a ladder that drifts, and a
+/// drifted ladder reprints `1 - (2 - 3)` as `1 - 2 - 3`.
 ///
-/// One entry per precedence level, not per operator: the op parser yields the
-/// BinOp, so same-precedence operators collapse into a `choice`. Chumsky only
-/// implements Operator for tuples up to a fixed arity, and a level-per-entry
-/// table keeps the ladder readable anyway.
+/// Built as a chain of left folds rather than with `pratt`: chumsky's pratt
+/// takes its levels as a tuple, which has to be written out at compile time and
+/// so cannot be derived from a table.
 fn binary_ops<'t, I>(atom: impl P<'t, I, Expr> + 't) -> impl P<'t, I, Expr>
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
-    // Captures nothing, so it is Copy and the same closure serves every level.
-    // MapExtra is spelled out rather than inferred: with `&mut _` the closure's
-    // type gets fixed before I and E are known, and the Operator impl then has
-    // nothing to unify against.
-    let fold = |lhs: Expr,
-                op: BinOp,
-                rhs: Expr,
-                _e: &mut chumsky::input::MapExtra<'t, '_, I, Extra>|
-     -> Expr {
-        let span = lhs.span.start..rhs.span.end;
-        Expr {
-            kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
-            span,
-        }
-    };
-
-    let cmp = choice((
-        just(Token::EqEq).to(BinOp::Eq),
-        just(Token::NotEq).to(BinOp::Ne),
-        just(Token::LtEq).to(BinOp::Le),
-        just(Token::GtEq).to(BinOp::Ge),
-        just(Token::Lt).to(BinOp::Lt),
-        just(Token::Gt).to(BinOp::Gt),
-    ));
-    let shift = choice((
-        just(Token::Bsl).to(BinOp::Bsl),
-        just(Token::Bsr).to(BinOp::Bsr),
-    ));
-    let additive = choice((
-        just(Token::Plus).to(BinOp::Add),
-        just(Token::Minus).to(BinOp::Sub),
-    ));
-    let multiplicative = choice((
-        just(Token::Star).to(BinOp::Mul),
-        just(Token::Slash).to(BinOp::Div),
-        just(Token::Percent).to(BinOp::Rem),
-    ));
-
-    atom.pratt((
-        infix(left(1), just(Token::Orelse).to(BinOp::Orelse), fold),
-        infix(left(2), just(Token::Or).to(BinOp::Or), fold),
-        infix(left(3), just(Token::And).to(BinOp::And), fold),
-        infix(left(4), cmp, fold),
-        infix(left(5), just(Token::Pipe).to(BinOp::Pipe), fold),
-        infix(left(6), just(Token::Bor).to(BinOp::Bor), fold),
-        infix(left(7), just(Token::Bxor).to(BinOp::Bxor), fold),
-        infix(left(8), just(Token::Band).to(BinOp::Band), fold),
-        infix(left(9), shift, fold),
-        infix(left(10), additive, fold),
-        infix(left(11), multiplicative, fold),
-    ))
-    .boxed()
+    let mut level = atom.boxed();
+    // Tightest first: each level's operands are the level one tighter than it.
+    for prec in (ops::MIN_PREC..=ops::MAX_PREC).rev() {
+        let op = any().try_map(move |t: Token, span: Span| match BinOp::from_token(&t) {
+            Some(op) if op.prec() == prec => Ok(op),
+            _ => Err(ParseError::new(
+                span,
+                ParseErrorKind::Expected {
+                    expected: ops::ops_at(prec).map(|o| Expected::Token(o.token())).collect(),
+                    found: Some(t),
+                },
+            )),
+        });
+        let operand = level.clone();
+        level = level
+            .foldl(op.then(operand).repeated(), |lhs, (op, rhs): (BinOp, Expr)| {
+                let span = lhs.span.start..rhs.span.end;
+                Expr {
+                    kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+                    span,
+                }
+            })
+            .boxed();
+    }
+    level
 }
 
 // ---- leaves ----

@@ -631,3 +631,52 @@ fn a_qualified_name_cannot_be_rebound() {
         "expected the invalid-target diagnostic, got {e:?}"
     );
 }
+
+#[test]
+fn try_binds_tighter_than_binary_operators() {
+    // `try? get(m, k) orelse 30` is the documented easy path. With `try`'s body
+    // as the full expression parser it read as `try? (get(m, k) orelse 30)` —
+    // an orelse on a non-nullable type, which is a no-op by the language's own
+    // rule, so the default silently never applied and the result stayed
+    // `i64 | null`. A wrong answer with no error.
+    let e = tail("try? get(m, k) orelse 30");
+    let (op, lhs, _) = binop(&e);
+    assert_eq!(op, BinOp::Orelse);
+    assert!(
+        matches!(lhs.kind, ExprKind::Try { form: TryForm::Soften, .. }),
+        "the orelse must apply to the try's result, got {:?}",
+        lhs.kind
+    );
+}
+
+#[test]
+fn postfix_binds_tighter_than_prefix() {
+    // `-x.f` is `-(x.f)`. Folding the prefix operators before postfix ran gave
+    // `(-x).f`, which is what C and Rust do not do.
+    match tail("-x.f").kind {
+        ExprKind::Unary { op: UnOp::Neg, rhs } => {
+            assert!(matches!(rhs.kind, ExprKind::Field { .. }), "got {:?}", rhs.kind)
+        }
+        other => panic!("expected a negation of a field access, got {other:?}"),
+    }
+    match tail("-xs[0]").kind {
+        ExprKind::Unary { op: UnOp::Neg, rhs } => {
+            assert!(matches!(rhs.kind, ExprKind::Index { .. }), "got {:?}", rhs.kind)
+        }
+        other => panic!("expected a negation of an index, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_native_fn_has_no_body() {
+    // The signature is the declaration; the implementation is in the runtime.
+    let m = ok(r#"@native("neon_str_len") fn len(s: str) -> i64"#);
+    match &m.decls[0].kind {
+        DeclKind::Fn(f) => {
+            assert_eq!(f.annotations[0].name, "native");
+            assert!(f.body.is_none());
+            assert!(f.ret.is_some());
+        }
+        other => panic!("expected a fn, got {other:?}"),
+    }
+}
