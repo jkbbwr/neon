@@ -11,9 +11,14 @@ use std::path::Path;
 
 /// Every stdlib file as `(relative path, source)`, sorted for a stable module order.
 pub fn sources() -> Result<Vec<(String, String)>> {
-    let root = Sysroot::stdlib_dir()?;
+    sources_from(&Sysroot::stdlib_dir()?)
+}
+
+/// The walk, against an explicit root. Separate so a test can point at the repo's
+/// stdlib without going through the install-layout probe.
+pub fn sources_from(root: &Path) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
-    collect(&root, &root, &mut out)?;
+    collect(root, root, &mut out)?;
     out.sort();
     Ok(out)
 }
@@ -49,7 +54,9 @@ mod tests {
     /// the whole Phase 1 path, from files to a clean check, without a runtime.
     #[test]
     fn a_program_checks_against_the_on_disk_stdlib() {
-        let sources = sources().expect("stdlib on disk");
+        // The repo stdlib directly, not via the install-layout probe.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib");
+        let sources = sources_from(&root).expect("stdlib on disk");
         assert!(sources.iter().any(|(rel, _)| rel == "std/io.neon"), "io.neon is present");
 
         let std_modules = stdlib::parse(&sources).expect("stdlib parses");

@@ -54,32 +54,13 @@ impl Sysroot {
     /// so requiring it here would make `neon check` unusable before codegen lands.
     pub fn stdlib_dir() -> Result<PathBuf> {
         if let Some(dir) = std::env::var_os("NEON_SYSROOT") {
-            let d = PathBuf::from(dir).join("stdlib");
-            if d.is_dir() {
-                return Ok(d);
-            }
+            return Ok(PathBuf::from(dir).join("stdlib"));
         }
+        // Installed as prefix/bin/neon, so the stdlib is one directory up. A dev tree
+        // has no such layout and sets NEON_SYSROOT.
         let exe = std::env::current_exe().map_err(|e| eyre!("cannot locate the neon binary: {e}"))?;
         let exe_dir = exe.parent().ok_or_else(|| eyre!("the neon binary has no parent directory"))?;
-        // installed: prefix/bin/neon → prefix/stdlib. dev: target/<profile>/neon,
-        // so ../../stdlib is the repo root.
-        // installed prefix/bin; dev target/<profile>; and test binaries in
-        // target/<profile>/deps, one level deeper again.
-        let candidates = [
-            exe_dir.join("stdlib"),
-            exe_dir.join("../stdlib"),
-            exe_dir.join("../../stdlib"),
-            exe_dir.join("../../../stdlib"),
-        ];
-        for c in &candidates {
-            if c.is_dir() {
-                return Ok(c.clone());
-            }
-        }
-        bail!(
-            "cannot find the Neon stdlib under {}. Set NEON_SYSROOT to override.",
-            candidates.iter().map(|p| format!("'{}'", p.display())).collect::<Vec<_>>().join(" or ")
-        )
+        Ok(exe_dir.join("../stdlib"))
     }
 
     pub fn root(&self) -> &PathBuf {
