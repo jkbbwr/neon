@@ -31,8 +31,9 @@ Well-formed iff all of:
    **`opaque` is module-scoped, not absolute.** An opaque record's fields are visible
    inside its own module and to a single parent module; only beyond that is it an atom. So
    contractivity is judged **where the `mu type` is declared**: `opaque record Rng { seed: i64 }`
-   is a data constructor with a guardable field inside `std::rand`, and an unguardable atom
-   outside it. The same `mu type` can be well-formed in one module and rejected in another.
+   declared in `std::rand` is a data constructor with a guardable field inside `std::rand`
+   *and* inside `std`, its one parent — and an unguardable atom anywhere beyond that. The
+   same `mu type` can be well-formed in one module and rejected in another.
 
 2. Recursive references occur **only in covariant positions**. A function parameter is
    contravariant and therefore excluded; a return is covariant and allowed.
