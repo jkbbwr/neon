@@ -5,11 +5,17 @@
 
 pub mod bdd;
 pub mod empty;
+pub mod env;
 pub mod narrow;
+pub mod resolve;
 pub mod types;
 
+#[cfg(test)]
+mod env_tests;
 #[cfg(test)]
 mod tests;
 
 pub use empty::Solver;
+pub use env::{Env, TypeError, TypeErrorKind};
+pub use resolve::Scope;
 pub use types::{RecordAtom, TyId, Types};
