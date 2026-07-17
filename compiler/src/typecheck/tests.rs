@@ -617,3 +617,69 @@ fn reserve_under_union_keeps_the_recursion() {
     };
     assert!(s.is_subtype(one, n), "a one-deep Node is a Node");
 }
+
+// ---- recursion through an arrow ----
+
+/// `mu F = null | (i64) -> F`
+fn mu_arrow(s: &mut Solver) -> TyId {
+    let f = s.t.reserve();
+    let i = s.t.i64();
+    let arrow = s.t.arrow(vec![i], f);
+    let null = s.t.null();
+    let body = s.t.union(null, arrow);
+    let d = s.t.data(body);
+    s.t.define(f, d);
+    f
+}
+
+#[test]
+fn recursion_through_an_arrow_return_is_inhabited() {
+    let mut s = s();
+    let f = mu_arrow(&mut s);
+    assert!(!s.is_empty(f), "`null` is the base case");
+    assert!(s.is_subtype(f, f));
+}
+
+#[test]
+fn a_one_deep_function_is_a_member() {
+    let mut s = s();
+    let f = mu_arrow(&mut s);
+    let i = s.t.i64();
+    let null = s.t.null();
+    let one = s.t.arrow(vec![i], null);
+    assert!(s.is_subtype(one, f), "`(i64) -> null` is an F");
+}
+
+#[test]
+fn a_function_returning_the_wrong_thing_is_not_a_member() {
+    let mut s = s();
+    let f = mu_arrow(&mut s);
+    let i = s.t.i64();
+    let bad = s.t.arrow(vec![i], i);
+    assert!(!s.is_subtype(bad, f), "`(i64) -> i64` is not an F");
+}
+
+#[test]
+fn a_recursive_arrow_is_equi_recursive() {
+    let mut s = s();
+    let f = mu_arrow(&mut s);
+    let i = s.t.i64();
+    let null = s.t.null();
+    let arrow = s.t.arrow(vec![i], f);
+    let unfolded = s.t.union(null, arrow);
+    assert!(s.is_equiv(f, unfolded));
+}
+
+#[test]
+fn a_recursive_arrow_with_no_base_case_is_empty() {
+    let mut s = s();
+    // `mu G = (i64) -> G`. Unlike the record case this IS inhabited: a function is a
+    // value whether or not calling it ever terminates, so the arrow does not need a
+    // base case the way a record's field does.
+    let g = s.t.reserve();
+    let i = s.t.i64();
+    let arrow = s.t.arrow(vec![i], g);
+    let d = s.t.data(arrow);
+    s.t.define(g, d);
+    assert!(!s.is_empty(g));
+}

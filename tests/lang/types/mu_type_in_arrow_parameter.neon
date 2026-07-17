@@ -1,0 +1,13 @@
+//@ compile-fail
+//@ error-contains: contravariant
+//
+// A parameter is the one constructor position that guards nothing: an arrow is
+// contravariant there, so the recursion has no fixed point to converge to.
+// decisions.md rule 2: "a function parameter is contravariant and therefore
+// excluded". The return position in the sibling test is fine.
+
+mu type F = null | (F) -> i64
+
+fn f(v: F) -> i64 { 0 }
+
+fn main() {}

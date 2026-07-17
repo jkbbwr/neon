@@ -1,0 +1,18 @@
+// Recursion through a function type is contractive. An arrow is a constructor and
+// its return is covariant, so `(i64) -> F` guards `F` exactly as `List[F]` does.
+// decisions.md rule 2: "a return is covariant and allowed".
+//
+// The previous rejection was not a fact about the language. It was a fact about a
+// solver that could not represent the cycle, declared as a rule so the limitation
+// would be stated rather than met at a crash.
+
+use std::io;
+
+mu type F = null | (i64) -> F
+
+fn is_done(f: F) -> bool { f is null }
+
+fn main() {
+    let done: F = null;
+    io::println(if is_done(done) { "done" } else { "more" });
+}

@@ -418,16 +418,23 @@ fn recursion_beneath_a_negation_is_rejected() {
 }
 
 #[test]
-fn recursion_through_a_function_type_is_rejected() {
+fn recursion_through_an_arrow_return_is_allowed() {
+    // A return is covariant and the arrow guards it, so this is contractive.
     let e = env("mu type F = null | (i64) -> F");
-    assert_eq!(kinds(&e), vec![TypeErrorKind::MuUnderArrow("F".into())]);
-    assert!(errors(&e)[0].contains("function"));
+    assert_eq!(kinds(&e), vec![]);
 }
 
 #[test]
-fn recursion_in_a_parameter_is_rejected_too() {
+fn recursion_in_a_parameter_is_rejected() {
     let e = env("mu type F = null | (F) -> i64");
-    assert_eq!(kinds(&e), vec![TypeErrorKind::MuUnderArrow("F".into())]);
+    assert_eq!(kinds(&e), vec![TypeErrorKind::MuInParameter("F".into())]);
+    assert!(errors(&e)[0].contains("contravariant"));
+}
+
+#[test]
+fn a_parameter_is_rejected_even_when_a_return_also_recurses() {
+    let e = env("mu type F = null | (F) -> F");
+    assert_eq!(kinds(&e), vec![TypeErrorKind::MuInParameter("F".into())]);
 }
 
 #[test]

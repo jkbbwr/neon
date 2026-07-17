@@ -41,7 +41,7 @@ pub enum TypeErrorKind {
     MuMutual { name: String, other: String },
     MuUnguarded(String),
     MuUnderNegation(String),
-    MuUnderArrow(String),
+    MuInParameter(String),
     TooDeep(String),
 }
 
@@ -88,10 +88,10 @@ impl fmt::Display for TypeError {
                 "the recursive occurrence of `{n}` sits beneath a negation, which has \
                  no fixed point"
             ),
-            TypeErrorKind::MuUnderArrow(n) => write!(
+            TypeErrorKind::MuInParameter(n) => write!(
                 f,
-                "recursion through a function type is not supported: `{n}` occurs \
-                 beneath an arrow"
+                "the recursive occurrence of `{n}` sits in a function parameter, which \
+                 is contravariant"
             ),
             TypeErrorKind::TooDeep(n) => write!(
                 f,
@@ -739,10 +739,12 @@ struct Ctx {
 #[derive(Clone, Copy)]
 struct Pos {
     /// Beneath a structural constructor: a generic argument, a field, a tuple
-    /// element. This is what makes unfolding make progress.
+    /// element, an arrow's return. This is what makes unfolding make progress.
     guarded: bool,
     neg: bool,
-    arrow: bool,
+    /// In a function parameter. An arrow is contravariant there, so it is the one
+    /// constructor position that guards nothing.
+    contra: bool,
 }
 
 struct Contract<'a> {
@@ -772,7 +774,7 @@ fn contractivity(env: &Env, key: &str) -> (Vec<TypeError>, bool) {
         found: false,
     };
     let ctx = Rc::new(Ctx { module: decl.module.clone(), subst: HashMap::new() });
-    c.walk(&a.value, &ctx, Pos { guarded: false, neg: false, arrow: false });
+    c.walk(&a.value, &ctx, Pos { guarded: false, neg: false, contra: false });
     // One occurrence is reached twice — once as a generic argument, once through
     // the field that argument is substituted into — and it is one mistake.
     let mut seen: Vec<TypeError> = Vec::new();
@@ -805,11 +807,16 @@ impl Contract<'_> {
                 }
             }
             ast::TypeSpecKind::Fn { params, ret } => {
-                let arrow = Pos { arrow: true, ..under };
+                // decisions.md rule 2: a parameter is contravariant and excluded, a
+                // return is covariant and allowed. The arrow guards the return like
+                // any other constructor — `ArrowAtom` holds it as a raw `TyId`, which
+                // is exactly the path a boolean op never snapshots, so the cycle
+                // closes there the same way it does through a field.
+                let param = Pos { contra: true, ..under };
                 for p in params {
-                    self.walk(p, ctx, arrow);
+                    self.walk(p, ctx, param);
                 }
-                self.walk(ret, ctx, arrow);
+                self.walk(ret, ctx, under);
             }
             ast::TypeSpecKind::Named { path, args } => self.named(spec, path, args, ctx, pos),
             _ => {}
@@ -844,8 +851,8 @@ impl Contract<'_> {
                 TypeErrorKind::MuMutual { name: self.name.clone(), other: other.clone() }
             } else if pos.neg {
                 TypeErrorKind::MuUnderNegation(self.name.clone())
-            } else if pos.arrow {
-                TypeErrorKind::MuUnderArrow(self.name.clone())
+            } else if pos.contra {
+                TypeErrorKind::MuInParameter(self.name.clone())
             } else if !pos.guarded {
                 TypeErrorKind::MuUnguarded(self.name.clone())
             } else {
