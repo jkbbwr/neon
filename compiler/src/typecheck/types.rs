@@ -106,6 +106,10 @@ pub struct ArrowAtom {
 pub struct TyData {
     pub base: BaseSet,
     pub atoms: AtomSetId,
+    /// Rigid type variables. Inside `fn show[T](x: T)`, `T` is opaque: a singleton
+    /// disjoint from every other type, exactly like an atom, so it reuses the
+    /// finite-or-cofinite machinery rather than needing a sixth BDD.
+    pub vars: AtomSetId,
     pub records: BddId,
     pub tuples: BddId,
     pub arrows: BddId,
@@ -229,10 +233,12 @@ impl Types {
     /// which is what its assumption set is for.
     pub fn reserve(&mut self) -> TyId {
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         let id = TyId(self.tys.len() as u32);
         self.tys.push(TyData {
             base: 0,
             atoms,
+            vars,
             records: bdd::FALSE,
             tuples: bdd::FALSE,
             arrows: bdd::FALSE,
@@ -283,9 +289,11 @@ impl Types {
 
     pub fn never(&mut self) -> TyId {
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: 0,
             atoms,
+            vars,
             records: bdd::FALSE,
             tuples: bdd::FALSE,
             arrows: bdd::FALSE,
@@ -296,9 +304,11 @@ impl Types {
     /// thing here to fall back to.
     pub fn any(&mut self) -> TyId {
         let atoms = self.atomset(AtomSet::all());
+        let vars = self.atomset(AtomSet::all());
         self.intern(TyData {
             base: B_ANY,
             atoms,
+            vars,
             records: bdd::TRUE,
             tuples: bdd::TRUE,
             arrows: bdd::TRUE,
@@ -307,9 +317,11 @@ impl Types {
 
     pub fn of_base(&mut self, b: BaseSet) -> TyId {
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: b,
             atoms,
+            vars,
             records: bdd::FALSE,
             tuples: bdd::FALSE,
             arrows: bdd::FALSE,
@@ -345,9 +357,30 @@ impl Types {
 
     pub fn atom(&mut self, n: NameId) -> TyId {
         let atoms = self.atomset(AtomSet { neg: false, names: vec![n] });
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: 0,
             atoms,
+            vars,
+            records: bdd::FALSE,
+            tuples: bdd::FALSE,
+            arrows: bdd::FALSE,
+        })
+    }
+
+    /// A rigid type variable: the `T` inside `fn show[T](x: T)`.
+    ///
+    /// Opaque and disjoint from every concrete type, which is what makes the body
+    /// checkable once rather than per call site. The cost is that `x is i64` inside a
+    /// generic body reads as a dead branch — sound for checking, since the body must
+    /// hold for every `T`, but it means narrowing a type parameter is not a thing.
+    pub fn var(&mut self, n: NameId) -> TyId {
+        let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet { neg: false, names: vec![n] });
+        self.intern(TyData {
+            base: 0,
+            atoms,
+            vars,
             records: bdd::FALSE,
             tuples: bdd::FALSE,
             arrows: bdd::FALSE,
@@ -358,9 +391,11 @@ impl Types {
         let id = self.rec_atom(a);
         let b = self.rec_bdd.atom(id);
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: 0,
             atoms,
+            vars,
             records: b,
             tuples: bdd::FALSE,
             arrows: bdd::FALSE,
@@ -371,9 +406,11 @@ impl Types {
         let id = self.tup_atom(TupleAtom { elems });
         let b = self.tup_bdd.atom(id);
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: 0,
             atoms,
+            vars,
             records: bdd::FALSE,
             tuples: b,
             arrows: bdd::FALSE,
@@ -384,9 +421,11 @@ impl Types {
         let id = self.arrow_atom(ArrowAtom { params, ret });
         let b = self.arrow_bdd.atom(id);
         let atoms = self.atomset(AtomSet::empty());
+        let vars = self.atomset(AtomSet::empty());
         self.intern(TyData {
             base: 0,
             atoms,
+            vars,
             records: bdd::FALSE,
             tuples: bdd::FALSE,
             arrows: b,
@@ -401,9 +440,11 @@ impl Types {
         // is an anonymous record.
         let tag = {
             let a = self.atomset(AtomSet::all());
+            let v = self.atomset(AtomSet::empty());
             self.intern(TyData {
                 base: B_UNDEF,
                 atoms: a,
+                vars: v,
                 records: bdd::FALSE,
                 tuples: bdd::FALSE,
                 arrows: bdd::FALSE,
@@ -438,10 +479,14 @@ impl Types {
             let (p, q) = (self.atomset_of(x.atoms).clone(), self.atomset_of(y.atoms).clone());
             self.atomset(atomset_or(&p, &q))
         };
+        let vars = {
+            let (p, q) = (self.atomset_of(x.vars).clone(), self.atomset_of(y.vars).clone());
+            self.atomset(atomset_or(&p, &q))
+        };
         let records = self.rec_bdd.or(x.records, y.records);
         let tuples = self.tup_bdd.or(x.tuples, y.tuples);
         let arrows = self.arrow_bdd.or(x.arrows, y.arrows);
-        self.intern(TyData { base: x.base | y.base, atoms, records, tuples, arrows })
+        self.intern(TyData { base: x.base | y.base, atoms, vars, records, tuples, arrows })
     }
 
     pub fn intersect(&mut self, a: TyId, b: TyId) -> TyId {
@@ -450,10 +495,14 @@ impl Types {
             let (p, q) = (self.atomset_of(x.atoms).clone(), self.atomset_of(y.atoms).clone());
             self.atomset(atomset_and(&p, &q))
         };
+        let vars = {
+            let (p, q) = (self.atomset_of(x.vars).clone(), self.atomset_of(y.vars).clone());
+            self.atomset(atomset_and(&p, &q))
+        };
         let records = self.rec_bdd.and(x.records, y.records);
         let tuples = self.tup_bdd.and(x.tuples, y.tuples);
         let arrows = self.arrow_bdd.and(x.arrows, y.arrows);
-        self.intern(TyData { base: x.base & y.base, atoms, records, tuples, arrows })
+        self.intern(TyData { base: x.base & y.base, atoms, vars, records, tuples, arrows })
     }
 
     /// Complement within ⊤. `B_UNDEF` is included: a field's negation has to be able
@@ -464,10 +513,14 @@ impl Types {
             let p = self.atomset_of(x.atoms).clone();
             self.atomset(AtomSet { neg: !p.neg, names: p.names })
         };
+        let vars = {
+            let p = self.atomset_of(x.vars).clone();
+            self.atomset(AtomSet { neg: !p.neg, names: p.names })
+        };
         let records = self.rec_bdd.not(x.records);
         let tuples = self.tup_bdd.not(x.tuples);
         let arrows = self.arrow_bdd.not(x.arrows);
-        self.intern(TyData { base: !x.base & B_ALL, atoms, records, tuples, arrows })
+        self.intern(TyData { base: !x.base & B_ALL, atoms, vars, records, tuples, arrows })
     }
 
     pub fn diff(&mut self, a: TyId, b: TyId) -> TyId {

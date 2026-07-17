@@ -77,6 +77,9 @@ impl Solver {
         if !self.t.atomset_of(d.atoms).is_empty_set() {
             return false;
         }
+        if !self.t.atomset_of(d.vars).is_empty_set() {
+            return false;
+        }
         if !self.records_empty(d.records) {
             return false;
         }

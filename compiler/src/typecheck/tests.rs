@@ -517,3 +517,74 @@ fn recursive_emptiness_does_not_poison_the_memo() {
     assert!(!s.is_empty(i));
     assert!(!s.is_subtype(i, a));
 }
+
+// ---- rigid type variables ----
+
+#[test]
+fn a_type_variable_is_opaque_and_reflexive() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let v = s.t.var(t);
+    assert!(!s.is_empty(v));
+    assert!(s.is_subtype(v, v));
+}
+
+#[test]
+fn distinct_type_variables_are_disjoint() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let u = s.t.name("U");
+    let vt = s.t.var(t);
+    let vu = s.t.var(u);
+    let meet = s.t.intersect(vt, vu);
+    assert!(s.is_empty(meet));
+    assert!(!s.is_subtype(vt, vu));
+}
+
+#[test]
+fn a_type_variable_is_disjoint_from_concrete_types() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let v = s.t.var(t);
+    let i = s.t.i64();
+    let meet = s.t.intersect(v, i);
+    assert!(s.is_empty(meet), "T is opaque: it is not i64 until instantiated");
+}
+
+#[test]
+fn a_type_variable_is_below_any() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let v = s.t.var(t);
+    let a = s.t.any();
+    assert!(s.is_subtype(v, a), "any is top, so every T fits");
+    assert!(!s.is_subtype(a, v));
+}
+
+#[test]
+fn a_type_variable_survives_negation() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let v = s.t.var(t);
+    let nv = s.t.negate(v);
+    let meet = s.t.intersect(v, nv);
+    assert!(s.is_empty(meet));
+
+    let u = s.t.name("U");
+    let vu = s.t.var(u);
+    assert!(s.is_subtype(vu, nv), "U is not T, so U <: !T");
+}
+
+#[test]
+fn a_type_variable_can_be_a_field_and_a_generic_argument() {
+    let mut s = s();
+    let t = s.t.name("T");
+    let v = s.t.var(t);
+    let b = boxed(&mut s, v);
+    assert!(!s.is_empty(b), "Box[T] is inhabited");
+
+    let i = s.t.i64();
+    let bi = boxed(&mut s, i);
+    let meet = s.t.intersect(b, bi);
+    assert!(s.is_empty(meet), "Box[T] and Box[i64] are disjoint while T is rigid");
+}
