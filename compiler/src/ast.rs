@@ -2,8 +2,13 @@
 //!
 //! Spans are carried on every node a diagnostic can point at.
 
+mod ids;
 mod spans;
 
+#[cfg(test)]
+mod tests;
+
+pub use ids::number_exprs;
 pub use spans::strip_spans;
 
 use crate::lexer::Span;
@@ -211,10 +216,24 @@ pub enum StmtKind {
 
 // ---- expressions ----
 
+/// Stable per-expression identity, assigned by a pre-order pass after parsing.
+///
+/// The checker records a type for every expression keyed on this. Spans are not
+/// usable for the job: two expressions can share a span, and a span is a fact
+/// about source position that formatting is allowed to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExprId(pub u32);
+
+impl ExprId {
+    /// What the parser builds. `number_exprs` replaces it.
+    pub const UNSET: ExprId = ExprId(u32::MAX);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
+    pub id: ExprId,
 }
 
 #[derive(Debug, Clone, PartialEq)]

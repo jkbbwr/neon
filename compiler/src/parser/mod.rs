@@ -22,7 +22,14 @@ pub fn parse(tokens: &[Spanned], eoi: usize) -> (Option<Module>, Vec<ParseError>
     // Bound rather than inlined: as a temporary the parser outlives `owned`,
     // which it borrows, and is dropped after it.
     let parser = module();
-    parser.parse(input).into_output_errors()
+    let (module, errors) = parser.parse(input).into_output_errors();
+    // Numbered here so no consumer can forget to: an UNSET id is not an absent
+    // type, it is a collision with every other UNSET node.
+    let module = module.map(|mut m| {
+        number_exprs(&mut m);
+        m
+    });
+    (module, errors)
 }
 
 /// Shorthand for the bound every rule below satisfies.
@@ -714,7 +721,7 @@ where
     // It must come before `rest`, which would otherwise parse the whole thing as
     // a binary expression.
     let block_like_stmt = keyword_block_like(expr.clone(), cond, block, ty.clone())
-        .map_with(|kind, e| Expr { kind, span: e.span() })
+        .map_with(|kind, e| Expr { kind, span: e.span(), id: ExprId::UNSET })
         .then(just(Token::Semi).or_not())
         .map(|(e, semi)| Item::Expr(e, semi.is_some()))
         .boxed();
@@ -837,9 +844,10 @@ where
         .map_with(|kind, e| Expr {
             kind: ExprKind::Unary {
                 op: UnOp::Neg,
-                rhs: Box::new(Expr { kind, span: e.span() }),
+                rhs: Box::new(Expr { kind, span: e.span(), id: ExprId::UNSET }),
             },
             span: e.span(),
+            id: ExprId::UNSET,
         });
 
     choice((neg, literal_token(), string_expr(expr))).boxed()
@@ -859,7 +867,7 @@ where
         Token::False => ExprKind::Bool(false),
         Token::Null => ExprKind::Null,
     }
-    .map_with(|kind, e| Expr { kind, span: e.span() })
+    .map_with(|kind, e| Expr { kind, span: e.span(), id: ExprId::UNSET })
 }
 
 /// Reassembles the lexer's flat string token run into parts.
@@ -876,7 +884,7 @@ where
         .repeated()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::StrStart), just(Token::StrEnd))
-        .map_with(|parts, e| Expr { kind: ExprKind::Str(parts), span: e.span() })
+        .map_with(|parts, e| Expr { kind: ExprKind::Str(parts), span: e.span(), id: ExprId::UNSET })
         .boxed()
 }
 
@@ -1013,7 +1021,7 @@ where
         literal_token().map(|e| e.kind).boxed(),
         path_expr,
     ))
-    .map_with(|kind, e| Expr { kind, span: e.span() })
+    .map_with(|kind, e| Expr { kind, span: e.span(), id: ExprId::UNSET })
     .labelled("an expression")
     .boxed()
 }
@@ -1030,6 +1038,7 @@ where
     ))
     .repeated()
     .foldr_with(postfixed, |op, rhs, e| Expr {
+        id: ExprId::UNSET,
         kind: ExprKind::Unary { op, rhs: Box::new(rhs) },
         span: e.span(),
     })
@@ -1114,10 +1123,14 @@ where
                 just(Token::Else)
                     .ignore_then(choice((
                         if_chain
-                            .map_with(|kind, e| Expr { kind, span: e.span() })
+                            .map_with(|kind, e| Expr { kind, span: e.span(), id: ExprId::UNSET })
                             .boxed(),
                         block
-                            .map_with(|b, e| Expr { kind: ExprKind::Block(b), span: e.span() })
+                            .map_with(|b, e| Expr {
+                                kind: ExprKind::Block(b),
+                                span: e.span(),
+                                id: ExprId::UNSET,
+                            })
                             .boxed(),
                     )))
                     .or_not(),
@@ -1227,7 +1240,7 @@ where
                 Post::Is(ty) => ExprKind::Is { lhs: Box::new(lhs), ty },
                 Post::As(ty) => ExprKind::As { lhs: Box::new(lhs), ty },
             };
-            Expr { kind, span: e.span() }
+            Expr { kind, span: e.span(), id: ExprId::UNSET }
         },
     )
     .boxed()
@@ -1267,6 +1280,7 @@ where
                 Expr {
                     kind: ExprKind::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
                     span,
+                    id: ExprId::UNSET,
                 }
             })
             .boxed();
