@@ -485,16 +485,29 @@ where
 
 // ---- types ----
 
-/// `(A, B)` — the items of a parenthesised type, before deciding what it is.
-fn paren_items<'t, I>(ty: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, Vec<TypeSpec>>
+/// `(A, B)` and whether a trailing comma closed it.
+///
+/// The comma is captured rather than merely allowed, because it is the only thing
+/// that could distinguish `(x,)` from `(x)` — and `(x,)` is an error rather than a
+/// one-element tuple, which needs seeing it to say so.
+fn paren_group<'t, I, O>(item: impl P<'t, I, O> + 't) -> impl P<'t, I, (Vec<O>, bool)>
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
+    O: 't,
 {
-    ty.separated_by(just(Token::Comma))
-        .allow_trailing()
+    item.separated_by(just(Token::Comma))
         .collect::<Vec<_>>()
+        .then(just(Token::Comma).or_not())
         .delimited_by(just(Token::LParen), just(Token::RParen))
+        .map(|(items, trailing)| (items, trailing.is_some()))
         .boxed()
+}
+
+/// `()` is unit, `(A)` is a grouping, `(A, B)` is a tuple. There is nothing at
+/// arity one, so `(A,)` is an error rather than a quietly-different type.
+fn one_element_tuple(span: Span, items: usize, trailing: bool) -> Option<ParseError> {
+    (items == 1 && trailing)
+        .then(|| ParseError::new(span, ParseErrorKind::OneElementTuple))
 }
 
 /// A tuple, or a grouping when there is one item. Never an arrow.
@@ -502,8 +515,11 @@ fn paren_plain<'t, I>(ty: impl P<'t, I, TypeSpec> + 't) -> impl P<'t, I, TypeSpe
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
-    paren_items(ty)
-        .map(|items| {
+    paren_group(ty)
+        .validate(|(items, trailing), e, emitter| {
+            if let Some(err) = one_element_tuple(e.span(), items.len(), trailing) {
+                emitter.emit(err);
+            }
             if items.len() == 1 {
                 items.into_iter().next().expect("len 1").kind
             } else {
@@ -623,16 +639,26 @@ where
             .or_not();
 
         // `(A, B) throws E -> C`, `(A, B) -> C` and `(A, B)`; `(A)` is just a grouping.
-        let parens = paren_items(ty.clone())
+        // A trailing comma is only suspect when this is a tuple: `(A,) -> B` is a
+        // parameter list, where it means nothing, like every other list.
+        let parens = paren_group(ty.clone())
             .then(codomain)
-            .map(|(items, codomain)| match codomain {
+            .validate(|((items, trailing), codomain), e, emitter| match codomain {
                 Some((throws, ret)) => TypeSpecKind::Fn {
                     params: items,
                     throws: throws.map(Box::new),
                     ret: Box::new(ret),
                 },
-                None if items.len() == 1 => items.into_iter().next().expect("len 1").kind,
-                None => TypeSpecKind::Tuple(items),
+                None => {
+                    if let Some(err) = one_element_tuple(e.span(), items.len(), trailing) {
+                        emitter.emit(err);
+                    }
+                    if items.len() == 1 {
+                        items.into_iter().next().expect("len 1").kind
+                    } else {
+                        TypeSpecKind::Tuple(items)
+                    }
+                }
             })
             .boxed();
 
@@ -886,12 +912,17 @@ where
             .map(|(path, (fields, rest))| PatternKind::Record { path, fields, rest })
             .boxed();
 
-        let tuple_pat = pat
-            .separated_by(just(Token::Comma))
-            .allow_trailing()
-            .collect::<Vec<_>>()
-            .delimited_by(just(Token::LParen), just(Token::RParen))
-            .map(PatternKind::Tuple)
+        let tuple_pat = paren_group(pat)
+            .validate(|(items, trailing), e, emitter| {
+                if let Some(err) = one_element_tuple(e.span(), items.len(), trailing) {
+                    emitter.emit(err);
+                }
+                if items.len() == 1 {
+                    items.into_iter().next().expect("len 1").kind
+                } else {
+                    PatternKind::Tuple(items)
+                }
+            })
             .boxed();
 
         let literal = literal_expr(expr)
@@ -976,13 +1007,11 @@ fn atom_expr<'t, I>(
 where
     I: ValueInput<'t, Token = Token, Span = Span>,
 {
-    let paren = expr
-        .clone()
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LParen), just(Token::RParen))
-        .map(|items| {
+    let paren = paren_group(expr.clone())
+        .validate(|(items, trailing), e, emitter| {
+            if let Some(err) = one_element_tuple(e.span(), items.len(), trailing) {
+                emitter.emit(err);
+            }
             if items.len() == 1 {
                 items.into_iter().next().expect("len 1").kind
             } else {

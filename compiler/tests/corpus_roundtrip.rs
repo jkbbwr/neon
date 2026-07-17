@@ -122,6 +122,8 @@ fn the_corpus_round_trips() {
         round_tripped >= 189,
         "the corpus shrank: {round_tripped} files round-trip, was at least 189"
     );
-    // Only the compile-fail tests are expected not to parse.
-    assert_eq!(files.len() - parsed, 2, "a different set of files parses now");
+    // Only the compile-fail tests that fail at the SYNTAX level are expected not to
+    // parse. Most compile-fail tests parse fine and fail later, so this is a small
+    // number and a new one is worth noticing — which is why it stays exact.
+    assert_eq!(files.len() - parsed, 3, "a different set of files parses now");
 }

@@ -1,0 +1,20 @@
+//@ compile-fail
+//@ error-contains: one-element tuple
+//
+// There is nothing at tuple arity one. `()` is unit, `(A)` is a grouping, and
+// `(A, B)` is a tuple — but `(A,)` is an error rather than a quietly different
+// type from `A`.
+//
+// The reason is uniformity, not taste. A trailing comma is allowed and
+// meaningless in every other list in the grammar: parameters, arguments, record
+// fields, generic arguments, list literals, structural types. Making it
+// significant in exactly this one place is a rule you would have to remember,
+// and `neon fmt` breaks a group across lines by adding a trailing comma — so
+// under that rule the formatter could silently turn a grouping into a tuple.
+//
+// Rust and Python both spend this complexity because macros and trait impls over
+// tuple arities need `(T,)`. Neon has neither, so it buys nothing here.
+
+type Single = (str,)
+
+fn main() {}

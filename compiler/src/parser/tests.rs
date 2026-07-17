@@ -787,3 +787,61 @@ fn a_block_like_expression_is_still_a_value_where_one_is_expected() {
     let b = body("fn main() { if a { 1 } else { 2 } }");
     assert!(b.tail.is_some(), "the trailing if is the block's value");
 }
+
+#[test]
+fn there_is_no_one_element_tuple() {
+    // Silently discarding the comma is what this replaces: `(str,)` used to parse
+    // as plain `str`, so the type you wrote was not the type you got.
+    for src in [
+        "type A = (str,)",
+        "fn f() { let a = (1,); }",
+        "fn f() { match p { (a,) => 1, _ => 0 } }",
+    ] {
+        let e = errs(src);
+        assert!(
+            e.iter().any(|e| matches!(e.kind, ParseErrorKind::OneElementTuple)),
+            "{src} -- got {e:?}"
+        );
+    }
+}
+
+#[test]
+fn a_trailing_comma_is_insignificant_everywhere_it_is_allowed() {
+    // The whole reason `(x,)` is rejected rather than meaningful: a trailing comma
+    // means nothing in any other list, so it does not get to change a type here.
+    ok("type C = (str, i64,)");
+    ok("fn f(a: i64,) -> i64 { 0 }");
+    ok("fn f() -> i64 { g(1, 2,) }");
+    ok("fn f() -> i64 { let xs = [1, 2,]; 0 }");
+    ok("record R { a: i64, b: str, }");
+    ok("type S = { a: i64, b: str, }");
+}
+
+#[test]
+fn a_trailing_comma_in_an_arrow_parameter_list_is_fine() {
+    // `(A,) -> B` is a parameter list, not a tuple, so the comma means nothing.
+    let m = ok("type D = (i64,) -> str");
+    let DeclKind::TypeAlias(a) = &m.decls[0].kind else { panic!("a type alias") };
+    let TypeSpecKind::Fn { params, .. } = &a.value.kind else { panic!("an arrow") };
+    assert_eq!(params.len(), 1);
+}
+
+#[test]
+fn parens_of_one_are_a_grouping_not_a_tuple() {
+    let m = ok("type B = (str)");
+    let DeclKind::TypeAlias(a) = &m.decls[0].kind else { panic!("a type alias") };
+    assert!(matches!(&a.value.kind, TypeSpecKind::Named { path, .. } if path == &["str"]));
+
+    // Patterns used to disagree with types here: `(x)` built a 1-tuple pattern
+    // while `(i64)` was a grouping.
+    ok("fn f() { match p { (a) => 1, _ => 0 } }");
+}
+
+#[test]
+fn unit_and_larger_tuples_are_unaffected() {
+    ok("type E = ()");
+    let m = ok("type F = (i64, str)");
+    let DeclKind::TypeAlias(a) = &m.decls[0].kind else { panic!("a type alias") };
+    let TypeSpecKind::Tuple(v) = &a.value.kind else { panic!("a tuple") };
+    assert_eq!(v.len(), 2);
+}

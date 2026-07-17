@@ -35,6 +35,9 @@ pub enum ParseErrorKind {
     IndexAssignment,
     /// `f() = e` and friends: the target is not something that can be rebound.
     InvalidAssignTarget,
+    /// `(x,)` — there is no one-element tuple. A trailing comma is insignificant
+    /// in every other list, so it does not get to change a meaning here.
+    OneElementTuple,
 }
 
 /// What the parser wanted. Mirrors chumsky's `DefaultExpected`, but owned and
@@ -66,6 +69,12 @@ impl fmt::Display for ParseError {
                     None => write!(f, ", found end of input"),
                 }
             }
+            ParseErrorKind::OneElementTuple => write!(
+                f,
+                "there is no one-element tuple: write `x` rather than `(x,)`. A \
+                 trailing comma is insignificant everywhere else, so it does not \
+                 change a meaning here either"
+            ),
             ParseErrorKind::EnumDeclaration => write!(
                 f,
                 "`enum` does not exist: declare the variants as records and union them, \
