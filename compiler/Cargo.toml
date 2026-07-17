@@ -2,3 +2,6 @@
 name = "neon-compiler"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+unicode-ident = "1.0.24"

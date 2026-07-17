@@ -253,6 +253,60 @@ on that would break the rule that constant folding and runtime agree exactly —
 shape as wrapping arithmetic, where the language defines the behaviour and `-fwrapv` has
 to guarantee it.
 
+## Source and identifiers are UTF-8
+
+    let café = 1
+    let 日本語 = 2
+
+Identifiers follow **UAX #31** — `XID_Start` / `XID_Continue`, the rule Rust uses, via the
+`unicode-ident` crate (one dependency, no transitive ones). Atoms follow the same rule.
+A character that is neither `XID_Start` nor punctuation — an emoji, say — is an
+`unexpected character`, not a mangled identifier.
+
+*Against:* the graveyard's `#609`, which called unicode identifiers a non-goal and lexed
+identifiers as ASCII-only.
+
+*Open:* **normalization.** `café` composed (U+00E9) and `café` decomposed (`e` + U+0301)
+are currently different identifiers that render identically. Rust normalizes to NFC and
+warns on confusable and mixed-script identifiers, because this is a supply-chain attack
+vector rather than a curiosity. Nothing here does that yet.
+
+## The lexer is hand-written; no logos
+
+*Against:* logos, which the previous implementation used. It was earning about 30% of the
+work — keyword matching, the ident and atom regexes, the outer shape of numbers and
+strings — and constraining the rest. Everything interesting there was already a hand-written
+callback: integer parsing, string escapes, rune escapes (a near-duplicate of the string
+ones), sigils, and nested block comments, which a regex cannot count.
+
+It also cannot do interpolation at all: `#{}` needs a mode stack with brace-depth counting
+and string-state tracking, and logos is a stateless DFA matcher. The hybrid — logos wrapped
+in a hand-written mode driver — is more complex than either pure option.
+
+Two concrete costs it imposed: the error channel is one `Default`-able type per token, so
+every literal parser returned `Option` and a bad escape became "Unrecognized" with no
+position; and `Int(i64)` made `-9223372036854775808` unlexable, because the magnitude
+overflows before the parser can fold the sign.
+
+Speed is irrelevant — lexing is never a compiler's bottleneck.
+
+## Tests are `test "name" { ... }` blocks with assert intrinsics
+
+    test "adds two" {
+        assert_eq(add(1, 1), 2)
+    }
+
+    bench "push 1k" { ... }
+
+`assert`, `assert_eq`, `assert_ne`, `assert_throws` are **intrinsics**, not stdlib
+functions: the compiler knows them, so a failure can report the actual values and the
+source span rather than just "assertion failed". An ordinary function cannot see its
+argument's source text.
+
+`test` and `bench` blocks are stripped from normal builds.
+
+The previous implementation reserved all six keywords and built none of it.
+
 ## Inherited, unchanged
 
 From the graveyard's `tasks/`, still authoritative — restated here only as an index:
