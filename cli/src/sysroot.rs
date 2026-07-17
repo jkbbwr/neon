@@ -47,6 +47,41 @@ impl Sysroot {
         )
     }
 
+    /// The stdlib directory alone, for front-end runs that need no runtime.
+    ///
+    /// Probed independently of `lib/libneon_rt.a`: type-checking needs only the
+    /// stdlib source, and the runtime archive does not exist until the backend does,
+    /// so requiring it here would make `neon check` unusable before codegen lands.
+    pub fn stdlib_dir() -> Result<PathBuf> {
+        if let Some(dir) = std::env::var_os("NEON_SYSROOT") {
+            let d = PathBuf::from(dir).join("stdlib");
+            if d.is_dir() {
+                return Ok(d);
+            }
+        }
+        let exe = std::env::current_exe().map_err(|e| eyre!("cannot locate the neon binary: {e}"))?;
+        let exe_dir = exe.parent().ok_or_else(|| eyre!("the neon binary has no parent directory"))?;
+        // installed: prefix/bin/neon → prefix/stdlib. dev: target/<profile>/neon,
+        // so ../../stdlib is the repo root.
+        // installed prefix/bin; dev target/<profile>; and test binaries in
+        // target/<profile>/deps, one level deeper again.
+        let candidates = [
+            exe_dir.join("stdlib"),
+            exe_dir.join("../stdlib"),
+            exe_dir.join("../../stdlib"),
+            exe_dir.join("../../../stdlib"),
+        ];
+        for c in &candidates {
+            if c.is_dir() {
+                return Ok(c.clone());
+            }
+        }
+        bail!(
+            "cannot find the Neon stdlib under {}. Set NEON_SYSROOT to override.",
+            candidates.iter().map(|p| format!("'{}'", p.display())).collect::<Vec<_>>().join(" or ")
+        )
+    }
+
     pub fn root(&self) -> &PathBuf {
         &self.0
     }

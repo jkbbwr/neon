@@ -1,5 +1,6 @@
 mod cmd;
 mod source;
+mod stdlib;
 mod sysroot;
 
 use clap::{Parser, Subcommand};

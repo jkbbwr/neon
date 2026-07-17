@@ -1,0 +1,6 @@
+// Console output. Every function here bottoms out in the runtime; the bodies live
+// in libneon_rt, and these are the signatures the checker resolves against.
+
+@native("neon_io_println") fn println(s: str)
+@native("neon_io_print") fn print(s: str)
+@native("neon_io_eprintln") fn eprintln(s: str)

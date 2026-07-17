@@ -32,7 +32,16 @@ pub fn run(file: &OsString, lib: bool) -> Result<()> {
     let module = module.expect("no errors means a module");
 
     let unit = if lib { Unit::Library } else { Unit::RootApplication };
-    let mut env = Env::build_as(&module, unit);
+
+    // The stdlib is declared alongside the program, so `use std::io` resolves.
+    let std_sources = crate::stdlib::sources()?;
+    let std_modules = neon_compiler::stdlib::parse(&std_sources)
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+    let mut modules: Vec<(Vec<String>, &_)> =
+        std_modules.iter().map(|(p, m)| (p.clone(), m)).collect();
+    modules.push((Vec::new(), &module));
+
+    let mut env = Env::build_with(&modules, unit);
     // Declarations first: a body checked against a signature that did not resolve
     // would report the same mistake twice.
     if env.errors().is_empty() {
