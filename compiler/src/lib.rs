@@ -6,6 +6,7 @@ pub mod format;
 pub mod lexer;
 pub mod ops;
 pub mod parser;
+pub mod stdlib;
 pub mod typecheck;
 
 /// Placeholder for the pipeline entry point.

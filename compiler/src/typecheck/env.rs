@@ -342,11 +342,26 @@ impl Env {
     }
 
     pub fn build_as(module: &ast::Module, unit: Unit) -> Self {
+        Env::build_with(&[(Vec::new(), module)], unit)
+    }
+
+    /// Build from several modules at once, each under its own path prefix — the
+    /// stdlib's `std::io`, `std::string`, … then the user's program at the root.
+    ///
+    /// The phases stay global and ordered: every module is declared before any body
+    /// is resolved, so a program may name a stdlib type and a stdlib fn may name a
+    /// program type. That is the only reason this is not just a loop of `build_as` —
+    /// resolution needs every name present first.
+    pub fn build_with(modules: &[(Vec<String>, &ast::Module)], unit: Unit) -> Self {
         let mut env = Env::new();
         env.unit = unit;
-        env.declare(&[], &module.decls);
+        for (prefix, m) in modules {
+            env.declare(prefix, &m.decls);
+        }
         env.check_contractivity();
-        env.resolve_bodies(&[], &module.decls);
+        for (prefix, m) in modules {
+            env.resolve_bodies(prefix, &m.decls);
+        }
         env.check_coherence();
         env
     }
@@ -438,12 +453,16 @@ impl Env {
     /// A function by path, as seen from `module`. Lexical lookup comes before
     /// protocol dispatch, so this is what shadows a protocol method.
     pub fn fn_named(&self, module: &[String], path: &[String]) -> Option<&FnSig> {
-        let name = path.last()?;
-        // An inner module's fn shadows an outer's, so prefer the longest prefix of
-        // `module` that declares it.
-        (0..=module.len()).rev().find_map(|n| {
-            self.fns.iter().find(|f| &f.name == name && f.module == module[..n])
-        })
+        for cand in self.candidates(module, path) {
+            let (m, name) = match cand.rsplit_once("::") {
+                Some((m, n)) => (m, n),
+                None => ("", cand.as_str()),
+            };
+            if let Some(f) = self.fns.iter().find(|f| f.name == name && f.module.join("::") == m) {
+                return Some(f);
+            }
+        }
+        None
     }
 
     pub fn fns(&self) -> &[FnSig] {
@@ -702,44 +721,42 @@ impl Env {
 
     /// `path` as seen from `module`: an inner module's names shadow an outer's,
     /// a `use` binds its last segment, and a fully qualified path always works.
-    pub fn lookup(&self, module: &[String], path: &[String]) -> Option<String> {
-        let joined = path.join("::");
+    /// The fully qualified names `path` could denote, seen from `module`, in priority
+    /// order: innermost scope first, and a `use` alias on the first segment before the
+    /// plain relative reading. Each caller keeps the first that its own table holds.
+    ///
+    /// This is what makes `io::println` work after `use std::io`: `io` is an alias for
+    /// `std::io`, so the first segment is rewritten and the rest appended. The single
+    /// case the old resolvers handled — `use std::io::println; println()` — is the same
+    /// rule with an empty tail.
+    fn candidates(&self, module: &[String], path: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
         for n in (0..=module.len()).rev() {
-            let m = module[..n].join("::");
-            if let ([only], Some(us)) = (path, self.uses.get(&m)) {
-                if let Some((_, full)) = us.iter().find(|(bound, _)| bound == only) {
-                    if self.decls.contains_key(full) {
-                        return Some(full.clone());
+            let scope = module[..n].join("::");
+            if let (Some(first), Some(us)) = (path.first(), self.uses.get(&scope)) {
+                if let Some((_, full)) = us.iter().find(|(bound, _)| bound == first) {
+                    let mut key = full.clone();
+                    for seg in &path[1..] {
+                        key.push_str("::");
+                        key.push_str(seg);
                     }
+                    out.push(key);
                 }
             }
-            let cand = if m.is_empty() { joined.clone() } else { format!("{m}::{joined}") };
-            if self.decls.contains_key(&cand) {
-                return Some(cand);
-            }
+            let joined = path.join("::");
+            out.push(if scope.is_empty() { joined } else { format!("{scope}::{joined}") });
         }
-        None
+        out
+    }
+
+    pub fn lookup(&self, module: &[String], path: &[String]) -> Option<String> {
+        self.candidates(module, path).into_iter().find(|k| self.decls.contains_key(k))
     }
 
     /// A protocol path as seen from `module`. Public because `A::go(r)` — the
     /// escape from cross-protocol ambiguity — has to name one.
     pub fn lookup_protocol(&self, module: &[String], path: &[String]) -> Option<ProtocolId> {
-        let joined = path.join("::");
-        for n in (0..=module.len()).rev() {
-            let m = module[..n].join("::");
-            if let ([only], Some(us)) = (path, self.uses.get(&m)) {
-                if let Some((_, full)) = us.iter().find(|(bound, _)| bound == only) {
-                    if let Some(&id) = self.protocol_ids.get(full) {
-                        return Some(id);
-                    }
-                }
-            }
-            let cand = if m.is_empty() { joined.clone() } else { format!("{m}::{joined}") };
-            if let Some(&id) = self.protocol_ids.get(&cand) {
-                return Some(id);
-            }
-        }
-        None
+        self.candidates(module, path).into_iter().find_map(|k| self.protocol_ids.get(&k).copied())
     }
 
     // ---- instantiation ----

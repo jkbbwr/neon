@@ -740,3 +740,36 @@ fn a_generic_alias_is_not_recorded_under_its_bare_name() {
     assert_ne!(a, b, "two instantiations must not print alike: {a} vs {b}");
     assert!(!a.contains("Pair"), "no name is better than the wrong name: {a}");
 }
+
+// ---- multi-module build ----
+
+#[test]
+fn a_program_resolves_a_name_from_another_module() {
+    // The stdlib-loading mechanism, without a filesystem: an `io` module declared
+    // under the prefix `std::io`, and a user program that calls into it.
+    let io = parse("@native(\"neon_io_println\") fn println(s: str)");
+    let user = parse("use std::io\nfn main() { io::println(\"hi\") }");
+    let env = Env::build_with(
+        &[(vec!["std".into(), "io".into()], &io), (vec![], &user)],
+        super::env::Unit::RootApplication,
+    );
+    assert!(env.errors().is_empty(), "{:?}", env.errors());
+
+    // The real proof: the body resolves `io::println` through the `use` alias.
+    let mut env = env;
+    let (_r, errs) = super::check::check_module(&mut env, &user);
+    assert!(errs.is_empty(), "io::println did not resolve: {errs:?}");
+}
+
+#[test]
+fn a_stdlib_fn_may_reference_a_later_module() {
+    // All modules are declared before any body resolves, so order does not matter:
+    // the second module's type is visible to the first.
+    let a = parse("fn wrap(p: b::Point) -> i64 { p.x }");
+    let b = parse("record Point { x: i64 }");
+    let env = Env::build_with(
+        &[(vec!["a".into()], &a), (vec!["b".into()], &b)],
+        super::env::Unit::RootApplication,
+    );
+    assert!(env.errors().is_empty(), "{:?}", env.errors());
+}
