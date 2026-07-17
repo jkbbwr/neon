@@ -379,3 +379,51 @@ fn test_and_bench_are_keywords() {
     ]);
     assert_eq!(toks("bench"), vec![Token::Bench]);
 }
+
+#[test]
+fn comments_are_retained_as_trivia() {
+    // Dropped comments mean `neon fmt` can only ever delete them. The parser
+    // still sees tokens only; trivia rides alongside.
+    let l = lex_full("fn f() {} // trailing\n/// doc\n/* block */ fn g() {}")
+        .expect("lexes");
+    assert_eq!(l.trivia.len(), 3);
+    assert_eq!(l.trivia[0].kind, TriviaKind::Line);
+    assert_eq!(l.trivia[0].text, " trailing");
+    // `///` attaches to what follows and a doc tool will want it, so the kind is
+    // tagged at lex time rather than reconstructed later.
+    assert_eq!(l.trivia[1].kind, TriviaKind::Doc);
+    assert_eq!(l.trivia[1].text, " doc");
+    assert_eq!(l.trivia[2].kind, TriviaKind::Block);
+    assert_eq!(l.trivia[2].text, " block ");
+    // The token stream is unchanged.
+    assert!(l.tokens.iter().all(|t| !matches!(t.token, Token::StrText(_))));
+}
+
+#[test]
+fn four_slashes_is_not_a_doc_comment() {
+    let l = lex_full("//// separator").expect("lexes");
+    assert_eq!(l.trivia[0].kind, TriviaKind::Line);
+}
+
+#[test]
+fn blank_lines_between_items_are_recoverable() {
+    // A formatter that reflows every blank line on first run is not one people
+    // will use. Line starts make this derivable without recording whitespace.
+    let src = "fn a() {}\n\n\nfn b() {}";
+    let l = lex_full(src).expect("lexes");
+    let a_end = l.tokens.iter().find(|t| t.token == Token::RBrace).expect("a's brace").span.end;
+    let b_start = l.tokens.iter().rev().find(|t| t.token == Token::Fn).expect("fn b").span.start;
+    assert_eq!(l.blank_lines_between(a_end, b_start), 2);
+
+    let l = lex_full("fn a() {}\nfn b() {}").expect("lexes");
+    let a_end = l.tokens.iter().find(|t| t.token == Token::RBrace).expect("a's brace").span.end;
+    let b_start = l.tokens.iter().rev().find(|t| t.token == Token::Fn).expect("fn b").span.start;
+    assert_eq!(l.blank_lines_between(a_end, b_start), 0);
+}
+
+#[test]
+fn nested_block_comment_text_survives() {
+    let l = lex_full("/* a /* b */ c */").expect("lexes");
+    assert_eq!(l.trivia.len(), 1);
+    assert_eq!(l.trivia[0].text, " a /* b */ c ");
+}

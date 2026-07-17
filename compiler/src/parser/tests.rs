@@ -575,3 +575,45 @@ fn a_label_names_the_construct() {
 fn empty_input_is_an_empty_module() {
     assert!(ok("").decls.is_empty());
 }
+
+#[test]
+fn annotations_take_an_optional_string() {
+    // One shape for all of them: `@name` or `@name("...")`. `@cfg` takes a
+    // string rather than a nested expression (`@cfg("not(windows)")`, not
+    // `@cfg(not(windows))`), so the grammar needs no expression language of its
+    // own; whatever evaluates the cfg parses its contents.
+    let m = ok(r#"@native("neon_x") @cfg("not(windows)") @doc("Adds two numbers.") fn f() {}"#);
+    match &m.decls[0].kind {
+        DeclKind::Fn(f) => {
+            let names: Vec<_> = f.annotations.iter().map(|a| a.name.as_str()).collect();
+            assert_eq!(names, ["native", "cfg", "doc"]);
+            assert_eq!(f.annotations[1].arg.as_deref(), Some("not(windows)"));
+            assert_eq!(f.annotations[2].arg.as_deref(), Some("Adds two numbers."));
+        }
+        other => panic!("expected a fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_annotation_may_have_no_argument() {
+    let m = ok("@inline fn f() {}");
+    match &m.decls[0].kind {
+        DeclKind::Fn(f) => {
+            assert_eq!(f.annotations[0].name, "inline");
+            assert!(f.annotations[0].arg.is_none());
+        }
+        other => panic!("expected a fn, got {other:?}"),
+    }
+}
+
+#[test]
+fn annotations_on_records() {
+    let m = ok(r#"@native("NeonBytes*") opaque record Bytes {}"#);
+    match &m.decls[0].kind {
+        DeclKind::Record(r) => {
+            assert!(r.opaque);
+            assert_eq!(r.annotations[0].arg.as_deref(), Some("NeonBytes*"));
+        }
+        other => panic!("expected a record, got {other:?}"),
+    }
+}

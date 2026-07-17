@@ -1,11 +1,13 @@
 mod error;
 mod token;
+mod trivia;
 
 #[cfg(test)]
 mod tests;
 
 pub use error::{LexError, LexErrorKind};
 pub use token::{Span, Spanned, Token};
+pub use trivia::{Lexed, Trivia, TriviaKind};
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -23,7 +25,14 @@ enum Mode {
     Interp { open: usize, depth: usize },
 }
 
+/// Tokens only. The parser wants nothing else.
 pub fn lex(source: &str) -> Result<Vec<Spanned>, Vec<LexError>> {
+    lex_full(source).map(|l| l.tokens)
+}
+
+/// Tokens, comments, and line starts — everything the formatter needs to put a
+/// file back the way the author left it.
+pub fn lex_full(source: &str) -> Result<Lexed, Vec<LexError>> {
     Lexer::new(source).run()
 }
 
@@ -34,6 +43,7 @@ struct Lexer<'a> {
     pos: usize,
     modes: Vec<Mode>,
     out: Vec<Spanned>,
+    trivia: Vec<Trivia>,
     errors: Vec<LexError>,
 }
 
@@ -45,11 +55,12 @@ impl<'a> Lexer<'a> {
             pos: 0,
             modes: vec![Mode::Code],
             out: Vec::new(),
+            trivia: Vec::new(),
             errors: Vec::new(),
         }
     }
 
-    fn run(mut self) -> Result<Vec<Spanned>, Vec<LexError>> {
+    fn run(mut self) -> Result<Lexed, Vec<LexError>> {
         // A BOM at the very start is consumed silently; anywhere else it is an
         // error naming itself, rather than a mystery character.
         if self.text.starts_with('\u{feff}') {
@@ -65,11 +76,18 @@ impl<'a> Lexer<'a> {
 
         self.report_unclosed();
 
-        if self.errors.is_empty() {
-            Ok(self.out)
-        } else {
-            Err(self.errors)
+        if !self.errors.is_empty() {
+            return Err(self.errors);
         }
+        let mut line_starts = vec![0usize];
+        line_starts.extend(
+            self.text
+                .bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        Ok(Lexed { tokens: self.out, trivia: self.trivia, line_starts })
     }
 
     /// Report whatever was still open at EOF, blaming the right thing.
@@ -177,12 +195,24 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'/') => {
+                    let start = self.pos;
+                    // `///` is a doc comment: it attaches to what follows and a
+                    // doc tool will want it. Tagging the kind here is free;
+                    // reconstructing it later is not.
+                    let doc = self.peek_at(2) == Some(b'/') && self.peek_at(3) != Some(b'/');
+                    self.pos += if doc { 3 } else { 2 };
+                    let text_start = self.pos;
                     while let Some(c) = self.peek() {
                         if c == b'\n' {
                             break;
                         }
                         self.pos += 1;
                     }
+                    self.trivia.push(Trivia {
+                        kind: if doc { TriviaKind::Doc } else { TriviaKind::Line },
+                        span: start..self.pos,
+                        text: self.text[text_start..self.pos].to_string(),
+                    });
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
                     let start = self.pos;
@@ -208,6 +238,11 @@ impl<'a> Lexer<'a> {
                             Some(_) => self.pos += 1,
                         }
                     }
+                    self.trivia.push(Trivia {
+                        kind: TriviaKind::Block,
+                        span: start..self.pos,
+                        text: self.text[start + 2..self.pos - 2].to_string(),
+                    });
                 }
                 _ => return,
             }

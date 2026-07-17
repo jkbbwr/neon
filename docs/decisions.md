@@ -237,6 +237,34 @@ special, and `\#{` escapes it.
 appears in leading position, and `#{m[:key]}` puts one mid-expression. Reserving `:` would
 mean deciding where the expression ends before the lexer knows.
 
+### Annotations are `@name` or `@name("string")`
+
+    @native("neon_str_len") fn len(s: str) -> i64
+    @cfg("not(windows)") fn spawn(...)
+    @doc("Adds two numbers.") fn add(a: i64, b: i64) -> i64
+
+One shape for all of them. **`@cfg` takes a string**, not a nested expression:
+`@cfg("not(windows)")`, not `@cfg(not(windows))`. Whatever evaluates the cfg parses its
+contents; the grammar needs no expression language of its own for a corner nobody reads.
+
+### Comments and blank lines survive lexing
+
+The lexer emits tokens *and* a side table of trivia: every comment with its span and text,
+plus the offset of each line start. The parser's input is unchanged — no combinator steps
+over trivia.
+
+Without this a formatter can only delete comments, which is the failure the previous
+implementation could not get out from under. Blank lines the author left between items are
+recovered from line starts rather than by recording whitespace; a formatter that reflows
+them all on first run is not one people will use.
+
+`///` is tagged as a doc comment at lex time. Distinguishing it later means re-lexing.
+
+*Against a lossless CST* (every token and space in a concrete tree, the AST a view over
+it): perfect fidelity and the right answer for an LSP, but a different parser architecture.
+A side table is lossless in *data* — attachment (leading vs trailing) is computed from
+spans by the consumer, where it can be revised, rather than frozen into the parser.
+
 ### Tests are `test "name" { ... }` blocks with assert intrinsics
 
     test "adds two" {
