@@ -559,18 +559,25 @@ impl Checker<'_> {
         expected: Option<TyId>,
     ) -> TyId {
         let ExprKind::Path(p) = &callee.kind else {
-            self.expr(module, callee, None);
-            for a in args {
-                self.expr(module, a, None);
-            }
-            return self.poison();
+            // Any other expression producing a value: a lambda, a field holding a
+            // function, a parenthesised call. It is callable iff its type is an arrow.
+            let t = self.expr(module, callee, None);
+            return self.apply(module, e, "this expression", t, args);
         };
 
-        // Lexical first: a local or a module fn shadows protocols entirely.
-        if self.lookup(p.last().map(String::as_str).unwrap_or("")).is_none() {
-            if let Some(sig) = self.env.fn_named(module, p).cloned() {
-                return self.direct_call(module, e, &sig, args);
+        // Lexical first: a local shadows everything. A local of arrow type is a
+        // first-class value being called, not a name to look up in the fn table.
+        if let [one] = p.as_slice() {
+            if let Some(t) = self.lookup(one) {
+                self.result.set_ty(callee.id, t);
+                return self.apply(module, e, one, t, args);
             }
+        }
+
+        // Then a module fn, which shadows protocols.
+        if let Some(sig) = self.env.fn_named(module, p).cloned() {
+            self.result.set_ty(callee.id, sig.ty);
+            return self.direct_call(module, e, &sig, args);
         }
 
         let arg_tys: Vec<TyId> = args.iter().map(|a| self.expr(module, a, None)).collect();
@@ -610,6 +617,41 @@ impl Checker<'_> {
             self.expr(module, a, None);
         }
         sig.ret
+    }
+
+    /// Call a value. `callee_ty` must be an arrow; `what` names it for diagnostics.
+    fn apply(&mut self, module: &[String], e: &Expr, what: &str, callee_ty: TyId, args: &[Expr]) -> TyId {
+        if self.env.is_error(callee_ty) {
+            for a in args {
+                self.expr(module, a, None);
+            }
+            return self.poison();
+        }
+        let Some(arrow) = self.env.solver.t.as_arrow(callee_ty) else {
+            for a in args {
+                self.expr(module, a, None);
+            }
+            let ty = self.show(callee_ty);
+            self.error(e.span.clone(), TypeErrorKind::NotCallable { what: what.to_string(), ty });
+            return self.poison();
+        };
+        if arrow.params.len() != args.len() {
+            self.error(
+                e.span.clone(),
+                TypeErrorKind::Arity {
+                    name: what.to_string(),
+                    expected: arrow.params.len(),
+                    found: args.len(),
+                },
+            );
+        }
+        for (a, want) in args.iter().zip(&arrow.params) {
+            self.expr(module, a, Some(*want));
+        }
+        for a in args.iter().skip(arrow.params.len()) {
+            self.expr(module, a, None);
+        }
+        arrow.ret
     }
 
     fn dispatch_error(&mut self, span: Span, err: DispatchError) {

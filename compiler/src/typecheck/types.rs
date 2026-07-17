@@ -520,6 +520,26 @@ impl Types {
         })
     }
 
+    /// The signature of `ty`, when it is exactly one arrow — `(A) -> B`, not a union
+    /// or intersection of them. First-class calls need the params and return of the
+    /// value being called, and a lone arrow is the case that has an unambiguous one;
+    /// an overloaded `(A->B) & (C->D)` is not applied in v1.
+    pub fn as_arrow(&self, ty: TyId) -> Option<ArrowAtom> {
+        let d = self.data(ty);
+        if d.base != 0 || d.records != bdd::FALSE || d.tuples != bdd::FALSE {
+            return None;
+        }
+        if !self.atomset_of(d.atoms).is_empty_set() || !self.atomset_of(d.vars).is_empty_set() {
+            return None;
+        }
+        match self.arrow_bdd.paths(d.arrows).as_slice() {
+            [(pos, neg)] if neg.is_empty() && pos.len() == 1 => {
+                Some(self.arrow_atoms[pos[0] as usize].clone())
+            }
+            _ => None,
+        }
+    }
+
     /// An open structural record: `{x: i64}`, which nominal records satisfy.
     /// `#nominal` is unconstrained, so a `Red` with an `x: i64` is a member.
     pub fn struct_ty(&mut self, fields: Vec<(NameId, TyId)>) -> TyId {

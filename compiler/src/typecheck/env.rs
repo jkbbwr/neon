@@ -72,6 +72,8 @@ pub enum TypeErrorKind {
     NoReceiver(String),
     /// A field read that nothing in the subject has.
     NoField { field: String, on: String },
+    /// A call whose callee is not a function.
+    NotCallable { what: String, ty: String },
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
     /// TYPE nothing declares — `unknown type println` is not a sentence.
     UnknownName(String),
@@ -159,6 +161,9 @@ impl fmt::Display for TypeError {
             TypeErrorKind::UnknownName(n) => write!(f, "nothing named `{n}` is in scope"),
             TypeErrorKind::NoField { field, on } => {
                 write!(f, "`{on}` has no field `{field}`")
+            }
+            TypeErrorKind::NotCallable { what, ty } => {
+                write!(f, "{what} is a `{ty}`, which is not a function and cannot be called")
             }
             TypeErrorKind::OrphanInLibrary(n) => write!(
                 f,

@@ -345,3 +345,61 @@ fn arity_is_checked() {
     let e = check("fn g(a: i64, b: i64) -> i64 { a }\nfn f() -> i64 { g(1) }");
     assert!(e.iter().any(|k| matches!(k, TypeErrorKind::Arity { .. })), "{e:?}");
 }
+
+// ---- first-class calls ----
+
+#[test]
+fn an_arrow_typed_local_can_be_called() {
+    clean("fn f(g: (i64) -> i64) -> i64 { g(1) }");
+}
+
+#[test]
+fn a_first_class_call_checks_its_argument() {
+    mismatch(r#"fn f(g: (i64) -> i64) -> i64 { g("s") }"#);
+}
+
+#[test]
+fn a_first_class_call_has_the_arrows_return_type() {
+    clean("fn f(g: (i64) -> str) -> str { g(1) }");
+    mismatch("fn f(g: (i64) -> str) -> i64 { g(1) }");
+}
+
+#[test]
+fn a_first_class_call_checks_arity() {
+    let e = check("fn f(g: (i64) -> i64) -> i64 { g(1, 2) }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::Arity { .. })), "{e:?}");
+}
+
+#[test]
+fn calling_a_non_function_is_rejected() {
+    let e = check("fn f(x: i64) -> i64 { x(1) }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::NotCallable { .. })), "{e:?}");
+}
+
+#[test]
+fn a_higher_order_function_passes_a_fn_by_name() {
+    // The callee is a first-class value; the argument is a named fn used as a value.
+    clean(
+        "fn inc(n: i64) -> i64 { n + 1 }
+         fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }
+         fn f() -> i64 { apply_it(inc, 5) }",
+    );
+}
+
+#[test]
+fn passing_the_wrong_fn_type_is_rejected() {
+    mismatch(
+        "fn takes_str(s: str) -> str { s }
+         fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }
+         fn f() -> i64 { apply_it(takes_str, 5) }",
+    );
+}
+
+#[test]
+fn a_local_shadows_a_module_fn_when_called() {
+    // `g` the parameter, not any `g` in the fn table.
+    clean(
+        "fn g(n: str) -> str { n }
+         fn f(g: (i64) -> i64) -> i64 { g(1) }",
+    );
+}
