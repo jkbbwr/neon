@@ -588,3 +588,32 @@ fn a_type_variable_can_be_a_field_and_a_generic_argument() {
     let meet = s.t.intersect(b, bi);
     assert!(s.is_empty(meet), "Box[T] and Box[i64] are disjoint while T is rigid");
 }
+/// A reserved id read by a boolean operation before it is defined.
+///
+/// `union` is eager over `TyData`, so it snapshots the reserved id's data — which
+/// is `never` until `define`. `record Node { next: Node | null }` therefore
+/// resolves to `record Node { next: null }`, silently. Reserve/define only keeps
+/// the recursion when the recursive occurrence reaches the body through a raw
+/// `TyId` — a field, a generic argument, a tuple element — and never through
+/// `union`/`intersect`/`negate`.
+#[test]
+fn reserve_under_union_keeps_the_recursion() {
+    let mut s = s();
+    // `record Node { next: Node | null }` built exactly as reserve/define prescribes.
+    let n = s.t.reserve();
+    let null = s.t.null();
+    let next = s.t.union(n, null);
+    let label = s.t.name("next");
+    let nm = s.t.name("Node");
+    let body = s.t.nominal(nm, vec![], vec![(label, next)]);
+    let d = s.t.data(body);
+    s.t.define(n, d);
+
+    // A one-deep Node must be a Node.
+    let inner = s.t.nominal(nm, vec![], vec![(label, null)]);
+    let one = {
+        let f = s.t.union(inner, null);
+        s.t.nominal(nm, vec![], vec![(label, f)])
+    };
+    assert!(s.is_subtype(one, n), "a one-deep Node is a Node");
+}

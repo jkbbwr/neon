@@ -53,6 +53,14 @@ impl AtomSet {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct AtomSetId(pub u32);
 
+/// A boolean op whose operands were not all defined when it was written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PendingOp {
+    Union(TyId, TyId),
+    Intersect(TyId, TyId),
+    Negate(TyId),
+}
+
 // ---- kind atoms ----
 
 /// A record shape as a total map from label to type: explicit `fields`, and
@@ -140,6 +148,11 @@ pub struct Types {
     /// depend on its declaration being resolved yet.
     pub defs: HashMap<NameId, TyId>,
 
+    /// Reserved but not yet defined. Their `TyData` is `never` until `define`, so any
+    /// eager read of it is a silent lie — hence `pending`.
+    undefined: std::collections::HashSet<TyId>,
+    pending: Vec<(TyId, PendingOp)>,
+
     pub nominal_label: NameId,
 }
 
@@ -168,6 +181,8 @@ impl Types {
             tup_bdd: Bdd::new(),
             arrow_bdd: Bdd::new(),
             defs: HashMap::new(),
+            undefined: std::collections::HashSet::new(),
+            pending: Vec::new(),
             nominal_label: NameId(0),
         };
         // `#` is not an identifier character, so these cannot collide with source.
@@ -235,6 +250,7 @@ impl Types {
         let atoms = self.atomset(AtomSet::empty());
         let vars = self.atomset(AtomSet::empty());
         let id = TyId(self.tys.len() as u32);
+        self.undefined.insert(id);
         self.tys.push(TyData {
             base: 0,
             atoms,
@@ -252,6 +268,68 @@ impl Types {
     pub fn define(&mut self, id: TyId, d: TyData) {
         self.tys[id.0 as usize] = d;
         self.ty_map.entry(d).or_insert(id);
+        self.undefined.remove(&id);
+        self.discharge();
+    }
+
+    /// No reserved id is still awaiting its body.
+    ///
+    /// Querying while one is outstanding reads `never` for it and answers wrongly
+    /// without saying so, which is the bug this whole mechanism exists to prevent.
+    pub fn all_defined(&self) -> bool {
+        self.undefined.is_empty()
+    }
+
+    fn ready(&self, op: PendingOp) -> bool {
+        match op {
+            PendingOp::Union(a, b) | PendingOp::Intersect(a, b) => {
+                !self.undefined.contains(&a) && !self.undefined.contains(&b)
+            }
+            PendingOp::Negate(a) => !self.undefined.contains(&a),
+        }
+    }
+
+    fn eval(&mut self, op: PendingOp) -> TyId {
+        match op {
+            PendingOp::Union(a, b) => self.union_eager(a, b),
+            PendingOp::Intersect(a, b) => self.intersect_eager(a, b),
+            PendingOp::Negate(a) => self.negate_eager(a),
+        }
+    }
+
+    /// Re-run deferred ops now their operands exist, to a fixpoint.
+    ///
+    /// Contractivity is what bounds this: a recursive occurrence must sit beneath a
+    /// constructor, so by the time the constructor is built the operand it defers on
+    /// is defined. The recursion then closes through the constructor's raw `TyId`,
+    /// which is the one path a boolean op never snapshots.
+    fn discharge(&mut self) {
+        loop {
+            let ready: Vec<(TyId, PendingOp)> = self
+                .pending
+                .iter()
+                .copied()
+                .filter(|&(r, op)| self.undefined.contains(&r) && self.ready(op))
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            for (r, op) in ready {
+                let id = self.eval(op);
+                let d = self.data(id);
+                self.tys[r.0 as usize] = d;
+                self.ty_map.entry(d).or_insert(r);
+                self.undefined.remove(&r);
+            }
+        }
+        self.pending.retain(|&(r, _)| self.undefined.contains(&r));
+    }
+
+    /// Hand back a reserved id now and compute the op once its operands exist.
+    fn defer(&mut self, op: PendingOp) -> TyId {
+        let r = self.reserve();
+        self.pending.push((r, op));
+        r
     }
 
     pub fn rec_atom(&mut self, mut a: RecordAtom) -> u32 {
@@ -473,7 +551,16 @@ impl Types {
 
     // ---- boolean operations, field-wise ----
 
+    /// Union. Defers if either operand is a reserved id awaiting its body — reading
+    /// its `TyData` now would snapshot `never` and drop the recursion on the floor.
     pub fn union(&mut self, a: TyId, b: TyId) -> TyId {
+        if self.undefined.contains(&a) || self.undefined.contains(&b) {
+            return self.defer(PendingOp::Union(a, b));
+        }
+        self.union_eager(a, b)
+    }
+
+    fn union_eager(&mut self, a: TyId, b: TyId) -> TyId {
         let (x, y) = (self.data(a), self.data(b));
         let atoms = {
             let (p, q) = (self.atomset_of(x.atoms).clone(), self.atomset_of(y.atoms).clone());
@@ -490,6 +577,13 @@ impl Types {
     }
 
     pub fn intersect(&mut self, a: TyId, b: TyId) -> TyId {
+        if self.undefined.contains(&a) || self.undefined.contains(&b) {
+            return self.defer(PendingOp::Intersect(a, b));
+        }
+        self.intersect_eager(a, b)
+    }
+
+    fn intersect_eager(&mut self, a: TyId, b: TyId) -> TyId {
         let (x, y) = (self.data(a), self.data(b));
         let atoms = {
             let (p, q) = (self.atomset_of(x.atoms).clone(), self.atomset_of(y.atoms).clone());
@@ -508,6 +602,13 @@ impl Types {
     /// Complement within ⊤. `B_UNDEF` is included: a field's negation has to be able
     /// to say "absent", or `{x: i64} ∧ ¬{x: i64}` would not come out empty.
     pub fn negate(&mut self, a: TyId) -> TyId {
+        if self.undefined.contains(&a) {
+            return self.defer(PendingOp::Negate(a));
+        }
+        self.negate_eager(a)
+    }
+
+    fn negate_eager(&mut self, a: TyId) -> TyId {
         let x = self.data(a);
         let atoms = {
             let p = self.atomset_of(x.atoms).clone();

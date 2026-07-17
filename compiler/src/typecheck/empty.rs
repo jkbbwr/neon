@@ -42,6 +42,13 @@ impl Solver {
     }
 
     pub fn is_empty(&mut self, ty: TyId) -> bool {
+        // A reserved id still awaiting its body reads as `never`, so a query that
+        // races resolution answers wrongly and says nothing. That is exactly how
+        // `record Node { next: Node | null }` became `record Node { next: null }`.
+        debug_assert!(
+            self.t.all_defined(),
+            "is_empty ran while a reserved id was still undefined"
+        );
         if let Some(&r) = self.memo.get(&ty) {
             return r;
         }
