@@ -423,7 +423,7 @@ fn lists_and_spread() {
 fn record_literal_with_spread() {
     match tail("Point { x: 1, ..base }").kind {
         ExprKind::RecordLit { path, fields, spread } => {
-            assert_eq!(path, vec!["Point"]);
+            assert_eq!(path.as_deref(), Some(&["Point".to_string()][..]));
             assert_eq!(fields.len(), 1);
             assert!(spread.is_some());
         }
@@ -432,7 +432,9 @@ fn record_literal_with_spread() {
     // The bare form: an anonymous record, which is how optional params arrive.
     match tail("{ timeout: 5 }").kind {
         ExprKind::RecordLit { path, fields, .. } => {
-            assert!(path.is_empty());
+            // None, not an empty vec: anonymity is stated, not encoded in a
+            // length check the reader has to know about.
+            assert!(path.is_none());
             assert_eq!(fields.len(), 1);
         }
         other => panic!("expected an anonymous record, got {other:?}"),
@@ -465,7 +467,7 @@ fn let_and_rebind() {
     assert!(matches!(b.stmts[0].kind, StmtKind::Let { .. }));
     match &b.stmts[1].kind {
         // Bindings rebind; there is no `mut`.
-        StmtKind::Assign { name, .. } => assert_eq!(name, &["x"]),
+        StmtKind::Assign { name, .. } => assert_eq!(name, "x"),
         other => panic!("expected an assign, got {other:?}"),
     }
 }
@@ -616,4 +618,16 @@ fn annotations_on_records() {
         }
         other => panic!("expected a record, got {other:?}"),
     }
+}
+
+#[test]
+fn a_qualified_name_cannot_be_rebound() {
+    // Only a binding can be rebound, so the AST holds a String rather than a
+    // path. The parser rejects the rest rather than handing a later pass
+    // something it could not act on.
+    let e = errs("fn main() { a::b = 1; }");
+    assert!(
+        e.iter().any(|e| e.kind == ParseErrorKind::InvalidAssignTarget),
+        "expected the invalid-target diagnostic, got {e:?}"
+    );
 }

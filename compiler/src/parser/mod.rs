@@ -706,7 +706,14 @@ where
         .then(expr.clone())
         .then_ignore(just(Token::Semi).or_not())
         .validate(|(target, value), e, emitter| match target.kind {
-            ExprKind::Path(name) => StmtKind::Assign { name, value },
+            ExprKind::Path(mut segments) if segments.len() == 1 => StmtKind::Assign {
+                name: segments.pop().expect("len 1"),
+                value,
+            },
+            ExprKind::Path(_) => {
+                emitter.emit(ParseError::new(target.span, ParseErrorKind::InvalidAssignTarget));
+                StmtKind::Error
+            }
             ExprKind::Field { .. } => {
                 emitter.emit(ParseError::new(target.span, ParseErrorKind::FieldAssignment));
                 StmtKind::Error
@@ -748,7 +755,6 @@ where
 
         let record_pat = path()
             .or_not()
-            .map(Option::unwrap_or_default)
             .then(
                 field_pat
                     .separated_by(just(Token::Comma))
@@ -878,7 +884,6 @@ where
 
     let record_lit = path()
         .or_not()
-        .map(Option::unwrap_or_default)
         .then(
             field_init
                 .separated_by(just(Token::Comma))

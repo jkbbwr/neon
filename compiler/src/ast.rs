@@ -197,9 +197,10 @@ pub struct Stmt {
 pub enum StmtKind {
     /// Bindings rebind; there is no `mut`.
     Let { pat: Pattern, ty: Option<TypeSpec>, value: Expr },
-    /// `x = e`. The target is always a plain binding: `xs[i] = e` and `p.f = e`
-    /// do not exist, because lists and records are values.
-    Assign { name: Vec<String>, value: Expr },
+    /// `x = e`. A single name, never a path: only a binding can be rebound, so
+    /// `a::b = e` is meaningless and the parser rejects it rather than letting
+    /// the tree carry something no later pass could act on.
+    Assign { name: String, value: Expr },
     Expr(Expr),
     Error,
 }
@@ -217,6 +218,9 @@ pub enum ExprKind {
     /// The magnitude only; `-` is a unary operator applied to it. Keeping the
     /// sign out of the literal is what makes `-9223372036854775808` expressible.
     Int(u64),
+    /// Kept as written, not parsed: `1.0`, `1.00` and `1e0` are the same value
+    /// but not the same text, and the formatter must not silently rewrite one
+    /// into another.
     Float(String),
     Str(Vec<StrPart>),
     Rune(char),
@@ -234,8 +238,9 @@ pub enum ExprKind {
     Field { base: Box<Expr>, name: String },
     /// `[1, 2, ..rest]`
     List(Vec<Elem>),
-    /// `Point { x: 1, ..base }` and the bare `{ x: 1 }` record literal.
-    RecordLit { path: Vec<String>, fields: Vec<FieldInit>, spread: Option<Box<Expr>> },
+    /// `Point { x: 1, ..base }`, or `{ x: 1 }` with `path: None` — the
+    /// anonymous record that optional parameters arrive in.
+    RecordLit { path: Option<Vec<String>>, fields: Vec<FieldInit>, spread: Option<Box<Expr>> },
     /// `(a, b)`
     Tuple(Vec<Expr>),
     /// `(x) => e`, `(x: i64) => e`
@@ -345,8 +350,9 @@ pub enum PatternKind {
     /// `1`, `"s"`, `:ok`, `true`, `null`, `-1`. Boxed: `For` holds a Pattern
     /// inline, so an unboxed Expr here would close a cycle.
     Literal(Box<Expr>),
-    /// `Point { x, y }` — field shorthand binds `x` to the field.
-    Record { path: Vec<String>, fields: Vec<FieldPat>, rest: bool },
+    /// `Point { x, y }` — field shorthand binds `x` to the field. `path: None`
+    /// matches an anonymous record.
+    Record { path: Option<Vec<String>>, fields: Vec<FieldPat>, rest: bool },
     /// `(a, b)`
     Tuple(Vec<Pattern>),
     Error,
