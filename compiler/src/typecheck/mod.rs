@@ -5,6 +5,7 @@
 
 pub mod bdd;
 pub mod empty;
+pub mod narrow;
 pub mod types;
 
 #[cfg(test)]
