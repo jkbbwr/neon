@@ -120,6 +120,8 @@ records/nullable_field.neon
 records/recursive_mutual.neon
 records/recursive_self.neon
 records/structural_param_accepts_nominal.neon
+records/structural_param_missing_field.neon
+records/structural_param_wrong_field_type.neon
 records/union_typed_field.neon
 records/unit_record.neon
 records/value_and_heap_records_same_semantics.neon
@@ -129,6 +131,7 @@ types/alias_is_transparent.neon
 types/any_is_the_only_erasure.neon
 types/any_needs_a_cast_to_read.neon
 types/arrow_type_throws.neon
+types/as_cast_to_unrelated_type_rejected.neon
 types/atom_not_in_union_rejected.neon
 types/atom_singleton_type.neon
 types/atom_union.neon
@@ -151,7 +154,6 @@ types/mu_type_without_recursion.neon
 types/newtype_not_interchangeable_with_representation.neon
 types/newtype_siblings_do_not_mix.neon
 types/no_one_element_tuple.neon
-types/nominal_record_satisfies_opts_type.neon
 types/null_not_assignable_to_non_nullable.neon
 types/nullable.neon
 types/opaque_record_is_an_atom_beyond_its_parent.neon
@@ -161,4 +163,5 @@ types/throws_binds_below_the_arrow.neon
 types/type_alias_recursive_rejected.neon
 types/union_of_primitives.neon
 types/union_of_records_is_a_sum_type.neon
+types/union_rejects_non_member.neon
 types/union_variant_is_a_subtype_of_the_union.neon

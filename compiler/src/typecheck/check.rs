@@ -528,10 +528,25 @@ impl Checker<'_> {
         spread: &Option<Box<Expr>>,
         expected: Option<TyId>,
     ) -> TyId {
-        // A named literal's fields must match a declared record, and generic
-        // arguments must be inferred from them -- not built yet. The expected type
-        // carries it for now, unchecked.
-        if path.is_some() {
+        // A named literal builds a nominal record. Resolve the type, then check its
+        // fields exactly as an anonymous literal is checked against a target: every
+        // field declared, right types, no extras. Generic records need their
+        // arguments inferred from the fields, which is not built yet -- those still
+        // flow the expected type unchecked.
+        if let Some(p) = path {
+            let generic = self.env.lookup(module, p).is_some_and(|k| self.env.is_generic(&k));
+            if !generic {
+                let scope = Scope::new(module);
+                let spec = ast::TypeSpec {
+                    kind: ast::TypeSpecKind::Named { path: p.clone(), args: vec![] },
+                    span: e.span.clone(),
+                };
+                let record_ty = self.env.resolve(&scope, &spec);
+                if let Some(target_fields) = self.record_fields(record_ty) {
+                    self.check_record_fields(module, e, fields, spread, &target_fields);
+                    return record_ty;
+                }
+            }
             for f in fields {
                 self.expr(module, &f.value, None);
             }
@@ -546,7 +561,10 @@ impl Checker<'_> {
         // (a typo, not a widening), while a missing nullable field is fine. A record
         // held in a variable still flows by width subtyping -- this excess check is
         // TypeScript's, and it is why a literal differs from a value here.
-        let target_fields = expected.and_then(|exp| self.record_fields(exp));
+        if let Some(target_fields) = expected.and_then(|exp| self.record_fields(exp)) {
+            self.check_record_fields(module, e, fields, spread, &target_fields);
+            return expected.expect("target present");
+        }
 
         let mut seen: Vec<String> = Vec::new();
         let mut field_tys: Vec<(super::types::NameId, TyId)> = Vec::new();
@@ -555,37 +573,57 @@ impl Checker<'_> {
                 self.error(f.span.clone(), TypeErrorKind::DuplicateField(f.name.clone()));
             }
             seen.push(f.name.clone());
-
-            let want = target_fields.as_ref().and_then(|fs| {
-                fs.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t)
-            });
-            if target_fields.as_ref().is_some_and(|fs| !fs.iter().any(|(n, _)| *n == f.name)) {
-                let on = self.show(expected.expect("target present"));
-                self.error(f.span.clone(), TypeErrorKind::NoField { field: f.name.clone(), on });
-            }
-
-            let t = self.expr(module, &f.value, want);
+            let t = self.expr(module, &f.value, None);
             let label = self.env.solver.t.name(&f.name);
             field_tys.push((label, t));
         }
         if let Some(s) = spread {
             self.expr(module, s, None);
         }
+        self.env.solver.t.struct_ty(field_tys)
+    }
 
-        // Checked directly against the target: a missing field is fine only if it is
-        // nullable, and the literal then *is* the target type. Without a target the
-        // literal's own structural type flows up.
-        if let (Some(tf), Some(exp)) = (target_fields, expected) {
-            if spread.is_none() {
-                for (name, fty) in &tf {
-                    if !seen.contains(name) && !self.is_nullable(*fty) {
-                        self.error(e.span.clone(), TypeErrorKind::MissingField(name.clone()));
-                    }
+    /// Check a literal's fields against a record's declared fields: each present and
+    /// declared (no extras), each typed, and no required (non-nullable) field missing.
+    fn check_record_fields(
+        &mut self,
+        module: &[String],
+        e: &Expr,
+        fields: &[ast::FieldInit],
+        spread: &Option<Box<Expr>>,
+        target: &[(String, TyId)],
+    ) {
+        let mut seen: Vec<String> = Vec::new();
+        for f in fields {
+            if seen.contains(&f.name) {
+                self.error(f.span.clone(), TypeErrorKind::DuplicateField(f.name.clone()));
+            }
+            seen.push(f.name.clone());
+            match target.iter().find(|(n, _)| *n == f.name) {
+                Some((_, want)) => {
+                    self.expr(module, &f.value, Some(*want));
+                }
+                None => {
+                    self.expr(module, &f.value, None);
+                    let on = self.record_name(target);
+                    self.error(f.span.clone(), TypeErrorKind::NoField { field: f.name.clone(), on });
                 }
             }
-            return exp;
         }
-        self.env.solver.t.struct_ty(field_tys)
+        if let Some(s) = spread {
+            self.expr(module, s, None);
+            return;
+        }
+        for (name, fty) in target {
+            if !seen.contains(name) && !self.is_nullable(*fty) {
+                self.error(e.span.clone(), TypeErrorKind::MissingField(name.clone()));
+            }
+        }
+    }
+
+    fn record_name(&mut self, target: &[(String, TyId)]) -> String {
+        let fs: Vec<String> = target.iter().map(|(n, _)| n.clone()).collect();
+        format!("{{{}}}", fs.join(", "))
     }
 
     fn is_nullable(&self, ty: TyId) -> bool {

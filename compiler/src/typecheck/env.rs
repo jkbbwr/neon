@@ -562,6 +562,12 @@ impl Env {
         self.errors.push(TypeError { span, kind });
     }
 
+    /// Whether a declared type takes generic arguments -- a record literal for a
+    /// generic record needs its arguments inferred, which the checker does not do yet.
+    pub fn is_generic(&self, key: &str) -> bool {
+        self.decls.get(key).is_some_and(|d| !d.generics().is_empty())
+    }
+
     pub fn resolve(&mut self, scope: &Scope, spec: &ast::TypeSpec) -> TyId {
         resolve::resolve(self, scope, spec)
     }
