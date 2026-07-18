@@ -260,9 +260,18 @@ impl Checker<'_> {
                 self.env.solver.t.atom(n)
             }
             ExprKind::Str(parts) => {
+                // `#{x}` desugars to `to_string(x)`, so an interpolated value must be
+                // Display. Dispatching here is what enforces that, and records the
+                // resolution for codegen.
                 for p in parts {
                     if let ast::StrPart::Interp(inner) = p {
-                        self.expr(module, inner, None);
+                        let t = self.expr(module, inner, None);
+                        if !self.env.is_error(t) {
+                            match dispatch::resolve(self.env, "to_string", None, &[t], None) {
+                                Ok(sel) => self.result.set_call(inner.id, sel.resolution),
+                                Err(err) => self.dispatch_error(inner.span.clone(), err),
+                            }
+                        }
                     }
                 }
                 self.env.solver.t.str()
@@ -464,8 +473,25 @@ impl Checker<'_> {
                 b
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                self.expr(module, lhs, None);
-                self.expr(module, rhs, None);
+                let l = self.expr(module, lhs, None);
+                let r = self.expr(module, rhs, None);
+                // `x == null` / `!= null` is a nullable tag test, not `Eq`.
+                let is_null = |e: &Expr| matches!(e.kind, ExprKind::Null);
+                let null_cmp = matches!(op, BinOp::Eq | BinOp::Ne) && (is_null(lhs) || is_null(rhs));
+                // Otherwise the operands must be comparable: one a subtype of the
+                // other. `1 == "s"` is neither, and is a mistake rather than false.
+                if !null_cmp
+                    && !self.env.is_error(l)
+                    && !self.env.is_error(r)
+                    && !self.assignable(l, r)
+                    && !self.assignable(r, l)
+                {
+                    let (a, b) = (self.show(l), self.show(r));
+                    self.error(
+                        e.span.clone(),
+                        TypeErrorKind::Incomparable { left: a, right: b },
+                    );
+                }
                 self.env.solver.t.bool()
             }
             BinOp::Orelse => {

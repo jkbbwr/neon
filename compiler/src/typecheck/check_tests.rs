@@ -554,3 +554,43 @@ fn widening_a_generic_is_explicit() {
          fn f(xs: List[i64]) { push[i64 | str](xs, \"s\"); }",
     );
 }
+
+// ---- interpolation desugars to to_string ----
+
+const DISPLAY: &str = "
+    protocol Display for T { fn to_string(v: T) -> str }
+    impl Display for i64 { @native(\"i\") fn to_string(v: i64) -> str }
+";
+
+#[test]
+fn an_interpolated_value_must_be_display() {
+    clean(&format!("{DISPLAY} fn f(n: i64) -> str {{ \"n=#{{n}}\" }}"));
+    // A record with no Display impl cannot be interpolated.
+    let e = check(&format!(
+        "{DISPLAY} record R {{ x: i64 }} fn f(r: R) -> str {{ \"#{{r}}\" }}"
+    ));
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::NoImpl { .. })), "{e:?}");
+}
+
+// ---- comparison ----
+
+#[test]
+fn comparable_operands_compare_to_bool() {
+    clean("fn f() -> bool { 1 == 2 }");
+    clean("fn f() -> bool { \"a\" < \"b\" }");
+    clean("fn f(x: i64 | str, y: i64) -> bool { x == y }");
+}
+
+#[test]
+fn incomparable_operands_are_rejected() {
+    let e = check("fn f() -> bool { 1 == \"s\" }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::Incomparable { .. })), "{e:?}");
+}
+
+#[test]
+fn a_null_comparison_needs_no_common_type() {
+    // `x == null` is a tag test, not Eq, so it does not require i64 and null to be
+    // comparable as values.
+    clean("fn f(x: i64 | null) -> bool { x == null }");
+    clean("fn f(x: i64 | null) -> bool { x != null }");
+}

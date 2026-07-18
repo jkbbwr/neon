@@ -76,6 +76,8 @@ pub enum TypeErrorKind {
     NotCallable { what: String, ty: String },
     /// A lambda parameter with no annotation and no expected type to infer it from.
     LambdaParamNeedsType(String),
+    /// `a == b` / `a < b` where the operands share no common type.
+    Incomparable { left: String, right: String },
     /// `impl Sub for X` without the `impl Super for X` that Sub's `where` requires.
     MissingSupertrait { sub: String, required: String, ty: String },
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
@@ -161,6 +163,10 @@ impl fmt::Display for TypeError {
                 f,
                 "`{n}` has no parameter to dispatch on, and nothing here says what it \
                  should return; annotate the binding or use a turbofish"
+            ),
+            TypeErrorKind::Incomparable { left, right } => write!(
+                f,
+                "`{left}` and `{right}` share no common type, so they cannot be compared"
             ),
             TypeErrorKind::MissingSupertrait { sub, required, ty } => write!(
                 f,
