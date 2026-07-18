@@ -465,6 +465,18 @@ fn a_lambda_param_with_no_type_and_no_context_is_an_error() {
 }
 
 #[test]
+fn a_closure_may_not_rebind_a_capture() {
+    let e = check("fn f() -> i64 { let c = 0; let g = () => { c = c + 1; c }; g() }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::RebindCapture(_))), "{e:?}");
+}
+
+#[test]
+fn a_closure_may_rebind_its_own_local() {
+    // A name introduced inside the closure is not a capture, so rebinding it is fine.
+    clean("fn f() -> i64 { let g = () => { let n = 0; n = n + 1; n }; g() }");
+}
+
+#[test]
 fn a_lambda_of_the_wrong_arity_is_rejected() {
     mismatch(
         "fn apply_it(g: (i64) -> i64, x: i64) -> i64 { g(x) }

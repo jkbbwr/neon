@@ -77,6 +77,8 @@ pub enum TypeErrorKind {
     NoField { field: String, on: String },
     /// `x.f(..)` where `f` is not a field: method-call syntax, which Neon lacks.
     DotCall { method: String, on: String },
+    /// Assigning, inside a closure, to a name captured from the enclosing scope.
+    RebindCapture(String),
     /// A call whose callee is not a function.
     NotCallable { what: String, ty: String },
     /// A lambda parameter with no annotation and no expected type to infer it from.
@@ -236,6 +238,12 @@ impl fmt::Display for TypeError {
                 f,
                 "`{on}` has no field `{method}`, and Neon has no method-call syntax; \
                  write `{method}(x)` or `x |> {method}(..)`"
+            ),
+            TypeErrorKind::RebindCapture(n) => write!(
+                f,
+                "cannot rebind '{n}': it is captured from the enclosing scope, and a \
+                 closure's captures are immutable inside it -- the assignment would \
+                 only touch the closure's private copy. Use `fold` or recursion."
             ),
             TypeErrorKind::NotCallable { what, ty } => {
                 write!(f, "{what} is a `{ty}`, which is not a function and cannot be called")

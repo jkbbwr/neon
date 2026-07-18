@@ -31,6 +31,7 @@ pub fn check_module(env: &mut Env, m: &ast::Module) -> (TypecheckResult, Vec<Typ
         throw_sinks: vec![],
         bounds: vec![],
         rigids: vec![],
+        capture_floors: vec![],
     };
     c.decls(&[], &m.decls);
     (c.result, c.errors)
@@ -56,6 +57,10 @@ struct Checker<'a> {
     /// The current function's generic names, so a type written in its body -- `as T`,
     /// `is T`, `let x: T` -- resolves `T` as the rigid variable it introduced.
     rigids: Vec<String>,
+    /// One entry per enclosing lambda: the `locals` depth where that lambda's own
+    /// scope begins. A name found in a frame below the innermost floor was captured,
+    /// and assigning to a capture is an error -- the closure holds a private copy.
+    capture_floors: Vec<usize>,
 }
 
 impl Checker<'_> {
@@ -190,6 +195,12 @@ impl Checker<'_> {
         self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, _)| n == name).map(|(_, t)| *t)
     }
 
+    /// The index of the innermost `locals` frame that binds `name`, for deciding
+    /// whether it lies below a lambda's capture floor.
+    fn frame_of(&self, name: &str) -> Option<usize> {
+        self.locals.iter().enumerate().rev().find(|(_, s)| s.iter().any(|(n, _)| n == name)).map(|(i, _)| i)
+    }
+
     // ---- blocks and statements ----
 
     fn block(&mut self, module: &[String], b: &ast::Block, expected: Option<TyId>) -> TyId {
@@ -257,6 +268,14 @@ impl Checker<'_> {
                     self.expr(module, value, None);
                     return;
                 };
+                // A capture is immutable inside the closure: assigning to it would
+                // write to the closure's private copy, invisible to everyone else.
+                if let (Some(&floor), Some(frame)) = (self.capture_floors.last(), self.frame_of(name))
+                {
+                    if frame < floor {
+                        self.error(s.span.clone(), TypeErrorKind::RebindCapture(name.clone()));
+                    }
+                }
                 self.expr(module, value, Some(want));
             }
             ast::StmtKind::Expr(e) => {
@@ -568,6 +587,9 @@ impl Checker<'_> {
         let scope = self.type_scope(module);
         let want = expected.and_then(|t| self.env.solver.t.as_arrow(t));
 
+        // Everything already on the stack is captured; the lambda's own scope starts
+        // here. An assignment to a name below this floor is a rebind of a capture.
+        self.capture_floors.push(self.locals.len());
         self.locals.push(vec![]);
         let mut param_tys = Vec::with_capacity(params.len());
         for (i, p) in params.iter().enumerate() {
@@ -591,6 +613,7 @@ impl Checker<'_> {
         let ret = self.expr(module, body, want_ret);
         self.throws = saved;
         self.locals.pop();
+        self.capture_floors.pop();
 
         let arrow = self.env.solver.t.arrow(param_tys, never, ret);
         self.result.set_lambda(e.id, arrow);
