@@ -113,7 +113,11 @@ fn insert_fn(f: &mut Func) {
 
             // A dead pointer result is dropped immediately.
             if let Some(v) = inst.result {
-                if ptr.contains(&v) && !live.contains(&v) {
+                // A view owns nothing, so it is never released on its own account —
+                // releasing one destroys what its base still holds. `elem` reading a
+                // captured closure out of an environment then released the environment's
+                // own copy, and the next call read freed memory.
+                if ptr.contains(&v) && !live.contains(&v) && !bases.contains_key(&v) {
                     releases_after.push(v);
                 }
                 live.remove(&v);
@@ -121,10 +125,13 @@ fn insert_fn(f: &mut Func) {
 
             let (consuming, borrowing) = operand_uses(&inst.op, &ptr);
             for w in borrowing {
-                if !live.contains(&w) {
+                let was_live = live.contains(&w);
+                // Mark first and unconditionally: borrowing a view has to keep the base it
+                // looks into alive, whether or not the view itself gets released here.
+                mark_live(&mut live, w, &bases);
+                if !was_live && !bases.contains_key(&w) {
                     // Dead after this borrow: release it once the borrow has read it.
                     releases_after.push(w);
-                    mark_live(&mut live, w, &bases);
                 }
             }
             for w in consuming {
@@ -170,6 +177,7 @@ fn insert_fn(f: &mut Func) {
                 .copied()
                 .filter(|v| {
                     !live_in[&b.id].contains(v)
+                        && !bases.contains_key(v)
                         && !b.params.contains(v)
                         && !moved_in[&b.id].contains(v)
                         && preds.iter().all(|p| live_out[p].contains(v))
@@ -280,7 +288,10 @@ fn operand_uses(op: &Op, ptr: &HashSet<Value>) -> (Vec<Value>, Vec<Value>) {
             consuming.extend(args.iter().copied())
         }
         Op::CallClosure { callee, args } => {
-            consuming.push(*callee);
+            // Calling a closure reads it; it does not destroy it, and you may call it
+            // again. Marking the callee consumed meant its reference was handed to a call
+            // that never released it, so every closure value leaked its environment.
+            borrowing.push(*callee);
             consuming.extend(args.iter().copied());
         }
         Op::MakeClosure { captures, .. } => consuming.extend(captures.iter().copied()),
