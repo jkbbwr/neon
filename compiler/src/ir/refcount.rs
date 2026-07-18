@@ -83,7 +83,8 @@ fn insert_fn(f: &mut Func) {
         return;
     }
     let bases = base_of(f, &ptr);
-    let live_out = liveness(f, &ptr, &bases);
+    let (live_in, live_out) = liveness(f, &ptr, &bases);
+    let (pred_map, moved_in) = predecessors(f);
 
     for b in &mut f.blocks {
         let mut live: HashSet<Value> = live_out[&b.id].clone();
@@ -99,6 +100,11 @@ fn insert_fn(f: &mut Func) {
         for v in &term_uses {
             live.insert(*v);
         }
+        // A view handed on by the terminator — a block argument, a return, a throw — is
+        // consumed just as it would be by a call, so it must materialise a reference of
+        // its own. This is where `unwrap_err`'s result escapes into a handler block.
+        let term_views: Vec<Value> =
+            term_uses.iter().copied().filter(|v| bases.contains_key(v)).collect();
 
         let mut rev: Vec<Inst> = Vec::new();
         for inst in b.insts.iter().rev() {
@@ -125,6 +131,14 @@ fn insert_fn(f: &mut Func) {
                 if live.contains(&w) {
                     // Used again later, so this consume needs its own owned reference.
                     retains_before.push(w);
+                } else if bases.contains_key(&w) {
+                    // Consuming a *view*. A projection holds no reference of its own — it
+                    // looks into what its base owns — so handing it on has to materialise
+                    // one. Without this, `unwrap_err` passed as a block argument made the
+                    // receiving parameter release a payload the tagged union it was read
+                    // from then released again.
+                    retains_before.push(w);
+                    mark_live(&mut live, w, &bases);
                 } else {
                     mark_live(&mut live, w, &bases);
                 }
@@ -149,14 +163,40 @@ fn insert_fn(f: &mut Func) {
             .filter(|p| ptr.contains(p) && !live.contains(p))
             .map(|&p| Inst { result: None, op: Op::Release(p) })
             .collect();
+        let preds = &pred_map[&b.id];
+        if !preds.is_empty() {
+            let mut dying: Vec<Value> = live_out[&preds[0]]
+                .iter()
+                .copied()
+                .filter(|v| {
+                    !live_in[&b.id].contains(v)
+                        && !b.params.contains(v)
+                        && !moved_in[&b.id].contains(v)
+                        && preds.iter().all(|p| live_out[p].contains(v))
+                })
+                .collect();
+            dying.sort();
+            head.extend(dying.into_iter().map(|v| Inst { result: None, op: Op::Release(v) }));
+        }
         head.extend(rev);
+        for v in term_views {
+            head.push(Inst { result: None, op: Op::Retain(v) });
+        }
         b.insts = head;
     }
 }
 
 /// Live-out per block: the counted values a block's successors still need. Standard
 /// backward dataflow; a block's parameters are definitions, not live-in.
-fn liveness(f: &Func, ptr: &HashSet<Value>, base_of: &HashMap<Value, Value>) -> HashMap<super::ssa::BlockId, HashSet<Value>> {
+#[allow(clippy::type_complexity)]
+fn liveness(
+    f: &Func,
+    ptr: &HashSet<Value>,
+    base_of: &HashMap<Value, Value>,
+) -> (
+    HashMap<super::ssa::BlockId, HashSet<Value>>,
+    HashMap<super::ssa::BlockId, HashSet<Value>>,
+) {
     let mut live_in: HashMap<_, HashSet<Value>> = f.blocks.iter().map(|b| (b.id, HashSet::new())).collect();
     let mut live_out: HashMap<_, HashSet<Value>> = live_in.clone();
 
@@ -208,7 +248,27 @@ fn liveness(f: &Func, ptr: &HashSet<Value>, base_of: &HashMap<Value, Value>) -> 
             break;
         }
     }
-    live_out
+    (live_in, live_out)
+}
+
+/// Each block's predecessors, and the values handed to it as block arguments.
+#[allow(clippy::type_complexity)]
+fn predecessors(
+    f: &Func,
+) -> (
+    HashMap<super::ssa::BlockId, Vec<super::ssa::BlockId>>,
+    HashMap<super::ssa::BlockId, HashSet<Value>>,
+) {
+    let mut preds: HashMap<_, Vec<_>> = f.blocks.iter().map(|b| (b.id, Vec::new())).collect();
+    let mut moved: HashMap<_, HashSet<Value>> =
+        f.blocks.iter().map(|b| (b.id, HashSet::new())).collect();
+    for b in &f.blocks {
+        for (succ, args) in successor_edges(&b.term) {
+            preds.entry(succ).or_default().push(b.id);
+            moved.entry(succ).or_default().extend(args);
+        }
+    }
+    (preds, moved)
 }
 
 /// A pointer op's operands split into consuming and borrowing uses.
