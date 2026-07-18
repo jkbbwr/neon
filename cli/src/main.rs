@@ -47,6 +47,13 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Emit the intermediate representation for a source file.
+    Ir {
+        file: OsString,
+        /// Which pipeline stage to print: `lowered`, `opt`, or `final` (default).
+        #[arg(long, default_value = "final")]
+        stage: String,
+    },
     /// Print the resolved sysroot.
     Sysroot,
 }
@@ -58,6 +65,14 @@ fn main() -> Result<()> {
         Command::Parse { file } => cmd::parse::run(&file),
         Command::Check { file, lib } => cmd::check::run(&file, lib),
         Command::Fmt { file, write, check } => cmd::fmt::run(&file, write, check),
+        Command::Ir { file, stage } => {
+            let stage = match stage.as_str() {
+                "lowered" => neon_compiler::ir::Stage::Lowered,
+                "opt" | "optimised" | "optimized" => neon_compiler::ir::Stage::Optimised,
+                _ => neon_compiler::ir::Stage::Final,
+            };
+            cmd::ir::run(&file, stage)
+        }
         Command::Sysroot => cmd::sysroot::run(),
     }
 }
