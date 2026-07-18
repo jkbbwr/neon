@@ -467,7 +467,7 @@ fn a_lambda_param_with_no_type_and_no_context_is_an_error() {
 #[test]
 fn a_closure_may_not_rebind_a_capture() {
     let e = check("fn f() -> i64 { let c = 0; let g = () => { c = c + 1; c }; g() }");
-    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::RebindCapture(_))), "{e:?}");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::RebindCapture { .. })), "{e:?}");
 }
 
 #[test]

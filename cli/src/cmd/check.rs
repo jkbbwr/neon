@@ -51,7 +51,7 @@ pub fn run(file: &OsString, lib: bool) -> Result<()> {
     let errors = env.errors();
     if !errors.is_empty() {
         for e in errors {
-            r.eprint(e.span.clone(), &e.to_string());
+            r.eprint_full(e.span.clone(), &e.to_string(), &e.labels(), e.help().as_deref());
         }
         let n = errors.len();
         eprintln!("{n} error{}", if n == 1 { "" } else { "s" });

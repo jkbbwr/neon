@@ -41,8 +41,9 @@ struct Checker<'a> {
     env: &'a mut Env,
     result: TypecheckResult,
     errors: Vec<TypeError>,
-    /// Innermost last. A name resolves to the nearest binding.
-    locals: Vec<Vec<(String, TyId)>>,
+    /// Innermost last. A name resolves to the nearest binding. Each carries the span
+    /// it was bound at, so a diagnostic can point back at a name's origin.
+    locals: Vec<Vec<(String, TyId, Span)>>,
     ret: Option<TyId>,
     throws: Option<TyId>,
     /// Break values of the enclosing loops, innermost last. A `loop` is the union
@@ -148,7 +149,7 @@ impl Checker<'_> {
         self.locals.push(vec![]);
         for p in &f.params {
             let t = self.env.resolve(&scope, &p.ty);
-            self.bind(&p.name, t);
+            self.bind(&p.name, t, p.span.clone());
         }
 
         let ret = match &f.ret {
@@ -185,20 +186,25 @@ impl Checker<'_> {
 
     // ---- scopes ----
 
-    fn bind(&mut self, name: &str, t: TyId) {
+    fn bind(&mut self, name: &str, t: TyId, span: Span) {
         if let Some(scope) = self.locals.last_mut() {
-            scope.push((name.to_string(), t));
+            scope.push((name.to_string(), t, span));
         }
     }
 
     fn lookup(&self, name: &str) -> Option<TyId> {
-        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, _)| n == name).map(|(_, t)| *t)
+        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(_, t, _)| *t)
     }
 
     /// The index of the innermost `locals` frame that binds `name`, for deciding
     /// whether it lies below a lambda's capture floor.
     fn frame_of(&self, name: &str) -> Option<usize> {
-        self.locals.iter().enumerate().rev().find(|(_, s)| s.iter().any(|(n, _)| n == name)).map(|(i, _)| i)
+        self.locals.iter().enumerate().rev().find(|(_, s)| s.iter().any(|(n, ..)| n == name)).map(|(i, _)| i)
+    }
+
+    /// The span where `name` was bound, for a "captured here"-style secondary label.
+    fn origin_of(&self, name: &str) -> Option<Span> {
+        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(.., s)| s.clone())
     }
 
     // ---- blocks and statements ----
@@ -273,7 +279,11 @@ impl Checker<'_> {
                 if let (Some(&floor), Some(frame)) = (self.capture_floors.last(), self.frame_of(name))
                 {
                     if frame < floor {
-                        self.error(s.span.clone(), TypeErrorKind::RebindCapture(name.clone()));
+                        let origin = self.origin_of(name);
+                        self.error(
+                            s.span.clone(),
+                            TypeErrorKind::RebindCapture { name: name.clone(), origin },
+                        );
                     }
                 }
                 self.expr(module, value, Some(want));
@@ -287,7 +297,7 @@ impl Checker<'_> {
 
     fn bind_pattern(&mut self, p: &ast::Pattern, t: TyId) {
         match &p.kind {
-            ast::PatternKind::Bind(n) => self.bind(n, t),
+            ast::PatternKind::Bind(n) => self.bind(n, t, p.span.clone()),
             ast::PatternKind::Wildcard => {}
             ast::PatternKind::Tuple(ps) => {
                 for (i, sub) in ps.iter().enumerate() {
@@ -303,7 +313,7 @@ impl Checker<'_> {
                     let ft = self.projected(p.span.clone(), pj, &f.name, t);
                     match &f.pat {
                         Some(sub) => self.bind_pattern(sub, ft),
-                        None => self.bind(&f.name, ft),
+                        None => self.bind(&f.name, ft, f.span.clone()),
                     }
                 }
             }
@@ -601,7 +611,9 @@ impl Checker<'_> {
                     self.poison()
                 }
             };
-            self.bind(&p.name, t);
+            // A lambda param carries no span of its own; the lambda's is close enough
+            // for a diagnostic, and a param is never a capture anyway.
+            self.bind(&p.name, t, e.span.clone());
             param_tys.push(t);
         }
 
@@ -872,7 +884,8 @@ impl Checker<'_> {
         if let Some(arm) = catch {
             // The error union is handled here, not propagated. `catch` binds it.
             self.locals.push(vec![]);
-            self.bind(&arm.binding, if thrown.is_empty() { never } else { caught });
+            let bound = if thrown.is_empty() { never } else { caught };
+            self.bind(&arm.binding, bound, arm.span.clone());
             let handled = self.block(module, &arm.body, expected);
             self.locals.pop();
             return self.union_branches(val, handled);
@@ -1078,7 +1091,7 @@ impl Checker<'_> {
                 None => remaining,
             };
             if let Some(v) = &scrut_var {
-                self.bind(v, bound);
+                self.bind(v, bound, scrutinee.span.clone());
             }
             self.bind_pattern(&arm.pat, bound);
             if let Some(g) = &arm.guard {

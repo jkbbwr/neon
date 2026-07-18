@@ -78,7 +78,8 @@ pub enum TypeErrorKind {
     /// `x.f(..)` where `f` is not a field: method-call syntax, which Neon lacks.
     DotCall { method: String, on: String },
     /// Assigning, inside a closure, to a name captured from the enclosing scope.
-    RebindCapture(String),
+    /// `origin` is where the name was bound, for a "captured here" secondary label.
+    RebindCapture { name: String, origin: Option<Span> },
     /// A call whose callee is not a function.
     NotCallable { what: String, ty: String },
     /// A lambda parameter with no annotation and no expected type to infer it from.
@@ -168,8 +169,7 @@ impl fmt::Display for TypeError {
             ),
             TypeErrorKind::IfWithoutElse => write!(
                 f,
-                "this `if` is used as a value, so it needs an `else` branch -- without \
-                 one it has nothing to be when the condition is false"
+                "this `if` is used as a value, so it needs an `else` branch"
             ),
             TypeErrorKind::ImpossibleCast { from, to } => write!(
                 f,
@@ -178,9 +178,8 @@ impl fmt::Display for TypeError {
             TypeErrorKind::AmbiguousCall { method, protocols } => write!(
                 f,
                 "Ambiguous call: `{method}` is declared by more than one protocol in \
-                 scope ({}); qualify it, e.g. `{}::{method}(..)`",
+                 scope ({})",
                 protocols.join(", "),
-                protocols.first().map(String::as_str).unwrap_or("P")
             ),
             TypeErrorKind::NoImpl { protocol, method, uncovered } => write!(
                 f,
@@ -197,7 +196,7 @@ impl fmt::Display for TypeError {
             TypeErrorKind::NotIndexable(t) => write!(f, "`{t}` cannot be indexed"),
             TypeErrorKind::BareThrowingCall => write!(
                 f,
-                "this call throws, so it must be a `try` -- `try`, `try?` or `try!`"
+                "this call throws, so it must be handled by a `try`"
             ),
             TypeErrorKind::Throws { thrown, declared } => write!(
                 f,
@@ -236,14 +235,12 @@ impl fmt::Display for TypeError {
             }
             TypeErrorKind::DotCall { method, on } => write!(
                 f,
-                "`{on}` has no field `{method}`, and Neon has no method-call syntax; \
-                 write `{method}(x)` or `x |> {method}(..)`"
+                "`{on}` has no field `{method}`, and Neon has no method-call syntax"
             ),
-            TypeErrorKind::RebindCapture(n) => write!(
+            TypeErrorKind::RebindCapture { name, .. } => write!(
                 f,
-                "cannot rebind '{n}': it is captured from the enclosing scope, and a \
-                 closure's captures are immutable inside it -- the assignment would \
-                 only touch the closure's private copy. Use `fold` or recursion."
+                "cannot rebind '{name}': it is captured from the enclosing scope, and a \
+                 closure's captures are immutable inside it"
             ),
             TypeErrorKind::NotCallable { what, ty } => {
                 write!(f, "{what} is a `{ty}`, which is not a function and cannot be called")
@@ -274,6 +271,53 @@ impl fmt::Display for TypeError {
                 f,
                 "`{n}` expands without bound: polymorphic recursion is not supported"
             ),
+        }
+    }
+}
+
+impl TypeError {
+    /// The actionable suggestion, if there is one -- rendered as ariadne's help line
+    /// so the title states only the problem. Kept as its own text (not folded into
+    /// the message) so a diagnostic reads "what is wrong" then "what to do".
+    pub fn help(&self) -> Option<String> {
+        Some(match &self.kind {
+            TypeErrorKind::DotCall { method, .. } => {
+                format!("write `{method}(x)`, or `x |> {method}(..)` for a pipeline")
+            }
+            TypeErrorKind::IfWithoutElse => {
+                "add an `else`, or make the `if` a statement by discarding its value".into()
+            }
+            TypeErrorKind::AmbiguousCall { method, protocols } => {
+                let p = protocols.first().map(String::as_str).unwrap_or("P");
+                format!("qualify it, e.g. `{p}::{method}(..)`")
+            }
+            TypeErrorKind::RebindCapture { .. } => {
+                "a closure cannot mutate its environment; use `fold` or recursion".into()
+            }
+            TypeErrorKind::BareThrowingCall => {
+                "`try` propagates, `try?` softens to null, `try!` aborts".into()
+            }
+            TypeErrorKind::NoImpl { protocol, uncovered, .. } => {
+                format!("add an `impl {protocol} for {uncovered}`")
+            }
+            TypeErrorKind::MainSignatureFixed => {
+                "drop the return type and `throws` clause".into()
+            }
+            TypeErrorKind::UnsatisfiedBound { ty, protocol } => {
+                format!("add `{protocol}` to `{ty}`'s bounds, or `impl {protocol} for {ty}`")
+            }
+            _ => return None,
+        })
+    }
+
+    /// Secondary labels: related spans the diagnostic should also point at. Empty for
+    /// most errors; a capture rebind points back at where the name was bound.
+    pub fn labels(&self) -> Vec<(Span, String)> {
+        match &self.kind {
+            TypeErrorKind::RebindCapture { origin: Some(origin), .. } => {
+                vec![(origin.clone(), "captured here".into())]
+            }
+            _ => vec![],
         }
     }
 }

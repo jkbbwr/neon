@@ -183,7 +183,15 @@ fn check(path: &Path, src: &str) -> Result<(), Failure> {
     if env.errors().is_empty() {
         return Ok(());
     }
-    let it = env.errors().iter().map(|e| (e.span.clone(), e.to_string()));
+    // `error-contains` matches the whole diagnostic a user sees, help line included:
+    // the actionable text (`|>`, the `try` triad) now lives in `help`, not the title.
+    let it = env.errors().iter().map(|e| {
+        let msg = match e.help() {
+            Some(h) => format!("{e}\n{h}"),
+            None => e.to_string(),
+        };
+        (e.span.clone(), msg)
+    });
     Err(Failure::of(path, src, it))
 }
 

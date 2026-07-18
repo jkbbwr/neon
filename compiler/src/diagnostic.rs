@@ -33,34 +33,74 @@ impl<'a> Renderer<'a> {
     }
 
     pub fn render(&mut self, span: Range<usize>, msg: &str) -> String {
+        self.render_full(span, msg, &[], None)
+    }
+
+    /// The full diagnostic: a primary underline, zero or more secondary labels that
+    /// point at related spans, and an optional help line. The lexer and parser use
+    /// the bare `render`; the type checker uses this to say *where* a related thing
+    /// is (a capture's origin) and *what to do* (write `f(x)`), instead of packing it
+    /// all into one title.
+    pub fn render_full(
+        &mut self,
+        span: Range<usize>,
+        msg: &str,
+        secondary: &[(Range<usize>, String)],
+        help: Option<&str>,
+    ) -> String {
         let span = self.underline(span);
         let id = self.cache.0.clone();
 
-        // The message goes on the report, not the label: it is the only string
-        // an error carries, and ariadne would print it twice. An empty label
-        // message is what earns the underline — ariadne draws none without one.
-        let mut label = Label::new((id.clone(), span.clone())).with_message("");
+        // The message goes on the report, not the label: it is the only string an
+        // error carries, and ariadne would print it twice. An empty label message is
+        // what earns the underline — ariadne draws none without one.
+        let mut primary = Label::new((id.clone(), span.clone())).with_message("").with_order(0);
         if self.color {
-            label = label.with_color(Color::Red);
+            primary = primary.with_color(Color::Red);
         }
 
-        let report = Report::build(ReportKind::Error, (id, span))
+        let mut labels = vec![primary];
+        for (i, (s, text)) in secondary.iter().enumerate() {
+            let s = self.underline(s.clone());
+            // A later order draws below the primary; a cooler colour reads as context
+            // rather than as a second fault.
+            let mut label =
+                Label::new((id.clone(), s)).with_message(text).with_order(i as i32 + 1);
+            if self.color {
+                label = label.with_color(Color::Cyan);
+            }
+            labels.push(label);
+        }
+
+        let mut report = Report::build(ReportKind::Error, (id, span))
             .with_config(
                 // Spans are byte offsets. Ariadne counts characters unless told
                 // otherwise, which puts the underline inside an `é`.
                 Config::default().with_index_type(IndexType::Byte).with_color(self.color),
             )
             .with_message(msg)
-            .with_label(label)
-            .finish();
+            .with_labels(labels);
+        if let Some(help) = help {
+            report = report.with_help(help);
+        }
 
         let mut out = Vec::new();
-        report.write(&mut self.cache, &mut out).expect("a Vec cannot fail to be written to");
+        report.finish().write(&mut self.cache, &mut out).expect("a Vec cannot fail to be written to");
         String::from_utf8(out).expect("ariadne emits UTF-8")
     }
 
     pub fn eprint(&mut self, span: Range<usize>, msg: &str) {
         eprint!("{}", self.render(span, msg));
+    }
+
+    pub fn eprint_full(
+        &mut self,
+        span: Range<usize>,
+        msg: &str,
+        secondary: &[(Range<usize>, String)],
+        help: Option<&str>,
+    ) {
+        eprint!("{}", self.render_full(span, msg, secondary, help));
     }
 
     /// A span that is empty, or that sits at end of input, underlines nothing.
