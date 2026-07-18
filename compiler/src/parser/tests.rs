@@ -871,3 +871,11 @@ fn a_use_group_flattens_its_prefix() {
     assert_eq!(children.len(), 2);
     assert!(matches!(&children[1], UseTree::Leaf { alias: Some(a), .. } if a == "c"));
 }
+
+#[test]
+fn a_protocol_may_carry_a_where_clause() {
+    let m = ok("protocol Ord for T where T: Eq { fn cmp(a: T, b: T) -> i64 }");
+    let DeclKind::Protocol(p) = &m.decls[0].kind else { panic!() };
+    assert_eq!(p.wheres.len(), 1);
+    assert_eq!(p.wheres[0].param, "T");
+}

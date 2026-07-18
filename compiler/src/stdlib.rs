@@ -11,6 +11,12 @@ use crate::{lexer, parser};
 /// `std/collections/list.neon` → `["std","collections","list"]`.
 pub fn module_path(rel: &str) -> Vec<String> {
     let rel = rel.strip_suffix(".neon").unwrap_or(rel);
+    // The prelude is declared at the root, so `Display`, `Ordering` and the rest
+    // resolve by their short names from any module without a `use` — which is what
+    // being in the prelude means.
+    if rel == "prelude" {
+        return Vec::new();
+    }
     rel.split(['/', '\\']).filter(|s| !s.is_empty()).map(String::from).collect()
 }
 
@@ -40,7 +46,9 @@ mod tests {
     fn module_path_from_relative() {
         assert_eq!(module_path("std/io.neon"), vec!["std", "io"]);
         assert_eq!(module_path("std/collections/list.neon"), vec!["std", "collections", "list"]);
-        assert_eq!(module_path("prelude.neon"), vec!["prelude"]);
+        // The prelude declares at the root, so its short names need no `use`.
+        assert_eq!(module_path("prelude.neon"), Vec::<String>::new());
+        assert_eq!(module_path("std/prelude.neon"), vec!["std", "prelude"]);
     }
 
     #[test]

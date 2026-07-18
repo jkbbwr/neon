@@ -870,3 +870,42 @@ fn without_the_import_the_ambiguous_call_still_errors() {
         "{errs:?}"
     );
 }
+
+// ---- protocol supertraits ----
+
+#[test]
+fn a_supertrait_obliges_the_type_to_implement_the_super() {
+    let e = env(
+        "record V { n: i64 }
+         protocol Eq for T { fn eq(a: T, b: T) -> bool }
+         protocol Ord for T where T: Eq { fn cmp(a: T, b: T) -> i64 }
+         impl Ord for V { fn cmp(a: V, b: V) -> i64 { 0 } }",
+    );
+    assert!(
+        matches!(kinds(&e).as_slice(), [TypeErrorKind::MissingSupertrait { .. }]),
+        "{:?}",
+        kinds(&e)
+    );
+}
+
+#[test]
+fn a_supertrait_is_satisfied_when_both_are_implemented() {
+    let e = env(
+        "record V { n: i64 }
+         protocol Eq for T { fn eq(a: T, b: T) -> bool }
+         protocol Ord for T where T: Eq { fn cmp(a: T, b: T) -> i64 }
+         impl Eq for V { fn eq(a: V, b: V) -> bool { true } }
+         impl Ord for V { fn cmp(a: V, b: V) -> i64 { 0 } }",
+    );
+    assert_eq!(kinds(&e), vec![]);
+}
+
+#[test]
+fn a_protocol_without_a_where_has_no_supertrait_obligation() {
+    let e = env(
+        "record V { n: i64 }
+         protocol Show for T { fn show(v: T) -> str }
+         impl Show for V { fn show(v: V) -> str { \"v\" } }",
+    );
+    assert_eq!(kinds(&e), vec![]);
+}

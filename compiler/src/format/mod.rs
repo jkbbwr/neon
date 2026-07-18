@@ -673,6 +673,17 @@ impl<'a> Fmt<'a> {
             self.push(&vec!["_"; p.subject_arity].join(", "));
             self.push("]");
         }
+        if !p.wheres.is_empty() {
+            self.push(" where ");
+            for (i, w) in p.wheres.iter().enumerate() {
+                if i > 0 {
+                    self.push(", ");
+                }
+                self.push(&w.param);
+                self.push(": ");
+                self.ty(&w.bound, TP_ANY);
+            }
+        }
         self.push(" ");
         self.methods(&p.methods, span);
     }

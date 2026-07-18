@@ -103,6 +103,9 @@ pub struct ProtocolDecl {
     /// `protocol Name for C[_] { ... }` — the subject is a type constructor of
     /// this arity. 0 for a plain type.
     pub subject_arity: usize,
+    /// `protocol Ord for T where T: Eq` — protocols the subject must also satisfy.
+    /// Implementing this protocol obliges the type to implement each of these.
+    pub wheres: Vec<WhereClause>,
     pub methods: Vec<FnDecl>,
 }
 

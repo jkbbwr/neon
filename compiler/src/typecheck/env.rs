@@ -76,6 +76,8 @@ pub enum TypeErrorKind {
     NotCallable { what: String, ty: String },
     /// A lambda parameter with no annotation and no expected type to infer it from.
     LambdaParamNeedsType(String),
+    /// `impl Sub for X` without the `impl Super for X` that Sub's `where` requires.
+    MissingSupertrait { sub: String, required: String, ty: String },
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
     /// TYPE nothing declares — `unknown type println` is not a sentence.
     UnknownName(String),
@@ -160,6 +162,12 @@ impl fmt::Display for TypeError {
                 "`{n}` has no parameter to dispatch on, and nothing here says what it \
                  should return; annotate the binding or use a turbofish"
             ),
+            TypeErrorKind::MissingSupertrait { sub, required, ty } => write!(
+                f,
+                "`impl {sub} for {ty}` requires `impl {required} for {ty}`: `{sub}` \
+                 declares `where T: {required}`, so implementing it obliges the type \
+                 to implement `{required}` too"
+            ),
             TypeErrorKind::UnknownName(n) => write!(f, "nothing named `{n}` is in scope"),
             TypeErrorKind::NoField { field, on } => {
                 write!(f, "`{on}` has no field `{field}`")
@@ -231,6 +239,10 @@ pub struct Protocol {
     pub subject: String,
     /// Non-zero for a constructor subject, `for C[_]`.
     pub subject_arity: usize,
+    /// Protocols the subject must also satisfy: `protocol Ord for T where T: Eq`.
+    /// Stored as written; resolved to ids when coherence checks them, because a
+    /// super may be declared in any module and order does not matter.
+    pub supertraits: Vec<Vec<String>>,
     pub methods: Vec<FnSig>,
     pub span: Span,
 }
@@ -411,6 +423,43 @@ impl Env {
                 self.error(span, TypeErrorKind::OrphanOverlaps { protocol, overlap });
             }
         }
+
+        self.check_supertraits();
+    }
+
+    /// `impl Ord for X` requires `impl Eq for X`, for every `where` on the protocol.
+    /// Runs after all impls are known, since the super may be implemented anywhere.
+    fn check_supertraits(&mut self) {
+        for n in 0..self.impls.len() {
+            let sub = self.impls[n].protocol;
+            let supers = self.protocols[sub.0].supertraits.clone();
+            let Some(target) = self.impls[n].target else { continue };
+            let module = self.impls[n].module.clone();
+            let span = self.impls[n].span.clone();
+            for spath in &supers {
+                let Some(super_id) = self.lookup_protocol(&module, spath) else {
+                    self.error(span.clone(), TypeErrorKind::UnknownProtocol(spath.join("::")));
+                    continue;
+                };
+                let targets: Vec<TyId> = self
+                    .impls
+                    .iter()
+                    .filter(|i| i.protocol == super_id)
+                    .filter_map(|i| i.target)
+                    .collect();
+                let covered = self.solver.t.union_all(&targets);
+                let missing = self.solver.t.diff(target, covered);
+                if !self.solver.is_empty(missing) {
+                    let sub_name = self.protocols[sub.0].name.clone();
+                    let required = self.protocols[super_id.0].name.clone();
+                    let ty = super::print::print(&mut self.solver.t, target);
+                    self.error(
+                        span.clone(),
+                        TypeErrorKind::MissingSupertrait { sub: sub_name, required, ty },
+                    );
+                }
+            }
+        }
     }
 
     /// Add the checker's diagnostics to the declaration pass's.
@@ -521,11 +570,14 @@ impl Env {
                     if self.protocol_ids.insert(key, id).is_some() {
                         self.error(d.span.clone(), TypeErrorKind::Duplicate(p.name.clone()));
                     }
+                    let supertraits =
+                        p.wheres.iter().filter_map(bound_path).collect();
                     self.protocols.push(Protocol {
                         name: p.name.clone(),
                         module: module.to_vec(),
                         subject: p.subject.clone(),
                         subject_arity: p.subject_arity,
+                        supertraits,
                         methods: vec![],
                         span: d.span.clone(),
                     });

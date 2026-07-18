@@ -319,16 +319,18 @@ where
         .ignore_then(ident())
         .then_ignore(just(Token::For))
         .then(subject)
+        .then(where_clauses(ty.clone()))
         .then(
             fn_like(ty, throws, block, false)
                 .repeated()
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace)),
         )
-        .map(|((name, (subject, subject_arity)), methods)| ProtocolDecl {
+        .map(|(((name, (subject, subject_arity)), wheres), methods)| ProtocolDecl {
             name,
             subject,
             subject_arity,
+            wheres,
             methods,
         })
         .boxed()

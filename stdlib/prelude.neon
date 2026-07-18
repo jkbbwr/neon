@@ -1,0 +1,51 @@
+// The prelude: what syntax depends on, in scope everywhere without a `use`.
+//
+// Declared at the root, so `Display`, `Ordering` and the protocol names resolve by
+// their short names from any module. `#{x}` desugars to `to_string(x)`; `==`/`!=`
+// to `Eq::eq`; `<`/`<=`/`>`/`>=` to `Ord::cmp`. See docs/decisions.md.
+//
+// The primitive impls bottom out in @native intrinsics: the leaf of `1 == 2` cannot
+// be `a == b` without regress. After monomorphisation and inlining a primitive
+// compare is a single instruction again.
+
+type Ordering = :lt | :eq | :gt
+
+// ---- the protocols ----
+
+protocol Display for T {
+    fn to_string(v: T) -> str
+}
+
+protocol Eq for T {
+    fn eq(a: T, b: T) -> bool
+}
+
+// Ordering requires equality: `cmp` must agree with `eq`, so a type cannot be
+// ordered without also defining what equal means.
+protocol Ord for T where T: Eq {
+    fn cmp(a: T, b: T) -> Ordering
+}
+
+// An error is anything printable. `catch (e) { io::println("#{e}") }` just works,
+// and there is no separate `message` method — the error text is its `to_string`.
+protocol Error for T where T: Display {}
+
+// ---- primitive Display ----
+
+impl Display for i64 { @native("neon_i64_to_string") fn to_string(v: i64) -> str }
+impl Display for f64 { @native("neon_f64_to_string") fn to_string(v: f64) -> str }
+impl Display for bool { @native("neon_bool_to_string") fn to_string(v: bool) -> str }
+impl Display for str { @native("neon_str_to_string") fn to_string(v: str) -> str }
+
+// ---- primitive Eq ----
+
+impl Eq for i64 { @native("neon_i64_eq") fn eq(a: i64, b: i64) -> bool }
+impl Eq for f64 { @native("neon_f64_eq") fn eq(a: f64, b: f64) -> bool }
+impl Eq for bool { @native("neon_bool_eq") fn eq(a: bool, b: bool) -> bool }
+impl Eq for str { @native("neon_str_eq") fn eq(a: str, b: str) -> bool }
+
+// ---- primitive Ord ----
+
+impl Ord for i64 { @native("neon_i64_cmp") fn cmp(a: i64, b: i64) -> Ordering }
+impl Ord for f64 { @native("neon_f64_cmp") fn cmp(a: f64, b: f64) -> Ordering }
+impl Ord for str { @native("neon_str_cmp") fn cmp(a: str, b: str) -> Ordering }
