@@ -145,6 +145,7 @@ protocols/ambiguous_call.neon
 protocols/declare_and_impl.neon
 protocols/dispatch_on_receiver.neon
 protocols/generic_impl.neon
+protocols/impl_for_primitive.neon
 protocols/impl_missing_method.neon
 protocols/local_name_shadows_protocol_method.neon
 protocols/no_impl_for_receiver.neon
@@ -175,6 +176,7 @@ types/alias_is_transparent.neon
 types/any_is_the_only_erasure.neon
 types/any_needs_a_cast_to_read.neon
 types/arrow_type_throws.neon
+types/as_cast_recovers_the_narrow_type.neon
 types/as_cast_to_unrelated_type_rejected.neon
 types/atom_not_in_union_rejected.neon
 types/atom_singleton_type.neon
@@ -195,6 +197,7 @@ types/mu_type_through_arrow_return.neon
 types/mu_type_through_arrow_that_throws.neon
 types/mu_type_under_negation.neon
 types/mu_type_without_recursion.neon
+types/newtype_is_nominally_distinct.neon
 types/newtype_not_interchangeable_with_representation.neon
 types/newtype_siblings_do_not_mix.neon
 types/no_one_element_tuple.neon

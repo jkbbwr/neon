@@ -204,6 +204,19 @@ impl Checker<'_> {
     /// whose expected type is unknown -- a binding without an annotation, or an
     /// argument to a protocol method. Where the expected type is known, `if_expr`
     /// rejects it against that type instead.
+    /// True when `nt` is a newtype whose representation meets `other` -- so a cast
+    /// between the two only wraps or unwraps. A newtype carries its representation as
+    /// a hidden `#inner` field, a label no source can write, so its presence marks a
+    /// newtype and its type is the representation.
+    fn newtype_bridges(&mut self, nt: TyId, other: TyId) -> bool {
+        let label = self.env.solver.t.name("#inner");
+        let Some(inner) = narrow::project_field(&mut self.env.solver, nt, label).ty() else {
+            return false;
+        };
+        let meet = self.env.solver.t.intersect(inner, other);
+        !self.env.solver.is_empty(meet)
+    }
+
     fn reject_bare_if(&mut self, e: &Expr) {
         if let ExprKind::If { else_: None, .. } = &e.kind {
             self.error(e.span.clone(), TypeErrorKind::IfWithoutElse);
@@ -380,9 +393,16 @@ impl Checker<'_> {
                 let from = self.expr(module, lhs, None);
                 let scope = Scope::new(module);
                 let to = self.env.resolve(&scope, ty);
-                // A cast narrows; it cannot reach a type the value could never be.
+                // A cast narrows -- it cannot reach a type the value could never be --
+                // except across a newtype boundary, where it wraps or unwraps: a
+                // `newtype Meter = f64` is disjoint from `f64`, yet `m as f64` and
+                // `x as Meter` are exactly what a newtype is for. So the cast is also
+                // valid when one side is a newtype whose representation meets the other.
                 let meet = self.env.solver.t.intersect(from, to);
-                if !self.env.is_error(from) && self.env.solver.is_empty(meet) {
+                let ok = !self.env.solver.is_empty(meet)
+                    || self.newtype_bridges(from, to)
+                    || self.newtype_bridges(to, from);
+                if !self.env.is_error(from) && !ok {
                     let (f, t) = (self.show(from), self.show(to));
                     self.error(e.span.clone(), TypeErrorKind::ImpossibleCast { from: f, to: t });
                     return self.poison();

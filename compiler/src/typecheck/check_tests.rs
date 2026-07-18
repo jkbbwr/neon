@@ -253,6 +253,20 @@ fn a_cast_that_narrows_is_fine() {
     clean("fn f(v: i64 | str) -> i64 { v as i64 }");
 }
 
+#[test]
+fn a_newtype_casts_to_and_from_its_representation() {
+    clean("newtype Meter = f64  fn f(m: Meter) -> f64 { m as f64 }");
+    clean("newtype Meter = f64  fn f(x: f64) -> Meter { x as Meter }");
+}
+
+#[test]
+fn a_cast_between_unrelated_newtypes_is_rejected() {
+    // Both wrap f64, but Meter and Second are disjoint: the bridge is one hop, not
+    // two, so `m as Second` is not `m as f64 as Second`.
+    let e = check("newtype Meter = f64  newtype Second = f64  fn f(m: Meter) -> Second { m as Second }");
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::ImpossibleCast { .. })), "{e:?}");
+}
+
 // ---- fields ----
 
 #[test]
