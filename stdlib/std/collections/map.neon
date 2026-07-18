@@ -1,0 +1,9 @@
+// Immutable maps. Like lists, every operation returns a new map.
+
+@native("neon_map_new") fn new[K, V]() -> Map[K, V]
+@native("neon_map_len") fn len[K, V](m: Map[K, V]) -> i64
+@native("neon_map_get") fn get[K, V](m: Map[K, V], k: K) throws KeyError -> V
+@native("neon_map_set") fn set[K, V](m: Map[K, V], k: K, v: V) -> Map[K, V]
+@native("neon_map_contains") fn contains[K, V](m: Map[K, V], k: K) -> bool
+@native("neon_map_keys") fn keys[K, V](m: Map[K, V]) -> List[K]
+@native("neon_map_values") fn values[K, V](m: Map[K, V]) -> List[V]

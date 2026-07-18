@@ -10,6 +10,25 @@
 
 type Ordering = :lt | :eq | :gt
 
+// The built-in collections, nominal and covariant in their arguments. Opaque: the
+// storage is native, reached only through `std::collections::{list, map}`.
+opaque record List[T] {}
+opaque record Map[K, V] {}
+
+// The errors the stdlib throws. Each is `Display` (its text is the message) and so
+// an `Error`.
+record IndexError { message: str }
+record ParseError { message: str }
+record KeyError { message: str }
+
+impl Display for IndexError { fn to_string(v: IndexError) -> str { v.message } }
+impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
+impl Display for KeyError { fn to_string(v: KeyError) -> str { v.message } }
+
+impl Error for IndexError {}
+impl Error for ParseError {}
+impl Error for KeyError {}
+
 // ---- the protocols ----
 
 protocol Display for T {

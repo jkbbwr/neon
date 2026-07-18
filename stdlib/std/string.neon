@@ -1,0 +1,17 @@
+// String operations. `str` is UTF-8 bytes; indices and lengths are byte-oriented.
+// Turning a value into a str is `to_string` (Display), not a function here.
+
+@native("neon_str_byte_len") fn byte_len(s: str) -> i64
+@native("neon_str_concat") fn concat(a: str, b: str) -> str
+@native("neon_str_slice") fn slice(s: str, from: i64, to: i64) throws IndexError -> str
+@native("neon_str_char_at") fn char_at(s: str, i: i64) throws IndexError -> str
+@native("neon_str_to_int") fn to_int(s: str) throws ParseError -> i64
+@native("neon_str_join") fn join(parts: List[str], sep: str) -> str
+@native("neon_str_find") fn find(s: str, needle: str) -> i64 | null
+@native("neon_str_contains") fn contains(s: str, needle: str) -> bool
+@native("neon_str_starts_with") fn starts_with(s: str, p: str) -> bool
+@native("neon_str_ends_with") fn ends_with(s: str, p: str) -> bool
+@native("neon_str_to_upper") fn to_upper(s: str) -> str
+@native("neon_str_to_lower") fn to_lower(s: str) -> str
+@native("neon_str_repeat") fn repeat(s: str, n: i64) -> str
+@native("neon_str_is_empty") fn is_empty(s: str) -> bool

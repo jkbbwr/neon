@@ -1,0 +1,10 @@
+// Immutable lists. Every operation returns a new list; these are values, which is
+// what makes their generic argument covariant. `rc == 1` reuse makes the copy free
+// when the input is uniquely owned.
+
+@native("neon_list_new") fn new[T]() -> List[T]
+@native("neon_list_len") fn len[T](xs: List[T]) -> i64
+@native("neon_list_get") fn get[T](xs: List[T], i: i64) throws IndexError -> T
+@native("neon_list_set") fn set[T](xs: List[T], i: i64, v: T) throws IndexError -> List[T]
+@native("neon_list_push") fn push[T](xs: List[T], v: T) -> List[T]
+@native("neon_list_concat") fn concat[T](a: List[T], b: List[T]) -> List[T]
