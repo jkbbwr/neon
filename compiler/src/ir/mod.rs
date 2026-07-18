@@ -5,3 +5,4 @@
 //! and re-derives nothing.
 
 pub mod repr;
+pub mod ssa;
