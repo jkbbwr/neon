@@ -14,7 +14,7 @@ use std::string;
 record Point { x: i64, y: i64 }
 
 impl Display for Point {
-    fn display(value: Point) -> str {
+    fn to_string(value: Point) -> str {
         string::concat("(", string::concat(to_string(value.x),
             string::concat(", ", string::concat(to_string(value.y), ")"))))
     }
@@ -23,8 +23,8 @@ impl Display for Point {
 record Box { at: Point, label: str }
 
 impl Display for Box {
-    fn display(value: Box) -> str {
-        string::concat(value.label, string::concat("@", display(value.at)))
+    fn to_string(value: Box) -> str {
+        string::concat(value.label, string::concat("@", to_string(value.at)))
     }
 }
 

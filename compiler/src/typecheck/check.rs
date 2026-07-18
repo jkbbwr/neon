@@ -1076,6 +1076,20 @@ impl Checker<'_> {
 
         // A generic fn: solve its type parameters, then check under the solution.
         let subst = self.solve_generics(module, sig, generics, args, expected);
+        // Discharge each `where T: P`: the type T was bound to must satisfy P here.
+        for (param, proto_path) in &sig.wheres {
+            let pn = self.env.solver.t.name(param);
+            let Some(&concrete) = subst.get(&pn) else { continue };
+            if self.env.is_error(concrete) || super::generic::is_var(&self.env.solver.t, concrete) {
+                continue;
+            }
+            if let Some(pid) = self.env.lookup_protocol(module, proto_path) {
+                if !self.env.type_satisfies(concrete, pid) {
+                    let (ty, protocol) = (self.show(concrete), proto_path.join("::"));
+                    self.error(e.span.clone(), TypeErrorKind::UnsatisfiedBound { ty, protocol });
+                }
+            }
+        }
         for (a, (_, template)) in args.iter().zip(&sig.params) {
             let want = self.env.solver.t.substitute(*template, &subst);
             self.expr(module, a, Some(want));

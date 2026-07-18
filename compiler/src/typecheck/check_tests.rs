@@ -679,3 +679,32 @@ fn a_generic_record_rejects_an_unknown_field() {
     let e = check("record Box[T] { item: T }  fn f() { let b = Box { item: 1, extra: 2 }; }");
     assert!(e.iter().any(|k| matches!(k, TypeErrorKind::NoField { .. })), "{e:?}");
 }
+
+// ---- where-clause bounds ----
+
+const DISP2: &str = "
+    protocol Display for T { fn to_string(v: T) -> str }
+    record X { n: i64 }
+    impl Display for X { @native(\"x\") fn to_string(v: X) -> str }
+";
+
+#[test]
+fn a_generic_body_resolves_a_method_through_its_bound() {
+    // T is opaque, so no impl applies; to_string resolves via `where T: Display`.
+    clean(&format!("{DISP2} fn show[T](v: T) -> str where T: Display {{ to_string(v) }}"));
+}
+
+#[test]
+fn a_bound_is_discharged_at_the_call_site() {
+    clean(&format!(
+        "{DISP2} fn show[T](v: T) -> str where T: Display {{ to_string(v) }}
+         fn f() -> str {{ show(X {{ n: 1 }}) }}"
+    ));
+    // A type with no Display impl fails the bound.
+    let e = check(&format!(
+        "{DISP2} record Plain {{ n: i64 }}
+         fn show[T](v: T) -> str where T: Display {{ to_string(v) }}
+         fn f() -> str {{ show(Plain {{ n: 1 }}) }}"
+    ));
+    assert!(e.iter().any(|k| matches!(k, TypeErrorKind::UnsatisfiedBound { .. })), "{e:?}");
+}

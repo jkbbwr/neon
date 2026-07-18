@@ -9,7 +9,7 @@ use std::io;
 
 record Plain { n: i64 }
 
-fn show[T](v: T) -> str where T: Display { display(v) }
+fn show[T](v: T) -> str where T: Display { to_string(v) }
 
 fn main() {
     io::println(show(Plain { n: 1 }));

@@ -90,6 +90,8 @@ pub enum TypeErrorKind {
     Throws { thrown: String, declared: String },
     /// `impl Sub for X` without the `impl Super for X` that Sub's `where` requires.
     MissingSupertrait { sub: String, required: String, ty: String },
+    /// A generic call whose `where T: P` bound the argument type does not satisfy.
+    UnsatisfiedBound { ty: String, protocol: String },
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
     /// TYPE nothing declares — `unknown type println` is not a sentence.
     UnknownName(String),
@@ -192,6 +194,11 @@ impl fmt::Display for TypeError {
             TypeErrorKind::Incomparable { left, right } => write!(
                 f,
                 "`{left}` and `{right}` share no common type, so they cannot be compared"
+            ),
+            TypeErrorKind::UnsatisfiedBound { ty, protocol } => write!(
+                f,
+                "`{ty}` does not satisfy the bound `{protocol}`: there is no `impl \
+                 {protocol} for {ty}`"
             ),
             TypeErrorKind::MissingSupertrait { sub, required, ty } => write!(
                 f,
@@ -866,6 +873,29 @@ impl Env {
     /// If a bare `name` was imported as a protocol method — `use M::P::method` — the
     /// protocol it came from, so the call dispatches through `P` rather than searching
     /// every protocol that declares `method`. Import as disambiguation.
+    /// Whether `ty` satisfies `protocol` -- has an impl covering it. For a
+    /// constructor-subject protocol the match is by head; otherwise `ty` must be a
+    /// subtype of the union of the protocol's impl targets.
+    pub fn type_satisfies(&mut self, ty: TyId, protocol: ProtocolId) -> bool {
+        if self.protocols[protocol.0].subject_arity > 0 {
+            let Some(head) = crate::typecheck::nominal_head_of(self, ty) else { return false };
+            return self.impls.iter().any(|i| {
+                i.protocol == protocol && i.target_head.as_deref() == Some(head.as_str())
+            });
+        }
+        let targets: Vec<TyId> = self
+            .impls
+            .iter()
+            .filter(|i| i.protocol == protocol)
+            .filter_map(|i| i.target)
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let covered = self.solver.t.union_all(&targets);
+        self.solver.is_subtype(ty, covered)
+    }
+
     pub fn imported_method(&self, module: &[String], name: &str) -> Option<ProtocolId> {
         for n in (0..=module.len()).rev() {
             let scope = module[..n].join("::");

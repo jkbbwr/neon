@@ -11,7 +11,7 @@ use std::string;
 record Point { x: i64, y: i64 }
 
 impl Display for Point {
-    fn display(value: Point) -> str {
+    fn to_string(value: Point) -> str {
         string::concat("(", string::concat(to_string(value.x), string::concat(", ", string::concat(to_string(value.y), ")"))))
     }
 }
@@ -19,7 +19,7 @@ impl Display for Point {
 record Tag { name: str }
 
 impl Display for Tag {
-    fn display(value: Tag) -> str { string::concat("#", value.name) }
+    fn to_string(value: Tag) -> str { string::concat("#", value.name) }
 }
 
 fn moved(p: Point, d: i64) -> Point { Point { x: p.x + d, y: p.y + d } }
@@ -27,7 +27,7 @@ fn moved(p: Point, d: i64) -> Point { Point { x: p.x + d, y: p.y + d } }
 fn main() {
     let p = Point { x: 1, y: 2 };
 
-    io::println(display(p));
+    io::println(to_string(p));
     io::println("p = #{p}");
 
     // Two Display types in one literal, plus a primitive. The parentheses around

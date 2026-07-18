@@ -175,7 +175,7 @@ fn hkt_resolve(
 
 /// The constructor name of a nominal type -- `Box[i64]` → `"Box"` -- read from the
 /// reserved `#nominal` atom of its single record atom.
-fn nominal_head(env: &Env, ty: TyId) -> Option<String> {
+pub(super) fn nominal_head(env: &Env, ty: TyId) -> Option<String> {
     let t = &env.solver.t;
     let d = t.data(ty);
     let atom = match t.rec_bdd.paths(d.records).as_slice() {

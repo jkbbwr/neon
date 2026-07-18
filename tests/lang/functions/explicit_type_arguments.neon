@@ -11,11 +11,11 @@ fn nothing[T]() -> T | null { null }
 fn identity[T](val: T) -> T { val }
 
 fn describe[T](v: T | null) -> str where T: Display {
-    if v is null { "none" } else { display(v as T) }
+    if v is null { "none" } else { to_string(v as T) }
 }
 
 record X { n: i64 }
-impl Display for X { fn display(value: X) -> str { "X" } }
+impl Display for X { fn to_string(value: X) -> str { "X" } }
 
 fn main() {
     // Nothing in the call pins T; the turbofish does.

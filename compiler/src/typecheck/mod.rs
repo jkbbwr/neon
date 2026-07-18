@@ -30,3 +30,8 @@ pub use empty::Solver;
 pub use env::{Env, TypeError, TypeErrorKind};
 pub use resolve::Scope;
 pub use types::{RecordAtom, TyId, Types};
+
+/// The constructor head of a nominal type, for the env's bound check.
+pub(crate) fn nominal_head_of(env: &Env, ty: TyId) -> Option<String> {
+    dispatch::nominal_head(env, ty)
+}

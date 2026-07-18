@@ -86,6 +86,8 @@ functions/named_function_as_value.neon
 functions/optional_params_are_records.neon
 functions/pipe_operator.neon
 functions/record_arg_duplicate_field.neon
+functions/where_clause_bound.neon
+functions/where_clause_unsatisfied.neon
 integers/div_by_zero.neon
 integers/div_min_by_neg_one.neon
 integers/min_literal.neon
@@ -137,6 +139,8 @@ records/union_typed_field.neon
 records/unit_record.neon
 records/value_and_heap_records_same_semantics.neon
 records/value_record_through_any.neon
+strings/interpolation_display.neon
+strings/interpolation_record_literal_in_hole.neon
 strings/interpolation_unterminated_fails.neon
 types/alias_is_transparent.neon
 types/any_is_the_only_erasure.neon

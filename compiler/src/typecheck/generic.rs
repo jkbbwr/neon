@@ -57,6 +57,11 @@ pub fn infer(
     }
 }
 
+/// True when `ty` is a rigid variable (so a bound cannot yet be discharged).
+pub fn is_var(t: &Types, ty: TyId) -> bool {
+    as_var(t, ty).is_some()
+}
+
 /// The variable name when `ty` is exactly one rigid variable and nothing else.
 fn as_var(t: &Types, ty: TyId) -> Option<NameId> {
     let d = t.data(ty);

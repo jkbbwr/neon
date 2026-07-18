@@ -9,13 +9,13 @@ use std::string;
 record X { n: i64 }
 record Y { n: i64 }
 
-impl Display for X { fn display(value: X) -> str { "X" } }
-impl Display for Y { fn display(value: Y) -> str { "Y" } }
+impl Display for X { fn to_string(value: X) -> str { "X" } }
+impl Display for Y { fn to_string(value: Y) -> str { "Y" } }
 
-fn show[T](v: T) -> str where T: Display { display(v) }
+fn show[T](v: T) -> str where T: Display { to_string(v) }
 
 fn pair[A, B](a: A, b: B) -> str where A: Display, B: Display {
-    string::concat(display(a), string::concat("/", display(b)))
+    string::concat(to_string(a), string::concat("/", to_string(b)))
 }
 
 fn main() {
