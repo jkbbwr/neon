@@ -62,10 +62,10 @@ for LLVM). **Printer only, never a parser.** Stage selectable via a `neon ir` ar
 **Testing.** Corpus `.stdout` files become end-to-end execution oracles; IR dumps guard
 passes.
 
-**Open.** *Effects.* Aggressive-always optimisation needs to know which calls are pure.
-Proposed: an inferred, **IR-level** effect analysis — natives tagged `pure`/`io`/`throw`
-(via `@native`), Neon functions inferred transitively, never in a signature; DCE keeps
-`io`/`throw`, CSE shares only `pure`. Awaiting confirmation.
+**Effects.** An IR-level analysis, **pessimistic**: a call is effectful unless cheaply
+proven pure (a primitive op, a `@native`-tagged-`pure`, or a fn transitively calling only
+pure). Two states, `pure` vs `effectful`; default effectful, so there is nothing to prove
+about effectful code. Never in a signature.
 
 ## Why an IR at all, and the one lesson from the graveyard
 
@@ -298,32 +298,27 @@ pass is a self-contained addition rather than a rewrite.
 
 CSE, DCE and reordering must know what is safe to move or drop, which means knowing which
 calls have effects. This is **not** purity in the type system — the decision to keep
-purity out of signatures stands. It is an invisible, inferred, IR-level analysis, and it
-is *small*, because the category that dominates effect systems — reads and writes of
-mutable memory — **does not exist** in an immutable language. What remains is two
-independent flags:
+purity out of signatures stands. It is an invisible, IR-level analysis, and it is
+**pessimistic by design**: a call is **effectful** unless it can be *cheaply proven*
+pure. Being wrong in the safe direction — treating a pure call as effectful — only costs
+a missed optimisation; the reverse would miscompile. So there is nothing to prove about
+effectful code, and no full lattice to compute — just a promotion to `pure` where it is
+obvious, which is a short list:
 
-- **`io`** — talks to the world: output (`neon_io_println`, write, send) *and*
-  nondeterministic input (clock, random, env, file read). `io`s are ordered among
-  themselves, never eliminated, and never shared by CSE (a second read returns a
-  different value).
-- **`throw`** — may return an error rather than a value; a control effect. Never deleted
-  (the error is observable), never hoisted above an `io`. Non-termination folds in here
-  as "may not return normally."
+- a primitive IR op (`i64` add, compare) — pure by construction;
+- a native tagged `pure` (riding `@native`; untagged means effectful);
+- a Neon fn whose calls are *all* (transitively) pure — a cheap monotonic fixpoint.
 
-`pure` is neither flag: a deterministic, terminating function of its inputs, free to CSE,
-DCE, reorder, hoist and duplicate. So the whole effect of a call is `{ may_throw, does_io
-}`, two bits.
+Anything else — an indirect closure call, an untagged native, a fn that reaches one —
+stays effectful, with no analysis at all. Two states suffice: `pure` vs `effectful`. The
+`io`-vs-`throw` distinction is not needed for correctness (lumping them is safe) and can
+be split out later only if a pass wants to move a throw past pure code; the checker
+already knows `throws` precisely, so that split is free when wanted.
 
-- Each native is tagged (`neon_i64_add` = pure; `neon_io_println` = io; a throwing native
-  carries throw), riding the `@native` annotation or a small table.
-- A Neon function's effect is the join of its body's — inferred, transitively, never
-  written by the user.
-- DCE deletes a dead call only if it is `pure`; CSE shares only `pure` computations. (One
-  policy call: a pure-but-possibly-non-terminating call is treated as terminating for
-  DCE, as C does; a `may_diverge` bit would make that strict, and is not worth it in v1.)
-
-No surface syntax, no signature change, no monad. Codegen simply knows what it may touch.
+DCE deletes a dead call only if `pure`; CSE shares only `pure` computations; an effectful
+call is never eliminated, duplicated, or reordered past another. (One policy call: a
+pure-but-possibly-non-terminating call is treated as terminating for DCE, as C does.) No
+surface syntax, no signature change, no monad — codegen simply knows what it may touch.
 
 ## Textual form
 
