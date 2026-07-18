@@ -1,9 +1,13 @@
 # The IR, and the road to a backend
 
-Status: **design**, unbuilt. The front end (lexer → parser → typecheck) is complete
-and holds at 198/198 on the corpus. This document pins the phase after it: an
-intermediate representation, and the first backend behind a seam a second could also
-sit behind.
+Status: **built.** The IR pipeline is implemented and tested — the representation map,
+the SSA data structure and printer, lowering with monomorphisation, the effect
+analysis, the optimiser, and reference-count insertion — and wired end to end behind
+`neon ir`. 147 of the 153 checkable corpus programs lower fully (the rest are edge cases:
+indirect call targets, an abstract dispatch receiver). What remains of this document's
+plan is the **backend**: `emit_c` behind the `Backend` seam, and a runtime with real
+`neon_*` bodies. The design below stands as written; this note records that everything
+up to the backend now exists.
 
 ## Decisions (settled)
 
