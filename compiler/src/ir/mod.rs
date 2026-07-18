@@ -4,5 +4,6 @@
 //! Everything here consumes what the checker already worked out (`TypecheckResult`)
 //! and re-derives nothing.
 
+pub mod lower;
 pub mod repr;
 pub mod ssa;

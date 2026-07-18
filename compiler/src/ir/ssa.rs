@@ -193,6 +193,13 @@ impl Builder {
         v
     }
 
+    pub fn value_repr(&self, v: Value) -> &Repr {
+        &self.values[v.0 as usize].repr
+    }
+    pub fn value_ty(&self, v: Value) -> TyId {
+        self.values[v.0 as usize].ty
+    }
+
     /// A fresh empty block.
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
