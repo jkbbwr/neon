@@ -50,7 +50,10 @@ pub fn analyze(program: &Program) -> HashMap<String, bool> {
     pure
 }
 
-fn op_is_effectful(op: &Op, pure: &HashMap<String, bool>) -> bool {
+/// Whether an op has an effect that must be preserved -- so DCE may not drop it even if
+/// its result is unused, and CSE may not share it. `pure` maps each function to whether
+/// it is pure.
+pub fn op_is_effectful(op: &Op, pure: &HashMap<String, bool>) -> bool {
     match op {
         // Talks to the world, or reaches something that might.
         Op::Native { symbol, .. } => native_is_effectful(symbol),

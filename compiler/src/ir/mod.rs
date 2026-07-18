@@ -6,5 +6,6 @@
 
 pub mod effects;
 pub mod lower;
+pub mod opt;
 pub mod repr;
 pub mod ssa;
