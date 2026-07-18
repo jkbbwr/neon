@@ -37,6 +37,28 @@ pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Mo
         funcs.push(func);
         lambda_jobs.extend(pending);
     }
+
+    // Impl methods: correlate each `ImplDef`'s method (which carries the types) with its
+    // AST body (which carries the code) through the same mangled name that dispatch uses.
+    let mut impl_bodies: std::collections::HashMap<String, &ast::FnDecl> =
+        std::collections::HashMap::new();
+    collect_impl_bodies(&module.decls, &mut impl_bodies);
+    for impl_def in env.impls() {
+        let proto = env.protocols()[impl_def.protocol.0].name.clone();
+        let head = impl_head(env, impl_def);
+        for m in &impl_def.methods {
+            if !m.has_body {
+                continue;
+            }
+            let name = mangle_impl(&proto, &head, &m.name);
+            if let Some(fd) = impl_bodies.get(&name) {
+                let (func, pending) = lower_method(env, result, &impl_def.module, fd, m, name);
+                funcs.push(func);
+                lambda_jobs.extend(pending);
+            }
+        }
+    }
+
     while let Some(job) = lambda_jobs.pop() {
         let (func, pending) = lower_lambda_job(env, result, job);
         funcs.push(func);
@@ -71,6 +93,86 @@ fn mangle(module: &[String], name: &str) -> String {
     } else {
         format!("{}__{name}", module.join("__"))
     }
+}
+
+/// The name of an impl method, agreed between the site that dispatches to it and the
+/// site that lowers it: protocol, target head, and method.
+fn mangle_impl(protocol: &str, head: &str, method: &str) -> String {
+    format!("{protocol}${head}${method}")
+}
+
+/// The head of an impl's target, for mangling — the nominal or primitive name.
+fn impl_head(env: &Env, impl_def: &crate::typecheck::env::ImplDef) -> String {
+    if let Some(h) = &impl_def.target_head {
+        return h.clone();
+    }
+    match impl_def.target.map(|t| repr_of(&env.solver.t, t)) {
+        Some(Repr::Record { name: Some(n), .. }) => n,
+        Some(Repr::I64) => "i64".into(),
+        Some(Repr::F64) => "f64".into(),
+        Some(Repr::Str) => "str".into(),
+        Some(Repr::Bool) => "bool".into(),
+        _ => String::new(),
+    }
+}
+
+/// The head of an impl target written in the AST, matching `impl_head`.
+fn ast_head(ty: &ast::TypeSpec) -> String {
+    match &ty.kind {
+        ast::TypeSpecKind::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn collect_impl_bodies<'a>(
+    decls: &'a [Decl],
+    out: &mut std::collections::HashMap<String, &'a ast::FnDecl>,
+) {
+    for d in decls {
+        match &d.kind {
+            DeclKind::Impl(i) => {
+                let proto = i.protocol.last().cloned().unwrap_or_default();
+                let head = ast_head(&i.target);
+                for m in &i.methods {
+                    if m.body.is_some() {
+                        out.insert(mangle_impl(&proto, &head, &m.name), m);
+                    }
+                }
+            }
+            DeclKind::Mod(m) => collect_impl_bodies(&m.decls, out),
+            _ => {}
+        }
+    }
+}
+
+/// Lower an impl method, whose types come from its `FnSig` and whose code from the AST.
+fn lower_method(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &[String],
+    f: &ast::FnDecl,
+    sig: &crate::typecheck::env::FnSig,
+    name: String,
+) -> (Func, Vec<LambdaJob>) {
+    let ret_repr = repr_of(&env.solver.t, sig.ret);
+    let mut lo = Lower::new(env, result, module.to_vec(), name, ret_repr.clone());
+    let mut params = Vec::new();
+    for (i, p) in f.params.iter().enumerate() {
+        let ty = sig.params.get(i).map(|(_, t)| *t).unwrap_or(TyId(0));
+        let r = repr_of(&env.solver.t, ty);
+        let v = lo.b.block_param(BlockId(0), r, ty);
+        lo.bind(&p.name, v);
+        params.push(v);
+    }
+    lo.b.switch_to(BlockId(0));
+    let body = f.body.as_ref().expect("filtered to bodied methods");
+    let tail = lo.lower_block(body);
+    if !lo.terminated {
+        let ret = if matches!(ret_repr, Repr::Unit) { None } else { tail };
+        lo.b.terminate(Term::Ret(ret));
+    }
+    let pending = std::mem::take(&mut lo.pending);
+    (lo.b.finish(params), pending)
 }
 
 fn lower_fn(
@@ -443,12 +545,20 @@ impl Lower<'_> {
                 ast::StrPart::Text(s) => self.b.emit(Op::ConstStr(s.clone()), Repr::Str, ty),
                 ast::StrPart::Interp(e) => {
                     let v = self.lower_expr(e);
-                    match to_string_symbol(self.b.value_repr(v)) {
+                    let vr = self.b.value_repr(v).clone();
+                    match to_string_symbol(&vr) {
                         Some(sym) => self.b.emit(Op::Native { symbol: sym, args: vec![v] }, Repr::Str, ty),
-                        // A str hole is already a string; a record/nominal hole needs a
-                        // Display dispatch, lowered with the rest of user dispatch.
-                        None if matches!(self.b.value_repr(v), Repr::Str) => v,
-                        None => return self.unhandled_note("string interpolation of a user type", repr, ty),
+                        // A str hole is already a string.
+                        None if matches!(vr, Repr::Str) => v,
+                        // A nominal hole dispatches to its Display impl's `to_string`.
+                        None => match &vr {
+                            Repr::Record { name: Some(n), .. } => self.b.emit(
+                                Op::Call { func: mangle_impl("Display", n, "to_string"), args: vec![v] },
+                                Repr::Str,
+                                ty,
+                            ),
+                            _ => return self.unhandled_note("string interpolation of a value type", repr, ty),
+                        },
                     }
                 }
             };
@@ -673,15 +783,23 @@ impl Lower<'_> {
         };
         match res {
             Resolution::Direct(impl_id) => {
-                let m = self.env.impls()[impl_id.0].methods.iter().find(|m| m.name == method);
-                let native_throws = m.map(|m| (m.native.clone(), m.throws));
-                match native_throws {
-                    Some((Some(sym), throws)) => {
-                        let result = self.b.emit(Op::Native { symbol: sym, args }, repr.clone(), ty);
-                        self.wrap_throwing(result, throws, repr, ty)
+                let impl_def = &self.env.impls()[impl_id.0];
+                let m = impl_def.methods.iter().find(|m| m.name == method);
+                let Some(m) = m else {
+                    return self.unhandled_note("dispatch: no method", repr, ty);
+                };
+                let throws = m.throws;
+                let op = match &m.native {
+                    Some(sym) => Op::Native { symbol: sym.clone(), args },
+                    None => {
+                        // A user impl: call the method's own lowered function.
+                        let proto = self.env.protocols()[impl_def.protocol.0].name.clone();
+                        let head = impl_head(self.env, impl_def);
+                        Op::Call { func: mangle_impl(&proto, &head, &method), args }
                     }
-                    _ => self.unhandled_note("dispatch to user impl", repr, ty),
-                }
+                };
+                let result = self.b.emit(op, repr.clone(), ty);
+                self.wrap_throwing(result, throws, repr, ty)
             }
             Resolution::Switch(_) => self.unhandled_note("dispatch switch", repr, ty),
             Resolution::Bound { .. } => self.unhandled_note("dispatch bound", repr, ty),

@@ -254,3 +254,16 @@ fn a_lambda_captures_and_lowers_as_its_own_function() {
     assert!(ir.contains("fn @lambda$"), "lambda function: {ir}");
     assert!(ir.contains("elem %0.0"), "unpack capture from env: {ir}");
 }
+
+#[test]
+fn user_impl_dispatch_calls_the_lowered_method() {
+    let ir = lower(
+        "protocol Area for T { fn area(s: T) -> i64 }
+         record Sq { side: i64 }
+         impl Area for Sq { fn area(s: Sq) -> i64 { s.side * s.side } }
+         fn use_it(s: Sq) -> i64 { area(s) }",
+    );
+    // The impl method is lowered as its own function, and dispatch calls it by name.
+    assert!(ir.contains("fn @Area$Sq$area"), "impl method lowered: {ir}");
+    assert!(ir.contains("call @Area$Sq$area"), "dispatch calls it: {ir}");
+}
