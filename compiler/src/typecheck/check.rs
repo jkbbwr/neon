@@ -971,16 +971,30 @@ impl Checker<'_> {
         expected: Option<TyId>,
     ) -> TyId {
         let subject = self.expr(module, scrutinee, None);
-        let mut covered: Vec<narrow::Test> = vec![];
+        // A bare-variable scrutinee is re-narrowed inside each arm, so `is Circle`
+        // makes `s.r` legal: the arm sees `s` as the member, not the whole union.
+        let scrut_var = self.scrutinee_var(scrutinee);
         let mut result = self.env.solver.t.never();
 
+        // The running residual: what values could still reach this arm, given the
+        // arms above it already peeled off theirs. Narrowing against it — not the
+        // full subject — is why a bare binding after `is null` receives the non-null
+        // half, and why exhaustiveness falls out as `remaining` reaching empty.
+        let mut remaining = subject;
+        // `bool` is one base bit, not `:true | :false`, so a boolean literal types
+        // as the whole `bool` and cannot be subtracted precisely. Track the two
+        // values by hand: seeing both, unguarded, exhausts `bool`.
+        let (mut saw_true, mut saw_false) = (false, false);
         for arm in arms {
             let test = self.arm_test(module, arm, subject);
             self.locals.push(vec![]);
             let bound = match test {
-                Some(t) => self.env.solver.t.intersect(subject, t.ty),
-                None => subject,
+                Some(t) => self.env.solver.t.intersect(remaining, t.ty),
+                None => remaining,
             };
+            if let Some(v) = &scrut_var {
+                self.bind(v, bound);
+            }
             self.bind_pattern(&arm.pat, bound);
             if let Some(g) = &arm.guard {
                 let b = self.env.solver.t.bool();
@@ -990,25 +1004,46 @@ impl Checker<'_> {
             self.locals.pop();
             result = self.union_branches(result, t);
 
-            if let Some(mut test) = test {
+            // Only an exact, unguarded arm removes anything from the fallthrough: `1`
+            // is one i64 among many, and a guard can always reject.
+            if let Some(test) = test {
+                let mut test = test;
                 if arm.guard.is_some() {
                     test = test.guarded();
                 }
-                covered.push(test);
+                let covered = test.covered(&mut self.env.solver);
+                remaining = self.env.solver.t.diff(remaining, covered);
+            }
+            if let ast::PatternKind::Literal(lit) = &arm.pat.kind {
+                if let (ExprKind::Bool(b), None) = (&lit.kind, &arm.guard) {
+                    if *b { saw_true = true } else { saw_false = true }
+                }
             }
         }
+        if saw_true && saw_false {
+            let bool_ty = self.env.solver.t.bool();
+            remaining = self.env.solver.t.diff(remaining, bool_ty);
+        }
 
-        // Exhaustiveness falls out: the residual is a type naming exactly what was
-        // missed. Only EXACT arms count — `1` is an i64 but matches one i64, so
-        // counting it as covering i64 would report this exhaustive.
-        let covered: Vec<TyId> =
-            covered.into_iter().map(|t| t.covered(&mut self.env.solver)).collect();
-        let rest = narrow::residual(&mut self.env.solver, subject, &covered);
-        if !self.env.solver.is_empty(rest) && !self.env.is_error(subject) {
-            let missing = self.show(rest);
+        // Exhaustiveness falls out: whatever is left in `remaining` names exactly the
+        // values no arm matched.
+        if !self.env.solver.is_empty(remaining) && !self.env.is_error(subject) {
+            let missing = self.show(remaining);
             self.error(e.span.clone(), TypeErrorKind::NotExhaustive { missing });
         }
         result
+    }
+
+    /// The scrutinee's variable name when it is a bare local, so match arms can
+    /// re-narrow it in place. A field access or call has no name to rebind.
+    fn scrutinee_var(&self, scrutinee: &Expr) -> Option<String> {
+        match &scrutinee.kind {
+            ExprKind::Path(segs) => match segs.as_slice() {
+                [one] if self.lookup(one).is_some() => Some(one.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// What an arm tests for, or `None` when it is a plain binding (which admits
@@ -1032,7 +1067,35 @@ impl Checker<'_> {
                     _ => narrow::Test::inexact(t),
                 })
             }
+            // A named record pattern selects its member and narrows to it, so
+            // `Circle { r }` reads `r` as an `i64`. It covers that member only when
+            // every field pattern is irrefutable -- `Circle { r: 0 }` matches one
+            // Circle among many, so it covers nothing and needs a fallthrough.
+            ast::PatternKind::Record { path: Some(p), fields, .. } => {
+                let spec = ast::TypeSpec {
+                    kind: ast::TypeSpecKind::Named { path: p.clone(), args: vec![] },
+                    span: arm.pat.span.clone(),
+                };
+                let t = self.env.resolve(&scope, &spec);
+                let exact = fields.iter().all(Self::field_irrefutable);
+                Some(if exact { narrow::Test::exact(t) } else { narrow::Test::inexact(t) })
+            }
             _ => None,
+        }
+    }
+
+    /// Whether a field pattern can never reject — a shorthand or a bind always
+    /// matches; a nested literal or `is` can fail.
+    fn field_irrefutable(f: &ast::FieldPat) -> bool {
+        f.pat.as_ref().is_none_or(Self::pat_irrefutable)
+    }
+
+    fn pat_irrefutable(p: &ast::Pattern) -> bool {
+        match &p.kind {
+            ast::PatternKind::Bind(_) | ast::PatternKind::Wildcard => true,
+            ast::PatternKind::Record { fields, .. } => fields.iter().all(Self::field_irrefutable),
+            ast::PatternKind::Tuple(ps) => ps.iter().all(Self::pat_irrefutable),
+            _ => false,
         }
     }
 
