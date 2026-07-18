@@ -66,6 +66,15 @@ fn with_bases(set: &mut HashSet<Value>, base_of: &HashMap<Value, Value>) {
     }
 }
 
+/// The value at the bottom of a projection chain — what actually owns the storage.
+fn root_base(base_of: &HashMap<Value, Value>, v: Value) -> Value {
+    let mut cur = v;
+    while let Some(&b) = base_of.get(&cur) {
+        cur = b;
+    }
+    cur
+}
+
 /// Mark a value live, and with it every base it was read out of.
 fn mark_live(live: &mut HashSet<Value>, v: Value, base_of: &HashMap<Value, Value>) {
     let mut cur = Some(v);
@@ -83,6 +92,10 @@ fn insert_fn(f: &mut Func) {
         return;
     }
     let bases = base_of(f, &ptr);
+    // A lifted lambda's environment parameter is *borrowed*: the closure value owns it and
+    // may be called again, so releasing it in the body frees the environment out from under
+    // the next call. It stays in `ptr` so reads out of it are still recognised as views.
+    let env_param: Option<Value> = f.env.is_some().then(|| f.params[0]);
     let (live_in, live_out) = liveness(f, &ptr, &bases);
     let (pred_map, moved_in) = predecessors(f);
 
@@ -117,7 +130,11 @@ fn insert_fn(f: &mut Func) {
                 // releasing one destroys what its base still holds. `elem` reading a
                 // captured closure out of an environment then released the environment's
                 // own copy, and the next call read freed memory.
-                if ptr.contains(&v) && !live.contains(&v) && !bases.contains_key(&v) {
+                if ptr.contains(&v)
+                    && !live.contains(&v)
+                    && !bases.contains_key(&v)
+                    && Some(v) != env_param
+                {
                     releases_after.push(v);
                 }
                 live.remove(&v);
@@ -126,11 +143,17 @@ fn insert_fn(f: &mut Func) {
             let (consuming, borrowing) = operand_uses(&inst.op, &ptr);
             for w in borrowing {
                 let was_live = live.contains(&w);
-                // Mark first and unconditionally: borrowing a view has to keep the base it
-                // looks into alive, whether or not the view itself gets released here.
+                // A base kept alive only by views into it still has to die once the last
+                // of them is done, or nothing ever releases it: `sum(node)` read `value`
+                // and `next` out of a node and then leaked the node itself.
+                let root = root_base(&bases, w);
+                if root != w && !live.contains(&root) && Some(root) != env_param {
+                    releases_after.push(root);
+                }
+                // Mark unconditionally: borrowing a view keeps the base it looks into
+                // alive whether or not the view itself gets released here.
                 mark_live(&mut live, w, &bases);
-                if !was_live && !bases.contains_key(&w) {
-                    // Dead after this borrow: release it once the borrow has read it.
+                if !was_live && !bases.contains_key(&w) && Some(w) != env_param {
                     releases_after.push(w);
                 }
             }
@@ -139,6 +162,10 @@ fn insert_fn(f: &mut Func) {
                     // Used again later, so this consume needs its own owned reference.
                     retains_before.push(w);
                 } else if bases.contains_key(&w) {
+                    let root = root_base(&bases, w);
+                    if !live.contains(&root) && Some(root) != env_param {
+                        releases_after.push(root);
+                    }
                     // Consuming a *view*. A projection holds no reference of its own — it
                     // looks into what its base owns — so handing it on has to materialise
                     // one. Without this, `unwrap_err` passed as a block argument made the
@@ -167,7 +194,7 @@ fn insert_fn(f: &mut Func) {
         let mut head: Vec<Inst> = b
             .params
             .iter()
-            .filter(|p| ptr.contains(p) && !live.contains(p))
+            .filter(|p| ptr.contains(p) && !live.contains(p) && Some(**p) != env_param)
             .map(|&p| Inst { result: None, op: Op::Release(p) })
             .collect();
         let preds = &pred_map[&b.id];
