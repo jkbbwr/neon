@@ -83,7 +83,7 @@ mod tests {
         assert!(env.errors().is_empty(), "{:?}", env.errors());
         let (result, errs) = check_module(&mut env, &module);
         assert!(errs.is_empty(), "{errs:?}");
-        analyze(&lower_module(&env, &result, &module))
+        analyze(&lower_module(&env, &result, &module, &[]))
     }
 
     #[test]

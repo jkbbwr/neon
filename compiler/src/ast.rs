@@ -8,7 +8,7 @@ mod spans;
 #[cfg(test)]
 mod tests;
 
-pub use ids::number_exprs;
+pub use ids::{number_exprs, number_exprs_from};
 pub use spans::strip_spans;
 
 use crate::lexer::Span;

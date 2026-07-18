@@ -295,16 +295,24 @@ fn merge_single_pred(f: &mut Func) -> bool {
 
         // Substitute B's parameters with the arguments A passed, then splice B's body and
         // terminator into A. B is left unreachable for the DCE pass to remove.
+        //
+        // The substitution has to run over the *whole function*, not just the code being
+        // spliced: B's parameters stop existing once B is merged away, and any block after
+        // it that still reads one would refer to a value nothing defines. That produced a
+        // program that silently computed with an uninitialised local.
         let subst: HashMap<Value, Value> =
             f.blocks[bi].params.iter().copied().zip(args).collect();
-        let mut insts = f.blocks[bi].insts.clone();
-        let mut term = f.blocks[bi].term.clone();
-        for inst in &mut insts {
-            rewrite_op(&mut inst.op, &subst);
-        }
-        rewrite_term(&mut term, &subst);
+        let insts = f.blocks[bi].insts.clone();
+        let term = f.blocks[bi].term.clone();
         f.blocks[ai].insts.extend(insts);
         f.blocks[ai].term = term;
+        f.blocks[bi].params.clear();
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                rewrite_op(&mut inst.op, &subst);
+            }
+            rewrite_term(&mut b.term, &subst);
+        }
         changed = true;
     }
     changed

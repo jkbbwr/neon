@@ -16,7 +16,7 @@ record Boom { msg: str }
 impl Display for Boom {
     fn to_string(error: Boom) -> str { error.msg }
 }
-impl Error for Boom {}
+impl Error for Boom { fn message(e: Boom) -> str { e.msg } }
 
 fn maybe(fail: bool) throws Boom -> i64 {
     if fail { throw Boom { msg: "detonated" } } else { 7 }

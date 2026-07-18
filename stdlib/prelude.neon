@@ -10,8 +10,18 @@
 
 type Ordering = :lt | :eq | :gt
 
-// `for i in range(a, b)` — the half-open range [a, b) as a list.
-@native("neon_range") fn range(from: i64, to: i64) -> List[i64]
+// `for i in range(a, b)` — the half-open range [a, b) as a list. Written in Neon rather
+// than as a native: a C function cannot build a `List[i64]` without the element's
+// value-witness, which codegen generates per program.
+fn range(from: i64, to: i64) -> List[i64] {
+    let out: List[i64] = [];
+    let i = from;
+    while i < to {
+        out = std::collections::list::push(out, i);
+        i = i + 1;
+    };
+    out
+}
 
 // The built-in collections, nominal and covariant in their arguments. Opaque: the
 // storage is native, reached only through `std::collections::{list, map}`.
@@ -34,9 +44,14 @@ protocol Ord for T where T: Eq {
     fn cmp(a: T, b: T) -> Ordering
 }
 
-// An error is anything printable. `catch (e) { io::println("#{e}") }` just works,
-// and there is no separate `message` method — the error text is its `to_string`.
-protocol Error for T where T: Display {}
+// An error explains what went wrong. That is a different question from `Display`'s
+// "how does this value render", so `Error` owns `message` rather than borrowing
+// `to_string`: a type can be both a value and an error without the two answers
+// fighting over one method. `message` is the only thing an error knows about itself —
+// a stacktrace belongs to the throw, not to the value, so the compiler supplies it.
+protocol Error for T {
+    fn message(v: T) -> str
+}
 
 // Eager transformation over a one-parameter container `C[_]`. Every method returns
 // a fresh `C` (or, for `fold`, the accumulated value): the language is immutable, so
@@ -49,8 +64,9 @@ protocol Mappable for C[_] {
     fn fold[T, A](c: C[T], init: A, step: (A, T) -> A) -> A
 }
 
-// The errors the stdlib throws. Each is `Display` (its text is the message) and so
-// an `Error`.
+// The errors the stdlib throws. `Display` renders the value; `Error::message` explains
+// the failure. Here they read the same field, but they answer different questions and a
+// type is free to answer them differently.
 record IndexError { message: str }
 record ParseError { message: str }
 record KeyError { message: str }
@@ -59,9 +75,9 @@ impl Display for IndexError { fn to_string(v: IndexError) -> str { v.message } }
 impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
 impl Display for KeyError { fn to_string(v: KeyError) -> str { v.message } }
 
-impl Error for IndexError {}
-impl Error for ParseError {}
-impl Error for KeyError {}
+impl Error for IndexError { fn message(v: IndexError) -> str { v.message } }
+impl Error for ParseError { fn message(v: ParseError) -> str { v.message } }
+impl Error for KeyError { fn message(v: KeyError) -> str { v.message } }
 
 // ---- primitive Display ----
 
@@ -90,7 +106,29 @@ impl Ord for str { @native("neon_str_cmp") fn cmp(a: str, b: str) -> Ordering }
 // a time, in order, over the contiguous buffer.
 
 impl Mappable for List {
-    @native("neon_list_map") fn map[T, U](c: List[T], f: (T) -> U) -> List[U]
-    @native("neon_list_filter") fn filter[T](c: List[T], keep: (T) -> bool) -> List[T]
-    @native("neon_list_fold") fn fold[T, A](c: List[T], init: A, step: (A, T) -> A) -> A
+    fn map[T, U](c: List[T], f: (T) -> U) -> List[U] {
+        let out: List[U] = [];
+        for x in c {
+            out = std::collections::list::push(out, f(x));
+        };
+        out
+    }
+
+    fn filter[T](c: List[T], keep: (T) -> bool) -> List[T] {
+        let out: List[T] = [];
+        for x in c {
+            if keep(x) {
+                out = std::collections::list::push(out, x);
+            };
+        };
+        out
+    }
+
+    fn fold[T, A](c: List[T], init: A, step: (A, T) -> A) -> A {
+        let acc = init;
+        for x in c {
+            acc = step(acc, x);
+        };
+        acc
+    }
 }

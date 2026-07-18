@@ -13,7 +13,7 @@ fn lower(src: &str) -> String {
     assert!(env.errors().is_empty(), "declaration errors: {:?}", env.errors());
     let (result, errs) = check_module(&mut env, &module);
     assert!(errs.is_empty(), "check errors: {errs:?}");
-    print::program(&lower_module(&env, &result, &module))
+    print::program(&lower_module(&env, &result, &module, &[]))
 }
 
 #[test]

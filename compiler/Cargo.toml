@@ -8,3 +8,13 @@ ariadne = "0.6.0"
 chumsky = { version = "0.13.0" }
 unicode-ident = "1.0.24"
 unicode-normalization = "0.1.25"
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+# The backend oracle registers one trial per corpus program, so `cargo nextest` runs and
+# reports each as an individual test. A custom harness is how tests are generated from
+# files discovered at run time.
+[[test]]
+name = "backend_run"
+harness = false

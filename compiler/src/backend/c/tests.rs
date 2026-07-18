@@ -12,7 +12,7 @@ fn emit_c(src: &str) -> String {
     assert!(env.errors().is_empty(), "{:?}", env.errors());
     let (result, errs) = check_module(&mut env, &module);
     assert!(errs.is_empty(), "{errs:?}");
-    emit(&lower_module(&env, &result, &module))
+    emit(&lower_module(&env, &result, &module, &[]))
 }
 
 #[test]

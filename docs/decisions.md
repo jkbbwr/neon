@@ -574,3 +574,63 @@ Module path is derived from file path: this is the one place a file-to-module ma
 exists, and it costs nothing, because `Env::declare` already takes a module prefix (it is
 how nested `mod` blocks work). The loader walks `stdlib/`, turns `std/io.neon` into the
 prefix `std::io`, and declares each file's decls under it before the user's module.
+
+### `Error` owns `message`; `Display` is a separate concern
+
+`protocol Error for T where T: Display {}` welded two unrelated jobs together. `Display`
+answers "how does this value render" — a `User` renders as `"Alice"`. An error answers a
+different question, "what went wrong", and wants `"failed to load user Alice: connection
+refused"`. One `to_string` cannot serve both, and a type that is both a value and an error
+had to pick. The protocol also declared no methods of its own, so it was, literally,
+"`Display`, but you also had to write an `impl`" — the marker and the capability doing
+unrelated work under one name.
+
+    protocol Error for T {
+        fn message(v: T) -> str
+    }
+
+`message` is the one thing an error genuinely knows about itself. Everything else people
+reach for -- context, a stacktrace -- is a property of *where it was thrown*, which the
+value cannot know. Those belong to the throw, not the type, and a default method body
+cannot supply them: a default can compute from fields the type already has, but it cannot
+create storage.
+
+### `throws` is unconstrained; `Error` is required only at the top
+
+`throws T` accepts any type: `throws any`, `throws :ok`, `throws Person`, `throws bool`.
+A `throws` clause is a claim about what a function can fail with, not a claim that the
+failure is presentable. `throws E ... where E: Error` covers generic propagation and
+already works, because the clause resolves in the function's rigid scope.
+
+The `Error` bound applies at exactly one place: an error escaping `main`. That is the only
+point where the language must render something it did not author, so it is the only point
+that may demand an interface. A non-`Error` reaching it is a compile error telling you to
+catch it or implement `Error`.
+
+### `main` does not throw `any`
+
+`main`'s implicit `throws Error` needed a type, and `Error` is a protocol -- a bound, not a
+type -- so ⊤ was substituted. That cost two things. It boxed the error path; and because
+everything is a subtype of ⊤, it silently switched off the check that a thrown value is an
+error at all, so `throw 42` from `main` compiled.
+
+`main`'s error channel is therefore **not a type**. It is a rule, checked per throw site.
+No existential is needed to enforce it: at every escape point the concrete type is
+statically known (or is a concrete union), so `message` is a direct call and a union is a
+tag switch. There is no vtable, no box, and nothing named `Report`.
+
+This holds precisely as long as **protocols stay bounds and never become types**. The day
+`List[Error]` or `fn log(e: Error)` is expressible, a value of unknown type must be carried
+at run time and a real protocol object is required. That line is deliberate.
+
+### `any` may only come from source
+
+`any` is legitimate when written: `throws any` asks for erasure and gets a box. The failure
+mode is the compiler *inventing* it where nobody wrote it -- a fallback, a default, an
+unhandled case -- and then using ⊤'s properties to answer questions it was never asked. That
+is how the previous compiler died, and it recurred here twice: `lower_try` hardcoded
+`Repr::Any` for the handler parameter, and `wrap_throwing` was handed the callee's declared
+error type and discarded it.
+
+`Repr::Any` must only ever arise from a source type that genuinely is ⊤, never from a
+fallback -- guarded the way `Repr::Var` already is.

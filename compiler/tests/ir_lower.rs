@@ -72,7 +72,7 @@ fn lower_the_corpus_and_report_gaps() {
         }
 
         files += 1;
-        let ir = print::program(&lower_module(&env, &result, &module));
+        let ir = print::program(&lower_module(&env, &result, &module, &[]));
         let mut file_todos = 0;
         for line in ir.lines() {
             if let Some(i) = line.find("<todo: ") {
@@ -98,4 +98,64 @@ fn lower_the_corpus_and_report_gaps() {
     }
     assert!(files > 100, "expected to lower most of the corpus, got {files}");
     assert_eq!(clean, files, "every checkable corpus program should lower fully");
+}
+
+/// `any` may only ever come from source. It is legitimate when written — `throws any`
+/// asks for erasure and gets a box — but the compiler must never *invent* it as a
+/// fallback, a default, or an unhandled case. That is how the previous compiler died,
+/// and it recurred twice here: `lower_try` hardcoded `Repr::Any` for a handler's error
+/// parameter, and `wrap_throwing` was handed the callee's declared error type and threw
+/// it away. Both produced a value whose repr was `Any` while its *type* was not `any`,
+/// which is exactly what this asserts cannot happen.
+///
+/// This has to run over the lowered IR rather than `repr_of`: neither bug went through
+/// `repr_of`, so a check on the representation map alone would have missed both.
+#[test]
+fn any_never_appears_unless_the_source_type_is_any() {
+    let mut checked = 0;
+    let mut offenders: Vec<String> = Vec::new();
+
+    for rel in expected_pass() {
+        let Ok(src) = std::fs::read_to_string(lang_root().join(&rel)) else { continue };
+        let Ok(tokens) = lexer::lex(&src) else { continue };
+        let (module, perrs) = parser::parse(&tokens, src.len());
+        if !perrs.is_empty() {
+            continue;
+        }
+        let Some(module) = module else { continue };
+
+        let std_owned = stdlib_modules();
+        let mut modules: Vec<(Vec<String>, &_)> =
+            std_owned.iter().map(|(p, m)| (p.clone(), m)).collect();
+        modules.push((Vec::new(), &module));
+        let mut env = Env::build_with(&modules, Unit::RootApplication);
+        if !env.errors().is_empty() {
+            continue;
+        }
+        let (result, errs) = check_module(&mut env, &module);
+        if !errs.is_empty() {
+            continue;
+        }
+
+        checked += 1;
+        let program = lower_module(&env, &result, &module, &[]);
+        let top = env.solver.t.any();
+        for f in &program.funcs {
+            for v in f.values() {
+                if matches!(f.value_repr(v), neon_compiler::ir::repr::Repr::Any)
+                    && f.value_ty(v) != top
+                {
+                    offenders.push(format!("{rel}: {} %{}", f.name, v.0));
+                }
+            }
+        }
+    }
+
+    assert!(checked > 100, "expected to lower most of the corpus, got {checked}");
+    assert!(
+        offenders.is_empty(),
+        "the compiler invented `any` for {} value(s) whose source type is not `any`:\n  {}",
+        offenders.len(),
+        offenders.iter().take(20).cloned().collect::<Vec<_>>().join("\n  "),
+    );
 }

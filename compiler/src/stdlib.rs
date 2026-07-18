@@ -25,17 +25,28 @@ pub fn module_path(rel: &str) -> Vec<String> {
 /// A stdlib file that does not lex or parse is a broken toolchain, not a user error,
 /// so it is an `Err` naming the file rather than a diagnostic.
 pub fn parse(sources: &[(String, String)]) -> Result<Vec<(Vec<String>, Module)>, String> {
+    parse_from(sources, 0).map(|(m, _)| m)
+}
+
+/// Parse the stdlib, numbering expressions from `base` so ids stay unique across the whole
+/// compilation. Returns the modules and the next free id, which the program is numbered from.
+pub fn parse_from(
+    sources: &[(String, String)],
+    base: u32,
+) -> Result<(Vec<(Vec<String>, Module)>, u32), String> {
     let mut out = Vec::with_capacity(sources.len());
+    let mut next = base;
     for (rel, src) in sources {
         let tokens = lexer::lex(src).map_err(|e| format!("stdlib `{rel}` did not lex: {e:?}"))?;
         let (module, errors) = parser::parse(&tokens, src.len());
         if !errors.is_empty() {
             return Err(format!("stdlib `{rel}` did not parse: {errors:?}"));
         }
-        let module = module.ok_or_else(|| format!("stdlib `{rel}` produced no module"))?;
+        let mut module = module.ok_or_else(|| format!("stdlib `{rel}` produced no module"))?;
+        next = crate::ast::number_exprs_from(&mut module, next);
         out.push((module_path(rel), module));
     }
-    Ok(out)
+    Ok((out, next))
 }
 
 #[cfg(test)]

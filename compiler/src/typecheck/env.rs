@@ -96,6 +96,9 @@ pub enum TypeErrorKind {
     BareThrowingCall,
     /// `throw e` of a type the enclosing function does not declare in `throws`.
     Throws { thrown: String, declared: String },
+    /// An error escaping `main` that does not implement `Error`. `main` must render
+    /// whatever reaches it, so it is the one place the language demands the interface.
+    NotAnError { thrown: String },
     /// `impl Sub for X` without the `impl Super for X` that Sub's `where` requires.
     MissingSupertrait { sub: String, required: String, ty: String },
     /// A generic call whose `where T: P` bound the argument type does not satisfy.
@@ -104,6 +107,8 @@ pub enum TypeErrorKind {
     ImplMissingMethod { protocol: String, method: String },
     /// `main` with an explicit return type or throws clause -- both are fixed.
     MainSignatureFixed,
+    /// A name that exists but sits inside an `internal` module the caller is outside of.
+    Internal { name: String, owner: String },
     /// A value-position name nothing declares. Distinct from `Unknown`, which is a
     /// TYPE nothing declares — `unknown type println` is not a sentence.
     UnknownName(String),
@@ -202,6 +207,11 @@ impl fmt::Display for TypeError {
                 f,
                 "this throws `{thrown}`, but the function only declares `throws {declared}`"
             ),
+            TypeErrorKind::NotAnError { thrown } => write!(
+                f,
+                "`{thrown}` escapes `main`, which must report it, but it does not implement \
+                 `Error` -- catch it, or give it an `impl Error` with a `message`"
+            ),
             TypeErrorKind::MissingField(n) => {
                 write!(f, "this record is missing the required field `{n}`")
             }
@@ -228,6 +238,10 @@ impl fmt::Display for TypeError {
                 "`impl {sub} for {ty}` requires `impl {required} for {ty}`: `{sub}` \
                  declares `where T: {required}`, so implementing it obliges the type \
                  to implement `{required}` too"
+            ),
+            TypeErrorKind::Internal { name, owner } => write!(
+                f,
+                "`{name}` is internal to `{owner}` and cannot be used from here"
             ),
             TypeErrorKind::UnknownName(n) => write!(f, "nothing named `{n}` is in scope"),
             TypeErrorKind::NoField { field, on } => {
@@ -434,6 +448,9 @@ pub struct Env {
     /// `mu` is reserved before its body is read, so a cycle through one is just
     /// a cycle in the graph.
     active: Vec<(String, Vec<TyId>)>,
+    /// Modules declared `internal mod`. Their contents resolve only from the subtree
+    /// rooted at the declaring parent — see `visible_from`.
+    internal_modules: Vec<Vec<String>>,
     /// `mu` declarations whose contractivity check failed.
     mu_bad: Vec<String>,
     depth: usize,
@@ -465,6 +482,7 @@ impl Env {
             errors: vec![],
             inst: HashMap::new(),
             active: vec![],
+            internal_modules: vec![],
             mu_bad: vec![],
             depth: 0,
             error_ty,
@@ -748,6 +766,9 @@ impl Env {
                 ast::DeclKind::Mod(m) => {
                     let mut inner = module.to_vec();
                     inner.push(m.name.clone());
+                    if m.internal {
+                        self.internal_modules.push(inner.clone());
+                    }
                     self.declare(&inner, &m.decls);
                 }
                 _ => {}
@@ -957,7 +978,48 @@ impl Env {
     /// `std::io`, so the first segment is rewritten and the rest appended. The single
     /// case the old resolvers handled — `use std::io::println; println()` — is the same
     /// rule with an empty tail.
+    /// Whether a fully-qualified name resolves from `module`.
+    ///
+    /// A name inside an `internal mod` is reachable only from the subtree rooted at the
+    /// module that declared it: `std::collections::list::raw` resolves from
+    /// `std::collections::list` and anything beneath it, and nowhere else. The same holds
+    /// for a path segment literally named `internal`, which marks a directory the same way.
+    ///
+    /// This is checked while *resolving a name*, not while checking a `use`, so a
+    /// fully-qualified call cannot slip past the boundary.
+    fn visible_from(&self, module: &[String], key: &str) -> bool {
+        let segs: Vec<&str> = key.split("::").collect();
+        let reachable = |root: &[&str]| {
+            module.len() >= root.len() && root.iter().zip(module).all(|(a, b)| *a == b.as_str())
+        };
+
+        // A directory named `internal` is internal to its parent.
+        if let Some(pos) = segs.iter().position(|s| *s == "internal") {
+            if !reachable(&segs[..pos]) {
+                return false;
+            }
+        }
+        // An `internal mod` is internal to the module that declared it.
+        for m in &self.internal_modules {
+            let is_prefix =
+                segs.len() >= m.len() && m.iter().zip(&segs).all(|(a, b)| a.as_str() == *b);
+            if is_prefix {
+                let root: Vec<&str> = m[..m.len() - 1].iter().map(String::as_str).collect();
+                if !reachable(&root) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn candidates(&self, module: &[String], path: &[String]) -> Vec<String> {
+        let mut out = self.candidates_raw(module, path);
+        out.retain(|k| self.visible_from(module, k));
+        out
+    }
+
+    fn candidates_raw(&self, module: &[String], path: &[String]) -> Vec<String> {
         let mut out = Vec::new();
         for n in (0..=module.len()).rev() {
             let scope = module[..n].join("::");
@@ -981,6 +1043,31 @@ impl Env {
             }
         }
         out
+    }
+
+    /// The same candidates without the visibility filter, so a failed lookup can tell
+    /// "no such name" apart from "that name is internal".
+    fn candidates_unfiltered(&self, module: &[String], path: &[String]) -> Vec<String> {
+        let mut out = self.candidates_raw(module, path);
+        out.dedup();
+        out
+    }
+
+    /// If a name resolves to something that exists but is hidden by an `internal` module,
+    /// the owning module — so the diagnostic can say why rather than "not in scope".
+    pub fn hidden_by_internal(&self, module: &[String], path: &[String]) -> Option<String> {
+        for k in self.candidates_unfiltered(module, path) {
+            if self.visible_from(module, &k) {
+                continue;
+            }
+            let (m, name) = k.rsplit_once("::").unwrap_or(("", k.as_str()));
+            let exists = self.decls.contains_key(&k)
+                || self.fns.iter().any(|f| f.name == name && f.module.join("::") == m);
+            if exists {
+                return Some(m.to_string());
+            }
+        }
+        None
     }
 
     pub fn lookup(&self, module: &[String], path: &[String]) -> Option<String> {

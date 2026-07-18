@@ -1,7 +1,10 @@
+pub mod build;
 pub mod check;
 pub mod compile;
 pub mod fmt;
+pub mod init;
 pub mod ir;
 pub mod lex;
 pub mod parse;
+pub mod run;
 pub mod sysroot;

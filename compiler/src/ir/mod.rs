@@ -29,8 +29,14 @@ pub enum Stage {
 
 /// Run the IR pipeline to the requested stage: lower (with monomorphisation), then
 /// optimise, then insert reference counts.
-pub fn compile(env: &Env, result: &TypecheckResult, module: &Module, stage: Stage) -> Program {
-    let mut program = lower::lower_module(env, result, module);
+pub fn compile(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &Module,
+    libs: &[(Vec<String>, &Module)],
+    stage: Stage,
+) -> Program {
+    let mut program = lower::lower_module(env, result, module, libs);
     if stage == Stage::Lowered {
         return program;
     }

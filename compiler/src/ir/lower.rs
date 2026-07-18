@@ -32,6 +32,10 @@ struct InstanceJob {
     module: Vec<String>,
     fn_name: String,
     subst: std::collections::HashMap<String, Repr>,
+    /// For a generic *impl* method, the `protocol$head$method` key that finds its body.
+    /// A protocol's methods can be generic independently of the impl (`Mappable::map[T,U]`),
+    /// so they monomorphise per call site exactly like a generic module function.
+    impl_key: Option<String>,
 }
 
 /// Replace every type variable in a repr with its concrete binding. After this a
@@ -44,7 +48,14 @@ fn substitute_repr(r: &Repr, subst: &std::collections::HashMap<String, Repr>) ->
             fields: fields.iter().map(|(n, r)| (n.clone(), substitute_repr(r, subst))).collect(),
         },
         Repr::Tuple(rs) => Repr::Tuple(rs.iter().map(|r| substitute_repr(r, subst)).collect()),
-        Repr::Union(rs) => Repr::Union(rs.iter().map(|r| substitute_repr(r, subst)).collect()),
+        // Re-normalise: substituted variants may collapse (`T | null` with a pointer `T`
+        // is a nullable pointer), coincide, or land in a different order than the concrete
+        // type's — variables are collected after the base bits, so `T | null` substitutes
+        // to `[null, i64]` while `i64 | null` is `[i64, null]`. Left alone, one type gets
+        // two different C structs.
+        Repr::Union(rs) => crate::ir::repr::normalize_union(
+            rs.iter().map(|r| substitute_repr(r, subst)).collect(),
+        ),
         Repr::List(e) => Repr::List(Box::new(substitute_repr(e, subst))),
         Repr::Nullable(e) => Repr::Nullable(Box::new(substitute_repr(e, subst))),
         Repr::Map(k, v) => {
@@ -159,7 +170,16 @@ fn repr_key(r: &Repr) -> String {
 /// Lower a whole module to a program of SSA functions. Lambdas are lowered as separate
 /// functions via a worklist: lowering a function may discover lambdas, which are queued
 /// and lowered in turn (and may discover more).
-pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Module) -> Program {
+/// Lower a program. `libs` are the modules the program was checked against — the stdlib —
+/// with their module paths: their function *bodies* must be lowered too, because the stdlib
+/// is no longer only `@native` signatures. A generic one lowers per instance as its call
+/// sites discover it; a concrete one is lowered outright.
+pub fn lower_module<'a>(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &'a ast::Module,
+    libs: &[(Vec<String>, &'a ast::Module)],
+) -> Program {
     let mut funcs = Vec::new();
     let mut lambda_jobs: Vec<LambdaJob> = Vec::new();
     let mut instance_jobs: Vec<InstanceJob> = Vec::new();
@@ -170,11 +190,17 @@ pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Mo
     let mut all_fns: std::collections::HashMap<(Vec<String>, String), ast::FnDecl> =
         std::collections::HashMap::new();
     collect_all_fns(&[], &module.decls, &mut all_fns);
+    for (path, m) in libs {
+        collect_all_fns(path, &m.decls, &mut all_fns);
+    }
 
     // Non-generic top-level functions. A generic one is lowered only per instance, as its
     // call sites discover them.
     let mut fn_jobs: Vec<(Vec<String>, &'a ast::FnDecl)> = Vec::new();
     collect_fn_jobs(&[], &module.decls, &mut fn_jobs);
+    for (path, m) in libs {
+        collect_fn_jobs(path, &m.decls, &mut fn_jobs);
+    }
     for (m, f) in fn_jobs {
         if !f.generics.is_empty() {
             continue;
@@ -191,6 +217,9 @@ pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Mo
     let mut impl_bodies: std::collections::HashMap<String, &ast::FnDecl> =
         std::collections::HashMap::new();
     collect_impl_bodies(&module.decls, &mut impl_bodies);
+    for (_, m) in libs {
+        collect_impl_bodies(&m.decls, &mut impl_bodies);
+    }
     for impl_def in env.impls() {
         let proto = env.protocols()[impl_def.protocol.0].name.clone();
         let head = impl_head(env, impl_def);
@@ -225,7 +254,7 @@ pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Mo
             if !lowered.insert(job.mangled.clone()) {
                 continue;
             }
-            if let Some((func, l, i)) = lower_instance(env, result, &all_fns, job) {
+            if let Some((func, l, i)) = lower_instance(env, result, &all_fns, &impl_bodies, job) {
                 funcs.push(func);
                 lambda_jobs.extend(l);
                 instance_jobs.extend(i);
@@ -234,7 +263,15 @@ pub fn lower_module<'a>(env: &Env, result: &TypecheckResult, module: &'a ast::Mo
         }
         break;
     }
-    Program { funcs }
+    // Every recursive type the program mentions. Collected from the checker's expression
+    // types rather than from the lowered reprs: a back-edge carries only a `TyId`, so by
+    // the time it is in the IR the unfolding it names is no longer reachable.
+    let mut recursive = std::collections::HashMap::new();
+    let mut boxed = std::collections::HashSet::new();
+    for (_, ty) in result.types() {
+        crate::ir::repr::recursive_unfoldings(&env.solver.t, ty, &mut recursive, &mut boxed);
+    }
+    Program { funcs, recursive, boxed }
 }
 
 fn collect_all_fns(
@@ -262,12 +299,25 @@ fn lower_instance(
     env: &Env,
     result: &TypecheckResult,
     all_fns: &std::collections::HashMap<(Vec<String>, String), ast::FnDecl>,
+    impl_bodies: &std::collections::HashMap<String, &ast::FnDecl>,
     job: InstanceJob,
 ) -> Option<(Func, Vec<LambdaJob>, Vec<InstanceJob>)> {
-    let f = all_fns.get(&(job.module.clone(), job.fn_name.clone()))?;
-    let sig = env.fn_named(&job.module, std::slice::from_ref(&job.fn_name));
-    let ret_ty = sig.map(|s| s.ret).unwrap_or(TyId(0));
-    let ret_repr = substitute_repr(&repr_of(&env.solver.t, ret_ty), &job.subst);
+    // Either a generic module function or a generic impl method: the body and the
+    // signature come from different places, the lowering below is the same.
+    let (f, sig): (&ast::FnDecl, crate::typecheck::env::FnSig) = match &job.impl_key {
+        Some(key) => {
+            let f = *impl_bodies.get(key)?;
+            let sig = impl_method_sig(env, key)?;
+            (f, sig)
+        }
+        None => {
+            let f = all_fns.get(&(job.module.clone(), job.fn_name.clone()))?;
+            let sig = env.fn_named(&job.module, std::slice::from_ref(&job.fn_name))?.clone();
+            (f, sig)
+        }
+    };
+    let ret_repr = substitute_repr(&repr_of(&env.solver.t, sig.ret), &job.subst);
+    let throws_ty = Some(sig.throws);
 
     let mut lo = Lower::with_subst(
         env,
@@ -277,9 +327,12 @@ fn lower_instance(
         ret_repr.clone(),
         job.subst.clone(),
     );
+    if let Some(t) = throws_ty {
+        set_throws(&mut lo.b, env, t, &job.subst);
+    }
     let mut params = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
-        let ty = sig.and_then(|s| s.params.get(i)).map(|(_, t)| *t).unwrap_or(TyId(0));
+        let ty = sig.params.get(i).map(|(_, t)| *t).unwrap_or(TyId(0));
         let r = lo.repr_of_ty(ty);
         let v = lo.b.block_param(BlockId(0), r, ty);
         lo.bind(&p.name, v);
@@ -326,6 +379,24 @@ fn mangle(module: &[String], name: &str) -> String {
 
 /// The name of an impl method, agreed between the site that dispatches to it and the
 /// site that lowers it: protocol, target head, and method.
+/// The signature behind a `protocol$head$method` key, for lowering a generic impl instance.
+fn impl_method_sig(
+    env: &Env,
+    key: &str,
+) -> Option<crate::typecheck::env::FnSig> {
+    let mut parts = key.split('$');
+    let (proto, head, method) = (parts.next()?, parts.next()?, parts.next()?);
+    for impl_def in env.impls() {
+        if env.protocols()[impl_def.protocol.0].name != proto || impl_head(env, impl_def) != head {
+            continue;
+        }
+        if let Some(m) = impl_def.methods.iter().find(|m| m.name == method) {
+            return Some(m.clone());
+        }
+    }
+    None
+}
+
 fn mangle_impl(protocol: &str, head: &str, method: &str) -> String {
     format!("{protocol}${head}${method}")
 }
@@ -418,6 +489,7 @@ fn lower_method(
 ) -> (Func, Vec<LambdaJob>, Vec<InstanceJob>) {
     let ret_repr = repr_of(&env.solver.t, sig.ret);
     let mut lo = Lower::new(env, result, module.to_vec(), name, ret_repr.clone());
+    set_throws(&mut lo.b, env, sig.throws, &Default::default());
     let mut params = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
         let ty = sig.params.get(i).map(|(_, t)| *t).unwrap_or(TyId(0));
@@ -449,6 +521,9 @@ fn lower_fn(
     let ret_repr = repr_of(&env.solver.t, ret_ty);
 
     let mut lo = Lower::new(env, result, module.to_vec(), mangle(module, &f.name), ret_repr.clone());
+    if let Some(s) = sig {
+        set_throws(&mut lo.b, env, s.throws, &Default::default());
+    }
 
     // Parameters are the entry block's parameters.
     let mut params = Vec::new();
@@ -487,7 +562,7 @@ fn lower_lambda_job(env: &Env, result: &TypecheckResult, job: LambdaJob) -> (Fun
 
     // The environment parameter, then unpack each capture from it.
     let env_repr = Repr::Tuple(job.captures.iter().map(|(_, r, _)| r.clone()).collect());
-    let env_v = lo.b.block_param(BlockId(0), env_repr, TyId(0));
+    let env_v = lo.b.block_param(BlockId(0), env_repr.clone(), TyId(0));
     let mut params = vec![env_v];
     if !job.captures.is_empty() {
         for (i, (n, r, cty)) in job.captures.iter().enumerate() {
@@ -509,7 +584,7 @@ fn lower_lambda_job(env: &Env, result: &TypecheckResult, job: LambdaJob) -> (Fun
         lo.b.terminate(Term::Ret(ret));
     }
     let (l, i) = (std::mem::take(&mut lo.pending), std::mem::take(&mut lo.instances));
-    (lo.b.finish(params), l, i)
+    (lo.b.finish_lambda(params, env_repr), l, i)
 }
 
 struct Lower<'a> {
@@ -623,6 +698,15 @@ impl Lower<'_> {
     /// Lower a block, returning its value (the tail expression's), or `None` for a
     /// statement-sequence block.
     fn lower_block(&mut self, block: &Block) -> Option<Value> {
+        // A rebind of a variable bound *outside* this block has to outlive it. The block's
+        // own frame is popped on the way out, which would otherwise discard the new binding
+        // and leave reads after the block seeing the old value. A bare block is
+        // straight-line — no branch, so no merge — and the new value simply replaces the
+        // old one in the enclosing scope.
+        let mut names = Vec::new();
+        collect_assigns_block(block, &mut names);
+        let escaping = self.carried(names);
+
         self.scope.push(vec![]);
         for s in &block.stmts {
             if self.terminated {
@@ -634,7 +718,13 @@ impl Lower<'_> {
             Some(e) if !self.terminated => Some(self.lower_expr(e)),
             _ => None,
         };
+        let updated: Vec<Option<Value>> = escaping.iter().map(|n| self.lookup(n)).collect();
         self.scope.pop();
+        for (n, v) in escaping.iter().zip(updated) {
+            if let Some(v) = v {
+                self.bind(n, v);
+            }
+        }
         tail
     }
 
@@ -720,8 +810,11 @@ impl Lower<'_> {
                     None => self.b.emit(Op::ConstNull, Repr::Null, ty),
                 };
                 if let Some(ctx) = self.loops.last() {
-                    let (exit, has_value) = (ctx.exit, ctx.has_value);
-                    let args = if has_value { vec![bv] } else { vec![] };
+                    let (exit, has_value, carried) = (ctx.exit, ctx.has_value, ctx.carried.clone());
+                    // The exit block carries the loop variables out: the break value first
+                    // (when the loop yields one), then each carried variable's current value.
+                    let mut args = if has_value { vec![bv] } else { vec![] };
+                    args.extend(carried.iter().map(|n| self.lookup(n).unwrap()));
                     self.b.terminate(Term::Jump(Target { to: exit, args }));
                 }
                 self.terminated = true;
@@ -759,14 +852,14 @@ impl Lower<'_> {
                 self.b.emit(Op::Cast(v), repr, ty)
             }
             ExprKind::Try { form, body, catch } => {
-                self.lower_try(*form, body, catch.as_ref(), repr, ty)
+                self.lower_try(e.id, *form, body, catch.as_ref(), repr, ty)
             }
             ExprKind::Lambda { .. } => self.lower_lambda(e, repr, ty),
             ExprKind::Throw(e) => {
                 let ev = self.lower_expr(e);
                 match self.handlers.last().copied() {
                     Some(h) => self.b.terminate(Term::Jump(Target { to: h, args: vec![ev] })),
-                    None => self.b.terminate(Term::Throw(ev)),
+                    None => self.throw_or_escape(ev, ty),
                 }
                 self.terminated = true;
                 self.b.value(Repr::Never, ty)
@@ -1080,7 +1173,14 @@ impl Lower<'_> {
                     // infer them by matching the parameter (and return) reprs against the
                     // concrete argument reprs.
                     let mut subst = std::collections::HashMap::new();
-                    if !generics.is_empty() {
+                    // Prefer the checker's solved type arguments: a turbofish's *syntax*
+                    // gives only a nominal's head (enough to mangle a name), while the
+                    // instance's parameters and locals need the type's full layout.
+                    if let Some(solved) = self.result.generics(id) {
+                        for (name, gty) in solved {
+                            subst.insert(name.clone(), self.repr_of_ty(*gty));
+                        }
+                    } else if !generics.is_empty() {
                         for (gname, spec) in sgenerics.iter().zip(generics) {
                             subst.insert(gname.clone(), repr_from_typespec(spec));
                         }
@@ -1101,6 +1201,7 @@ impl Lower<'_> {
                         module: smodule,
                         fn_name: sname,
                         subst,
+                        impl_key: None,
                     });
                     let result = self.b.emit(Op::Call { func: mangled, args: arg_vs }, repr.clone(), ty);
                     return self.wrap_throwing(result, throws, repr, ty);
@@ -1141,13 +1242,42 @@ impl Lower<'_> {
                     return self.unhandled_note("dispatch: no method", repr, ty);
                 };
                 let throws = m.throws;
+                let generics = m.generics.clone();
+                let mparams: Vec<TyId> = m.params.iter().map(|(_, t)| *t).collect();
+                let mret = m.ret;
                 let op = match &m.native {
                     Some(sym) => Op::Native { symbol: sym.clone(), args },
                     None => {
                         // A user impl: call the method's own lowered function.
                         let proto = self.env.protocols()[impl_def.protocol.0].name.clone();
                         let head = impl_head(self.env, impl_def);
-                        Op::Call { func: mangle_impl(&proto, &head, &method), args }
+                        let key = mangle_impl(&proto, &head, &method);
+                        if generics.is_empty() {
+                            Op::Call { func: key, args }
+                        } else {
+                            // A generic method (`Mappable::map[T, U]`) monomorphises per
+                            // call site, exactly like a generic module function: read the
+                            // bindings off the actual arguments and queue that instance.
+                            let mut subst = std::collections::HashMap::new();
+                            for (i, &av) in args.iter().enumerate() {
+                                if let Some(&pty) = mparams.get(i) {
+                                    let template = repr_of(&self.env.solver.t, pty);
+                                    let concrete = self.b.value_repr(av).clone();
+                                    match_repr(&template, &concrete, &mut subst);
+                                }
+                            }
+                            let ret_template = repr_of(&self.env.solver.t, mret);
+                            match_repr(&ret_template, &repr, &mut subst);
+                            let mangled = mangle_instance(&key, &subst);
+                            self.instances.push(InstanceJob {
+                                mangled: mangled.clone(),
+                                module: impl_def.module.clone(),
+                                fn_name: method.clone(),
+                                subst,
+                                impl_key: Some(key),
+                            });
+                            Op::Call { func: mangled, args }
+                        }
                     }
                 };
                 let result = self.b.emit(op, repr.clone(), ty);
@@ -1193,12 +1323,29 @@ impl Lower<'_> {
         repr: Repr,
         ty: TyId,
     ) -> Value {
+        // Variables a branch reassigns must be merged at the join, or reads after the `if`
+        // would see the pre-branch value. A branch's rebinds live in its own scope frame
+        // and vanish when it pops, so each branch's values are captured before that.
+        let mut names = Vec::new();
+        collect_assigns_block(then, &mut names);
+        if let Some(e) = else_ {
+            collect_assigns_expr(e, &mut names);
+        }
+        let mutated = self.carried(names);
+
         let cond_v = self.lower_expr(cond);
         let then_b = self.b.new_block();
         let else_b = self.b.new_block();
         let join = self.b.new_block();
         let produces = !matches!(repr, Repr::Unit) && else_.is_some();
         let join_param = produces.then(|| self.b.block_param(join, repr.clone(), ty));
+        // A join parameter per mutated variable, in a fixed order the branches follow.
+        let mut mut_params = Vec::new();
+        for n in &mutated {
+            let v = self.lookup(n).unwrap();
+            let (r, vty) = (self.b.value_repr(v).clone(), self.b.value_ty(v));
+            mut_params.push(self.b.block_param(join, r, vty));
+        }
 
         self.b.terminate(Term::Branch {
             cond: cond_v,
@@ -1209,31 +1356,58 @@ impl Lower<'_> {
         // then
         self.b.switch_to(then_b);
         self.terminated = false;
-        let tv = self.lower_block(then);
+        self.scope.push(vec![]);
+        let tv = self.lower_block_inline(then);
         if !self.terminated {
-            let args = join_param.map(|_| vec![tv.unwrap_or_else(|| self.unit(ty))]).unwrap_or_default();
+            let mut args = if produces { vec![tv.unwrap_or_else(|| self.unit(ty))] } else { vec![] };
+            args.extend(mutated.iter().map(|n| self.lookup(n).unwrap()));
             self.b.terminate(Term::Jump(Target { to: join, args }));
         }
+        self.scope.pop();
 
         // else (or straight to join when absent)
         self.b.switch_to(else_b);
         self.terminated = false;
         match else_ {
             Some(e) => {
+                self.scope.push(vec![]);
                 let ev = self.lower_expr(e);
                 if !self.terminated {
-                    let args = join_param.map(|_| vec![ev]).unwrap_or_default();
+                    let mut args = if produces { vec![ev] } else { vec![] };
+                    args.extend(mutated.iter().map(|n| self.lookup(n).unwrap()));
                     self.b.terminate(Term::Jump(Target { to: join, args }));
                 }
+                self.scope.pop();
             }
             None => {
-                self.b.terminate(Term::Jump(Target { to: join, args: vec![] }));
+                // No else means the mutated variables keep their pre-`if` values here.
+                let args: Vec<Value> = mutated.iter().map(|n| self.lookup(n).unwrap()).collect();
+                self.b.terminate(Term::Jump(Target { to: join, args }));
             }
         }
 
         self.b.switch_to(join);
         self.terminated = false;
+        // Reads after the `if` see the merged values.
+        for (n, &p) in mutated.iter().zip(&mut_params) {
+            self.bind(n, p);
+        }
         join_param.unwrap_or_else(|| self.unit(ty))
+    }
+
+    /// Lower a block's statements and tail in the current scope frame (the caller manages
+    /// push/pop), so mutations stay visible for the caller to thread out.
+    fn lower_block_inline(&mut self, block: &Block) -> Option<Value> {
+        for s in &block.stmts {
+            if self.terminated {
+                break;
+            }
+            self.lower_stmt(s);
+        }
+        match &block.tail {
+            Some(e) if !self.terminated => Some(self.lower_expr(e)),
+            _ => None,
+        }
     }
 
     /// `try`/`try?`/`try!` and `try ... catch`. The body runs with an error handler
@@ -1242,6 +1416,7 @@ impl Lower<'_> {
     /// the catch.
     fn lower_try(
         &mut self,
+        id: crate::ast::ExprId,
         form: ast::TryForm,
         body: &Expr,
         catch: Option<&ast::CatchArm>,
@@ -1251,7 +1426,11 @@ impl Lower<'_> {
         let join = self.b.new_block();
         let join_p = self.b.block_param(join, repr.clone(), ty);
         let handler = self.b.new_block();
-        let err_param = self.b.block_param(handler, Repr::Any, ty);
+        // The handler's error parameter takes the exact type the checker computed for what
+        // this `try` can catch. Defaulting it to `any` would erase a type that is known.
+        let err_ty = self.result.caught(id).unwrap_or(ty);
+        let err_repr = repr_of(&self.env.solver.t, err_ty);
+        let err_param = self.b.block_param(handler, err_repr, err_ty);
 
         self.handlers.push(handler);
         let body_v = self.lower_expr(body);
@@ -1272,15 +1451,16 @@ impl Lower<'_> {
             self.scope.pop();
         } else {
             match form {
-                ast::TryForm::Propagate => self.b.terminate(Term::Throw(err_param)),
+                ast::TryForm::Propagate => self.throw_or_escape(err_param, ty),
                 ast::TryForm::Soften => {
                     let n = self.b.emit(Op::ConstNull, Repr::Null, ty);
                     self.b.terminate(Term::Jump(Target { to: join, args: vec![n] }));
                 }
                 ast::TryForm::Assert => {
+                    let msg = self.error_message(err_param, ty);
                     self.b.emit_void(Op::Native {
                         symbol: "neon_panic".into(),
-                        args: vec![err_param],
+                        args: vec![msg],
                     });
                     self.b.terminate(Term::Unreachable);
                 }
@@ -1298,8 +1478,13 @@ impl Lower<'_> {
         if matches!(repr_of(&self.env.solver.t, throws_ty), Repr::Never) {
             return result;
         }
+        // The call yields a tagged result, not the callee's declared return. Retyping it
+        // here keeps codegen and the refcount pass agreeing about what the value holds.
+        let err_repr = repr_of(&self.env.solver.t, throws_ty);
+        self.b.set_value_repr(result, Repr::Union(vec![ok_repr.clone(), err_repr.clone()]));
+
         let iserr = self.b.emit(Op::IsErr(result), Repr::Bool, ty);
-        let err = self.b.emit(Op::UnwrapErr(result), Repr::Any, ty);
+        let err = self.b.emit(Op::UnwrapErr(result), err_repr, throws_ty);
         let ok_b = self.b.new_block();
         match self.handlers.last().copied() {
             Some(h) => self.b.terminate(Term::Branch {
@@ -1453,7 +1638,15 @@ impl Lower<'_> {
         if matches!(lit.kind, ExprKind::Null) {
             return self.b.emit(Op::IsNull(subj), Repr::Bool, bty);
         }
-        let lv = self.lower_expr(lit);
+        // A pattern literal is not a checked expression, so it has no recorded type; give
+        // the constant the subject's (narrowed) repr rather than defaulting to unit.
+        let scalar = variant_scalar(self.b.value_repr(subj));
+        let lv = match &lit.kind {
+            ExprKind::Int(n) => self.b.emit(Op::ConstI64(*n as i64), scalar, bty),
+            ExprKind::Bool(b) => self.b.emit(Op::ConstBool(*b), scalar, bty),
+            ExprKind::Atom(a) => self.b.emit(Op::ConstAtom(a.clone()), Repr::Tag, bty),
+            _ => self.lower_expr(lit),
+        };
         self.b.emit(Op::Prim(PrimOp::Eq, vec![subj, lv]), Repr::Bool, bty)
     }
 
@@ -1511,11 +1704,14 @@ impl Lower<'_> {
         let produces = !matches!(repr, Repr::Unit);
         let exit_param = produces.then(|| self.b.block_param(exit, repr.clone(), ty));
 
-        // Header parameters mirror the carried variables' current reprs.
+        // Header parameters mirror the carried variables' current reprs; the exit block
+        // takes the same set, so code after the loop reads their final values.
         let mut header_params = Vec::new();
+        let mut exit_carried = Vec::new();
         for &v in &inits {
             let (r, vty) = (self.b.value_repr(v).clone(), self.b.value_ty(v));
-            header_params.push(self.b.block_param(header, r, vty));
+            header_params.push(self.b.block_param(header, r.clone(), vty));
+            exit_carried.push(self.b.block_param(exit, r, vty));
         }
 
         self.b.terminate(Term::Jump(Target { to: header, args: inits }));
@@ -1544,6 +1740,10 @@ impl Lower<'_> {
         }
         self.loops.pop();
         self.scope.pop();
+        // Reads after the loop see the carried variables' exit values.
+        for (n, &p) in carried.iter().zip(&exit_carried) {
+            self.bind(n, p);
+        }
 
         self.b.switch_to(exit);
         self.terminated = false;
@@ -1560,9 +1760,11 @@ impl Lower<'_> {
         let exit = self.b.new_block();
 
         let mut header_params = Vec::new();
+        let mut exit_carried = Vec::new();
         for &v in &inits {
             let (r, vty) = (self.b.value_repr(v).clone(), self.b.value_ty(v));
-            header_params.push(self.b.block_param(header, r, vty));
+            header_params.push(self.b.block_param(header, r.clone(), vty));
+            exit_carried.push(self.b.block_param(exit, r, vty));
         }
 
         self.b.terminate(Term::Jump(Target { to: header, args: inits }));
@@ -1573,10 +1775,12 @@ impl Lower<'_> {
             self.bind(n, p);
         }
         let cond_v = self.lower_expr(cond);
+        // The condition-false edge is the natural exit: it hands the carried variables'
+        // current values (the header params) out to the exit block.
         self.b.terminate(Term::Branch {
             cond: cond_v,
             then: Target { to: body_b, args: vec![] },
-            els: Target { to: exit, args: vec![] },
+            els: Target { to: exit, args: header_params.clone() },
         });
 
         self.b.switch_to(body_b);
@@ -1588,11 +1792,21 @@ impl Lower<'_> {
             }
             self.lower_stmt(s);
         }
+        // The body's tail expression runs for its effects (a while yields unit, so its
+        // value is discarded) — dropping it would lose a trailing `if … { break }`.
+        if !self.terminated {
+            if let Some(t) = &body.tail {
+                self.lower_expr(t);
+            }
+        }
         if !self.terminated {
             self.jump_to_header();
         }
         self.loops.pop();
         self.scope.pop();
+        for (n, &p) in carried.iter().zip(&exit_carried) {
+            self.bind(n, p);
+        }
 
         self.b.switch_to(exit);
         self.terminated = false;
@@ -1621,9 +1835,11 @@ impl Lower<'_> {
 
         let i_param = self.b.block_param(header, Repr::I64, ty);
         let mut carried_params = Vec::new();
+        let mut exit_carried = Vec::new();
         for &v in &inits {
             let (r, vty) = (self.b.value_repr(v).clone(), self.b.value_ty(v));
-            carried_params.push(self.b.block_param(header, r, vty));
+            carried_params.push(self.b.block_param(header, r.clone(), vty));
+            exit_carried.push(self.b.block_param(exit, r, vty));
         }
         // The latch takes the carried variables from each back-edge (body end, continue).
         let mut latch_params = Vec::new();
@@ -1644,10 +1860,11 @@ impl Lower<'_> {
             self.bind(n, p);
         }
         let cond = self.b.emit(Op::Prim(PrimOp::Lt, vec![i_param, len]), Repr::Bool, ty);
+        // Exhausting the list exits, handing the carried variables out to the exit block.
         self.b.terminate(Term::Branch {
             cond,
             then: Target { to: body_b, args: vec![] },
-            els: Target { to: exit, args: vec![] },
+            els: Target { to: exit, args: carried_params.clone() },
         });
 
         // body: bind the element and run.
@@ -1690,9 +1907,37 @@ impl Lower<'_> {
         self.b.terminate(Term::Jump(Target { to: header, args: back }));
 
         self.scope.pop();
+        for (n, &p) in carried.iter().zip(&exit_carried) {
+            self.bind(n, p);
+        }
         self.b.switch_to(exit);
         self.terminated = false;
         self.unit(ty)
+    }
+
+    /// Leave the function with an error. A function that declares `throws` returns the
+    /// error case of its tagged result. Otherwise the error is escaping the program — only
+    /// `main` reaches here — so it is reported: `Error::message` resolves statically for
+    /// the concrete type, and the text goes to the top-level panic.
+    fn throw_or_escape(&mut self, err: Value, ty: TyId) {
+        if self.b.throws().is_some() {
+            self.b.terminate(Term::Throw(err));
+            return;
+        }
+        let msg = self.error_message(err, ty);
+        self.b.emit_void(Op::Native { symbol: "neon_panic".into(), args: vec![msg] });
+        self.b.terminate(Term::Unreachable);
+    }
+
+    /// `Error::message(e)` for a concrete error value, resolved at compile time.
+    fn error_message(&mut self, err: Value, ty: TyId) -> Value {
+        let head = repr_head(self.b.value_repr(err));
+        if let Some(head) = head {
+            let name = mangle_impl("Error", &head, "message");
+            return self.b.emit(Op::Call { func: name, args: vec![err] }, Repr::Str, ty);
+        }
+        // No nominal head to dispatch on; report something rather than nothing.
+        self.b.emit(Op::ConstStr("error".into()), Repr::Str, ty)
     }
 
     /// Jump to the innermost loop's header with the current values of its carried vars.
@@ -1710,6 +1955,12 @@ impl Lower<'_> {
     fn carried_vars(&self, body: &Block) -> Vec<String> {
         let mut names = Vec::new();
         collect_assigns_block(body, &mut names);
+        self.carried(names)
+    }
+
+    /// Reduce a list of assigned names to those bound outside — the variables a construct
+    /// must thread through its merge points — keeping first-seen order and dropping dups.
+    fn carried(&self, mut names: Vec<String>) -> Vec<String> {
         names.retain(|n| self.lookup(n).is_some());
         let mut seen = std::collections::HashSet::new();
         names.retain(|n| seen.insert(n.clone()));
@@ -1754,6 +2005,20 @@ fn kind_name(k: &ExprKind) -> &'static str {
         ExprKind::Field { .. } => "field",
         ExprKind::Assert { .. } => "assert",
         _ => "expr",
+    }
+}
+
+/// Record a function's declared error type on its builder, so its result becomes a tagged
+/// union. A `never` clause means it does not throw and the result stays the plain value.
+fn set_throws(
+    b: &mut Builder,
+    env: &Env,
+    throws: TyId,
+    subst: &std::collections::HashMap<String, Repr>,
+) {
+    let r = substitute_repr(&repr_of(&env.solver.t, throws), subst);
+    if !matches!(r, Repr::Never) {
+        b.set_throws(r);
     }
 }
 
@@ -2008,11 +2273,26 @@ fn elem_repr(b: &Builder, base: Value, index: usize) -> Repr {
 }
 
 fn field_repr(b: &Builder, base: Value, field: &str) -> Repr {
-    match b.value_repr(base) {
-        Repr::Record { fields, .. } => {
-            fields.iter().find(|(n, _)| n == field).map(|(_, r)| r.clone()).unwrap_or(Repr::Unit)
+    fn find(r: &Repr, field: &str) -> Option<Repr> {
+        match r {
+            Repr::Record { fields, .. } => {
+                fields.iter().find(|(n, _)| n == field).map(|(_, r)| r.clone())
+            }
+            // Destructuring a union or nullable value: the field lives in a variant.
+            Repr::Union(vs) => vs.iter().find_map(|v| find(v, field)),
+            Repr::Nullable(inner) => find(inner, field),
+            _ => None,
         }
-        _ => Repr::Unit,
+    }
+    find(b.value_repr(base), field).unwrap_or(Repr::Unit)
+}
+
+/// The scalar a value collapses to once its `null` variant is excluded — the type a literal
+/// pattern compares against.
+fn variant_scalar(r: &Repr) -> Repr {
+    match r {
+        Repr::Union(vs) => vs.iter().find(|v| !matches!(v, Repr::Null)).cloned().unwrap_or(Repr::I64),
+        other => other.clone(),
     }
 }
 

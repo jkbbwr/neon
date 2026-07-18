@@ -18,12 +18,12 @@ record OtherError { msg: str }
 impl Display for Boom {
     fn to_string(error: Boom) -> str { error.msg }
 }
-impl Error for Boom {}
+impl Error for Boom { fn message(e: Boom) -> str { e.msg } }
 
 impl Display for OtherError {
     fn to_string(error: OtherError) -> str { error.msg }
 }
-impl Error for OtherError {}
+impl Error for OtherError { fn message(e: OtherError) -> str { e.msg } }
 
 fn go() throws Boom -> i64 {
     throw Boom { msg: "no" }

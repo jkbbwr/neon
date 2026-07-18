@@ -15,12 +15,12 @@ record DecodeError { msg: str }
 impl Display for IoError {
     fn to_string(error: IoError) -> str { error.msg }
 }
-impl Error for IoError {}
+impl Error for IoError { fn message(e: IoError) -> str { e.msg } }
 
 impl Display for DecodeError {
     fn to_string(error: DecodeError) -> str { error.msg }
 }
-impl Error for DecodeError {}
+impl Error for DecodeError { fn message(e: DecodeError) -> str { e.msg } }
 
 fn load(which: i64) throws IoError | DecodeError -> str {
     if which == 0 { throw IoError { msg: "disk gone" } }

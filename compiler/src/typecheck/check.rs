@@ -20,6 +20,19 @@ use crate::ast::{self, BinOp, Expr, ExprKind, UnOp};
 use crate::lexer::Span;
 
 pub fn check_module(env: &mut Env, m: &ast::Module) -> (TypecheckResult, Vec<TypeError>) {
+    check_all(env, &[(Vec::new(), m)])
+}
+
+/// Check every module of a compilation, accumulating into one `TypecheckResult`.
+///
+/// The stdlib is checked here too, at its own module path: its function bodies are real
+/// Neon code that has to be lowered, and lowering reads types and call resolutions out of
+/// this result. Ids are unique across modules (see `ast::number_exprs_from`), so one map
+/// covers them all.
+pub fn check_all(
+    env: &mut Env,
+    modules: &[(Vec<String>, &ast::Module)],
+) -> (TypecheckResult, Vec<TypeError>) {
     let mut c = Checker {
         env,
         result: TypecheckResult::default(),
@@ -33,8 +46,21 @@ pub fn check_module(env: &mut Env, m: &ast::Module) -> (TypecheckResult, Vec<Typ
         rigids: vec![],
         capture_floors: vec![],
     };
-    c.decls(&[], &m.decls);
+    for (path, m) in modules {
+        c.decls(path, &m.decls);
+    }
     (c.result, c.errors)
+}
+
+/// What the enclosing function may fail with. A declared clause is a *type*, checked by
+/// subtyping. `main`'s implicit channel is not a type at all — substituting ⊤ for it both
+/// erased the error path and, because everything is a subtype of ⊤, silently switched off
+/// the check that a thrown value is an error. It is a rule instead: whatever escapes must
+/// implement `Error`, checked per throw site.
+#[derive(Clone, Copy)]
+enum Throws {
+    Declared(TyId),
+    ImplicitError,
 }
 
 struct Checker<'a> {
@@ -45,7 +71,7 @@ struct Checker<'a> {
     /// it was bound at, so a diagnostic can point back at a name's origin.
     locals: Vec<Vec<(String, TyId, Span)>>,
     ret: Option<TyId>,
-    throws: Option<TyId>,
+    throws: Option<Throws>,
     /// Break values of the enclosing loops, innermost last. A `loop` is the union
     /// of the values it breaks with.
     loop_breaks: Vec<Vec<TyId>>,
@@ -128,7 +154,7 @@ impl Checker<'_> {
                     self.locals.push(vec![]);
                     let never = self.env.solver.t.never();
                     self.ret = Some(never);
-                    self.throws = Some(never);
+                    self.throws = Some(Throws::Declared(never));
                     self.block(module, &t.body, None);
                     self.locals.pop();
                 }
@@ -157,11 +183,11 @@ impl Checker<'_> {
             None => self.env.solver.t.tuple(vec![]),
         };
         let throws = match &f.throws {
-            Some(t) => self.env.resolve(&scope, t),
-            // `main` implicitly throws `Error`, and every error record implements it,
-            // so any error propagates to it. Modelled as the top type here.
-            None if module.is_empty() && f.name == "main" => self.env.solver.t.any(),
-            None => self.env.solver.t.never(),
+            Some(t) => Throws::Declared(self.env.resolve(&scope, t)),
+            // `main`'s channel is a rule, not a type: whatever escapes must implement
+            // `Error`, because `main` has to report it.
+            None if module.is_empty() && f.name == "main" => Throws::ImplicitError,
+            None => Throws::Declared(self.env.solver.t.never()),
         };
         self.ret = Some(ret);
         self.throws = Some(throws);
@@ -405,16 +431,36 @@ impl Checker<'_> {
             }
 
             ExprKind::List(elems) => {
+                // Push the expected element type down. Without this a nested literal
+                // infers its own type from its own elements — `[:ok, [:ok, :ok]]` against
+                // `mu type A = :ok | List[A]` made the inner list a `List[:ok]` with
+                // 8-byte slots where the outer expected 16-byte `A` slots, and the
+                // coercion that could not bridge them quietly zeroed the element.
+                let want_elem = expected.and_then(|t| self.element_type(t));
+                let mut elem_tys = Vec::new();
                 for el in elems {
                     match el {
-                        ast::Elem::Value(x) | ast::Elem::Spread(x) => {
+                        ast::Elem::Value(x) => elem_tys.push(self.expr(module, x, want_elem)),
+                        ast::Elem::Spread(x) => {
                             self.expr(module, x, None);
                         }
                     }
                 }
-                // A list's type needs `List[T]`, which needs the stdlib. Until `use`
-                // loads it, saying anything here would be a guess.
-                expected.unwrap_or_else(|| self.poison())
+                // With an expected type, that is the list's type. Without one — a bare
+                // literal, e.g. a `for` iterable — infer `List[T]` where `T` is the union
+                // of the elements' types (`never` for the empty list).
+                match expected {
+                    Some(t) => t,
+                    None => {
+                        let elem = if elem_tys.is_empty() {
+                            self.env.solver.t.never()
+                        } else {
+                            self.env.solver.t.union_all(&elem_tys)
+                        };
+                        let name = self.env.solver.t.name("List");
+                        self.env.solver.t.nominal(name, vec![elem], vec![])
+                    }
+                }
             }
 
             ExprKind::If { cond, then, else_ } => self.if_expr(module, e, cond, then, else_, expected),
@@ -576,7 +622,7 @@ impl Checker<'_> {
             }
 
             ExprKind::Try { form, body, catch } => {
-                self.try_expr(module, *form, body, catch, expected)
+                self.try_expr(module, e.id, *form, body, catch, expected)
             }
         }
     }
@@ -621,7 +667,7 @@ impl Checker<'_> {
         // context that says so, and restore the enclosing one after.
         let want_ret = want.as_ref().map(|a| a.ret);
         let never = self.env.solver.t.never();
-        let saved = self.throws.replace(never);
+        let saved = self.throws.replace(Throws::Declared(never));
         let ret = self.expr(module, body, want_ret);
         self.throws = saved;
         self.locals.pop();
@@ -857,17 +903,43 @@ impl Checker<'_> {
         } else if from_call {
             self.error(span, TypeErrorKind::BareThrowingCall);
         } else {
-            let want = self.throws.unwrap_or(never);
-            if !self.assignable(throws, want) {
-                let (t, w) = (self.show(throws), self.show(want));
-                self.error(span, TypeErrorKind::Throws { thrown: t, declared: w });
+            match self.throws {
+                // Escaping `main`: it must be reportable, so it must implement `Error`.
+                // Resolving `message` for it is the check — and it answers for a union by
+                // requiring every variant to have an impl.
+                Some(Throws::ImplicitError) => {
+                    if !self.implements_error(throws) {
+                        let t = self.show(throws);
+                        self.error(span, TypeErrorKind::NotAnError { thrown: t });
+                    }
+                }
+                other => {
+                    let want = match other {
+                        Some(Throws::Declared(t)) => t,
+                        _ => never,
+                    };
+                    if !self.assignable(throws, want) {
+                        let (t, w) = (self.show(throws), self.show(want));
+                        self.error(span, TypeErrorKind::Throws { thrown: t, declared: w });
+                    }
+                }
             }
         }
+    }
+
+    /// Whether a type implements `Error`. Asking dispatch to resolve `message` for it is
+    /// the whole check: it succeeds only when every value the type admits has an impl.
+    fn implements_error(&mut self, ty: TyId) -> bool {
+        let Some(proto) = self.env.lookup_protocol(&[], &["Error".to_string()]) else {
+            return true; // no prelude in scope; nothing to enforce
+        };
+        dispatch::resolve(self.env, "message", Some(proto), &[ty], None).is_ok()
     }
 
     fn try_expr(
         &mut self,
         module: &[String],
+        id: crate::ast::ExprId,
         form: ast::TryForm,
         body: &Expr,
         catch: &Option<ast::CatchArm>,
@@ -880,6 +952,11 @@ impl Checker<'_> {
         let thrown = self.throw_sinks.pop().unwrap_or_default();
         let caught = self.env.solver.t.union_all(&thrown);
         let never = self.env.solver.t.never();
+
+        // Hand the exact error type to lowering, so the handler's parameter is concrete
+        // rather than erased.
+        let handled = if thrown.is_empty() { never } else { caught };
+        self.result.set_caught(id, handled);
 
         if let Some(arm) = catch {
             // The error union is handled here, not propagated. `catch` binds it.
@@ -950,6 +1027,11 @@ impl Checker<'_> {
         let joined = p.join("::");
         if let Some(sig) = self.env.fn_named(module, p) {
             return sig.ty;
+        }
+        // A name that exists but is fenced off reports why, rather than "not in scope".
+        if let Some(owner) = self.env.hidden_by_internal(module, p) {
+            self.error(e.span.clone(), TypeErrorKind::Internal { name: joined, owner });
+            return self.poison();
         }
         self.error(e.span.clone(), TypeErrorKind::UnknownName(joined));
         self.poison()
@@ -1243,6 +1325,16 @@ impl Checker<'_> {
             return self.direct_call(module, e, &sig, generics, args, expected);
         }
 
+        // A function that exists but is fenced off says so, rather than falling through
+        // to protocol dispatch and reporting a missing method.
+        if let Some(owner) = self.env.hidden_by_internal(module, p) {
+            self.error(
+                callee.span.clone(),
+                TypeErrorKind::Internal { name: p.join("::"), owner },
+            );
+            return self.poison();
+        }
+
         let arg_tys: Vec<TyId> = args
             .iter()
             .map(|a| {
@@ -1320,6 +1412,17 @@ impl Checker<'_> {
 
         // A generic fn: solve its type parameters, then check under the solution.
         let subst = self.solve_generics(module, sig, generics, args, expected);
+        // Hand the solution to lowering, which needs the *types* the parameters were bound
+        // to in order to lay the instance out.
+        let solved: Vec<(String, TyId)> = sig
+            .generics
+            .iter()
+            .filter_map(|g| {
+                let n = self.env.solver.t.name(g);
+                subst.get(&n).map(|&t| (g.clone(), t))
+            })
+            .collect();
+        self.result.set_generics(e.id, solved);
         // Discharge each `where T: P`: the type T was bound to must satisfy P here.
         for (param, proto_path) in &sig.wheres {
             let pn = self.env.solver.t.name(param);

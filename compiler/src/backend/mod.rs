@@ -2,3 +2,4 @@
 //! the only implementation. See `docs/design/ir.md`.
 
 pub mod c;
+mod ctype;

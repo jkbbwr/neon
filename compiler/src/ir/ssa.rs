@@ -21,6 +21,13 @@ pub struct BlockId(pub u32);
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     pub funcs: Vec<Func>,
+    /// Every recursive type in the program, paired with its unfolding. A back-edge is
+    /// only an identity — `Repr::Recursive(ty)` says *which* type, not what it looks
+    /// like — so the backend resolves it here to lay the type out and to refcount it.
+    pub recursive: std::collections::HashMap<crate::typecheck::types::TyId, Repr>,
+    /// The recursive types whose cycle closes entirely by value, so every value of them is
+    /// a heap pointer. `recursive` holds their pointee layout rather than their unfolding.
+    pub boxed: std::collections::HashSet<crate::typecheck::types::TyId>,
 }
 
 /// One function. `params` are the entry block's parameters; `values` records the repr
@@ -32,7 +39,22 @@ pub struct Func {
     pub ret: Repr,
     pub entry: BlockId,
     pub blocks: Vec<Block>,
+    /// For a lifted lambda, the repr of its environment (a tuple of the captures); the
+    /// first parameter is that environment, passed boxed as a `neon_header*`. `None` for
+    /// an ordinary function.
+    pub env: Option<Repr>,
+    /// The error repr of a throwing function. Such a function returns a tagged result
+    /// rather than its declared type: variant 0 is the value, variant 1 the error.
+    pub throws: Option<Repr>,
     values: Vec<ValueData>,
+}
+
+impl Func {
+    /// The tagged result a throwing function actually returns — `{tag, union{ok, err}}`,
+    /// expressed as a two-variant union so it shares the union layout and accessors.
+    pub fn result_repr(&self) -> Option<Repr> {
+        self.throws.as_ref().map(|e| Repr::Union(vec![self.ret.clone(), e.clone()]))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +211,8 @@ impl Func {
 pub struct Builder {
     name: String,
     ret: Repr,
+    /// Set when the function declares `throws`; makes its result a tagged union.
+    throws: Option<Repr>,
     values: Vec<ValueData>,
     blocks: Vec<Block>,
     current: BlockId,
@@ -202,7 +226,14 @@ impl Builder {
             insts: vec![],
             term: Term::Unreachable,
         };
-        Builder { name: name.into(), ret, values: vec![], blocks: vec![entry], current: BlockId(0) }
+        Builder {
+            name: name.into(),
+            ret,
+            throws: None,
+            values: vec![],
+            blocks: vec![entry],
+            current: BlockId(0),
+        }
     }
 
     /// Mint a fresh value with a repr and type.
@@ -261,12 +292,40 @@ impl Builder {
 
     /// Finish, declaring the entry block's parameters as the function's params.
     pub fn finish(self, params: Vec<Value>) -> Func {
+        self.finish_impl(params, None)
+    }
+
+    /// Finish a lifted lambda whose first parameter is a boxed environment of `env` repr.
+    pub fn finish_lambda(self, params: Vec<Value>, env: Repr) -> Func {
+        self.finish_impl(params, Some(env))
+    }
+
+    /// Record that this function throws, so its result becomes a tagged union.
+    pub fn set_throws(&mut self, err: Repr) {
+        self.throws = Some(err);
+    }
+
+    /// The declared error repr, if this function throws.
+    pub fn throws(&self) -> Option<&Repr> {
+        self.throws.as_ref()
+    }
+
+    /// Retype a value. Used for a throwing call's result: the call is emitted at the
+    /// callee's declared return, then retyped to the tagged result it actually yields, so
+    /// codegen and the refcount pass agree about what the value holds.
+    pub fn set_value_repr(&mut self, v: Value, repr: Repr) {
+        self.values[v.0 as usize].repr = repr;
+    }
+
+    fn finish_impl(self, params: Vec<Value>, env: Option<Repr>) -> Func {
         Func {
             name: self.name,
             params,
             ret: self.ret,
             entry: BlockId(0),
             blocks: self.blocks,
+            env,
+            throws: self.throws,
             values: self.values,
         }
     }

@@ -17,7 +17,7 @@ record IoError { msg: str }
 impl Display for IoError {
     fn to_string(error: IoError) -> str { error.msg }
 }
-impl Error for IoError {}
+impl Error for IoError { fn message(e: IoError) -> str { e.msg } }
 
 fn main() throws IoError -> i64 {
     io::println("unreachable");

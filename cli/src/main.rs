@@ -1,11 +1,60 @@
+mod buildcfg;
 mod cmd;
+mod emit;
+mod frontend;
+mod project;
 mod source;
 mod stdlib;
 mod sysroot;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use buildcfg::{Allocator, BuildFlags, Mode};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::Result;
 use std::ffi::OsString;
+
+/// Flags shared by every verb that drives the C compiler. Layered over `neon.toml`'s
+/// `[build]` table, which is layered over built-in defaults.
+#[derive(Args)]
+struct BuildOpts {
+    /// The C compiler to invoke (defaults to `$CC` or `cc`).
+    #[arg(long)]
+    cc: Option<String>,
+    /// The build preset: `debug` (-O0 + symbols + assertions), `release` (-O3), or
+    /// `opt-release` (-O3 + LTO + native + trimmings). Defaults to `release`.
+    #[arg(long, value_enum)]
+    mode: Option<Mode>,
+    /// Override the optimisation level as `-O<level>`, regardless of mode.
+    #[arg(short = 'O', long)]
+    opt: Option<String>,
+    /// Emit debug symbols (`-g`). Always on in debug mode.
+    #[arg(short = 'g', long)]
+    debug_symbols: bool,
+    /// A sanitizer to enable, e.g. `address` or `undefined` (repeatable).
+    #[arg(long)]
+    sanitize: Vec<String>,
+    /// Swap the memory allocator.
+    #[arg(long, value_enum)]
+    allocator: Option<Allocator>,
+    /// A raw flag passed straight through to the C compiler (repeatable). Values almost
+    /// always begin with `-`, so hyphen-led values are taken literally.
+    #[arg(short = 'C', long = "cflag", allow_hyphen_values = true)]
+    cflag: Vec<String>,
+}
+
+impl From<BuildOpts> for BuildFlags {
+    fn from(o: BuildOpts) -> Self {
+        BuildFlags {
+            cc: o.cc,
+            mode: o.mode,
+            opt: o.opt,
+            // Only a present `-g` overrides the layer below; its absence leaves it alone.
+            debug_symbols: o.debug_symbols.then_some(true),
+            sanitize: o.sanitize,
+            allocator: o.allocator,
+            cflags: o.cflag,
+        }
+    }
+}
 
 /// Which pipeline stage `neon ir` prints.
 #[derive(Clone, Copy, ValueEnum)]
@@ -75,12 +124,34 @@ enum Command {
         #[arg(long, value_enum, default_value_t = IrStage::Final)]
         stage: IrStage,
     },
-    /// Compile a source file to an executable.
+    /// Create a new project: a `neon.toml` and a `src/main.neon`.
+    Init {
+        /// The project directory to create (defaults to the working directory).
+        name: Option<OsString>,
+    },
+    /// Compile a single source file to an executable.
     Compile {
         file: OsString,
         /// The output executable (defaults to the source name without its extension).
         #[arg(short)]
         output: Option<OsString>,
+        #[command(flatten)]
+        build: BuildOpts,
+    },
+    /// Build the project containing the working directory into `target/`.
+    Build {
+        #[command(flatten)]
+        build: BuildOpts,
+    },
+    /// Build and run a project or a single `.neon` file.
+    Run {
+        /// A `.neon` file, a project directory, or nothing for the current project.
+        path: Option<OsString>,
+        #[command(flatten)]
+        build: BuildOpts,
+        /// Arguments forwarded to the program, after `--`.
+        #[arg(last = true)]
+        args: Vec<OsString>,
     },
     /// Print the resolved sysroot.
     Sysroot,
@@ -94,7 +165,10 @@ fn main() -> Result<()> {
         Command::Check { file, lib } => cmd::check::run(&file, lib),
         Command::Fmt { file, write, check } => cmd::fmt::run(&file, write, check),
         Command::Ir { file, stage } => cmd::ir::run(&file, stage.into()),
-        Command::Compile { file, output } => cmd::compile::run(&file, output),
+        Command::Init { name } => cmd::init::run(name),
+        Command::Compile { file, output, build } => cmd::compile::run(&file, output, build.into()),
+        Command::Build { build } => cmd::build::run(build.into()),
+        Command::Run { path, build, args } => cmd::run::run(path, args, build.into()),
         Command::Sysroot => cmd::sysroot::run(),
     }
 }

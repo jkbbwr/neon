@@ -44,50 +44,54 @@ void neon_free(void* p) {
 // ---- traps ----
 //
 // A trap prints to stderr and exits immediately with _exit: no atexit teardown, no
-// unwind. The program is dying from a bug; the OS reclaims memory.
+// unwind. The program is dying from a bug; the OS reclaims memory. Under NEON_DEBUG
+// (a `-g` build) we abort() instead, so a debugger catches SIGABRT at the fault.
 
-#define NEON_TRAP_CODE 134
+#define NEON_TRAP_CODE 101
 
 _Noreturn void neon_trap(const char* msg) {
+    // Flush stdout first: `_exit` skips stdio teardown, and output the program already
+    // produced before the fault (its golden up to this point) must still be seen.
+    fflush(stdout);
     fprintf(stderr, "neon: %s\n", msg);
     fflush(stderr);
+#ifdef NEON_DEBUG
+    abort();
+#else
     _exit(NEON_TRAP_CODE);
+#endif
 }
 
 _Noreturn void neon_panic(neon_str msg) {
+    // Flush stdout first, for the same reason a trap does: `_exit` skips stdio teardown,
+    // and whatever the program printed before failing must still be seen.
+    fflush(stdout);
     fprintf(stderr, "neon: uncaught error: %.*s\n", (int)msg.len, msg.data);
     fflush(stderr);
-    _exit(1);
+    _exit(NEON_TRAP_CODE);
 }
 
 _Noreturn void neon_unreachable(void) {
     neon_trap("reached unreachable code");
 }
 
-// ---- trapping i64 arithmetic ----
+// ---- i64 arithmetic ----
+//
+// `+`, `-`, `*`, and unary `-` wrap on overflow (two's complement, no trap); the
+// unsigned round-trip is how C gives that defined behaviour rather than UB. Division and
+// remainder trap on a zero divisor and on INT64_MIN / -1, whose true quotient is not
+// representable.
 
 int64_t neon_i64_add(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_add_overflow(a, b, &r)) {
-        neon_trap("integer overflow");
-    }
-    return r;
+    return (int64_t)((uint64_t)a + (uint64_t)b);
 }
 
 int64_t neon_i64_sub(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_sub_overflow(a, b, &r)) {
-        neon_trap("integer overflow");
-    }
-    return r;
+    return (int64_t)((uint64_t)a - (uint64_t)b);
 }
 
 int64_t neon_i64_mul(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_mul_overflow(a, b, &r)) {
-        neon_trap("integer overflow");
-    }
-    return r;
+    return (int64_t)((uint64_t)a * (uint64_t)b);
 }
 
 int64_t neon_i64_div(int64_t a, int64_t b) {
@@ -105,16 +109,13 @@ int64_t neon_i64_rem(int64_t a, int64_t b) {
         neon_trap("division by zero");
     }
     if (a == INT64_MIN && b == -1) {
-        return 0;
+        neon_trap("integer overflow");
     }
     return a % b;
 }
 
 int64_t neon_i64_neg(int64_t a) {
-    if (a == INT64_MIN) {
-        neon_trap("integer overflow");
-    }
-    return -a;
+    return (int64_t)(-(uint64_t)a);
 }
 
 // ---- str ----
@@ -156,6 +157,151 @@ neon_str neon_str_concat(neon_str a, neon_str b) {
     return s;
 }
 
+// The `+` operator. It borrows both operands -- the IR treats a `prim.add`'s inputs as
+// borrowed and releases them itself at their last use -- so this must not release them.
+neon_str neon_str_add(neon_str a, neon_str b) {
+    neon_header* h = neon_alloc(a.len + b.len, neon_str_drop);
+    char* data = (char*)(h + 1);
+    memcpy(data, a.data, a.len);
+    memcpy(data + a.len, b.data, b.len);
+    neon_str s = {data, a.len + b.len, h};
+    return s;
+}
+
+// ---- string natives (consume their str arguments) ----
+
+// The byte offset of `needle` in `hay`, or -1. An empty needle is found at 0.
+static int64_t str_index_of(neon_str hay, neon_str needle) {
+    if (needle.len == 0) return 0;
+    if (needle.len > hay.len) return -1;
+    for (size_t i = 0; i + needle.len <= hay.len; i++) {
+        if (memcmp(hay.data + i, needle.data, needle.len) == 0) return (int64_t)i;
+    }
+    return -1;
+}
+
+int64_t neon_str_byte_len(neon_str s) {
+    int64_t r = (int64_t)s.len;
+    neon_release(s.owner);
+    return r;
+}
+
+bool neon_str_is_empty(neon_str s) {
+    bool r = s.len == 0;
+    neon_release(s.owner);
+    return r;
+}
+
+neon_str neon_str_to_upper(neon_str s) {
+    neon_str r = neon_str_new(s.data, s.len);
+    for (size_t i = 0; i < r.len; i++) {
+        char c = r.data[i];
+        if (c >= 'a' && c <= 'z') r.data[i] = (char)(c - 32);
+    }
+    neon_release(s.owner);
+    return r;
+}
+
+neon_str neon_str_to_lower(neon_str s) {
+    neon_str r = neon_str_new(s.data, s.len);
+    for (size_t i = 0; i < r.len; i++) {
+        char c = r.data[i];
+        if (c >= 'A' && c <= 'Z') r.data[i] = (char)(c + 32);
+    }
+    neon_release(s.owner);
+    return r;
+}
+
+neon_str neon_str_repeat(neon_str s, int64_t n) {
+    if (n <= 0) {
+        neon_release(s.owner);
+        return neon_str_lit("", 0);
+    }
+    size_t total = s.len * (size_t)n;
+    neon_header* h = neon_alloc(total, neon_str_drop);
+    char* data = (char*)(h + 1);
+    for (int64_t i = 0; i < n; i++) memcpy(data + (size_t)i * s.len, s.data, s.len);
+    neon_str r = {data, total, h};
+    neon_release(s.owner);
+    return r;
+}
+
+bool neon_str_contains(neon_str s, neon_str needle) {
+    bool r = str_index_of(s, needle) >= 0;
+    neon_release(s.owner);
+    neon_release(needle.owner);
+    return r;
+}
+
+bool neon_str_starts_with(neon_str s, neon_str prefix) {
+    bool r = prefix.len <= s.len && memcmp(s.data, prefix.data, prefix.len) == 0;
+    neon_release(s.owner);
+    neon_release(prefix.owner);
+    return r;
+}
+
+bool neon_str_ends_with(neon_str s, neon_str suffix) {
+    bool r = suffix.len <= s.len &&
+             memcmp(s.data + s.len - suffix.len, suffix.data, suffix.len) == 0;
+    neon_release(s.owner);
+    neon_release(suffix.owner);
+    return r;
+}
+
+// A byte slice: `str` is byte-indexed throughout (`byte_len`, `find`), so this cuts at
+// byte offsets and may split a UTF-8 sequence — the caller asked for bytes.
+neon_str neon_str_slice_unchecked(neon_str s, int64_t from, int64_t to) {
+    neon_str r = neon_str_new(s.data + from, (size_t)(to - from));
+    neon_release(s.owner);
+    return r;
+}
+
+// The single byte at `i`. `str` is byte-indexed throughout, so this indexes bytes and may
+// land inside a UTF-8 sequence — the same contract as `slice` and `find`.
+neon_str neon_str_char_at_unchecked(neon_str s, int64_t i) {
+    neon_str r = neon_str_new(s.data + i, 1);
+    neon_release(s.owner);
+    return r;
+}
+
+int64_t neon_str_index_of(neon_str s, neon_str needle) {
+    int64_t r = str_index_of(s, needle);
+    neon_release(s.owner);
+    neon_release(needle.owner);
+    return r;
+}
+
+// Whether the whole string is a decimal integer, optionally signed. Kept separate from
+// parsing so the Neon wrapper decides what to throw.
+bool neon_str_is_int(neon_str s) {
+    size_t i = 0;
+    if (s.len > 0 && (s.data[0] == '-' || s.data[0] == '+')) i = 1;
+    bool any = false;
+    for (; i < s.len; i++) {
+        if (s.data[i] < '0' || s.data[i] > '9') {
+            neon_release(s.owner);
+            return false;
+        }
+        any = true;
+    }
+    neon_release(s.owner);
+    return any;
+}
+
+int64_t neon_str_parse_int(neon_str s) {
+    int64_t sign = 1, v = 0;
+    size_t i = 0;
+    if (s.len > 0 && (s.data[0] == '-' || s.data[0] == '+')) {
+        sign = s.data[0] == '-' ? -1 : 1;
+        i = 1;
+    }
+    for (; i < s.len; i++) {
+        v = (int64_t)((uint64_t)v * 10 + (uint64_t)(s.data[i] - '0'));
+    }
+    neon_release(s.owner);
+    return (int64_t)((uint64_t)v * (uint64_t)sign);
+}
+
 // ---- to-string natives ----
 
 neon_str neon_i64_to_string(int64_t n) {
@@ -184,4 +330,304 @@ void neon_io_println(neon_str s) {
     fwrite(s.data, 1, s.len, stdout);
     fputc('\n', stdout);
     neon_release(s.owner); // consumes s
+}
+
+// ---- list ----
+
+int64_t neon_list_len(neon_list* l) {
+    int64_t n = (int64_t)l->len;
+    neon_release((neon_header*)l);
+    return n;
+}
+
+void* neon_list_at(neon_list* l, int64_t i) {
+    if (i < 0 || (size_t)i >= l->len) {
+        neon_trap("list index out of range");
+    }
+    return l->data + (size_t)i * l->w->size;
+}
+
+static void neon_list_drop(void* p) {
+    neon_list* l = (neon_list*)p;
+    if (l->w->release) {
+        for (size_t i = 0; i < l->len; i++) {
+            l->w->release(l->data + i * l->w->size);
+        }
+    }
+    free(l->data);
+    neon_free(l); // frees the header+body allocation
+}
+
+neon_list* neon_list_new(const neon_witness* w) {
+    neon_list* l = (neon_list*)neon_alloc(sizeof(neon_list) - sizeof(neon_header), neon_list_drop);
+    l->w = w;
+    l->len = 0;
+    l->cap = 0;
+    l->data = NULL;
+    return l;
+}
+
+neon_list* neon_list_new_with_capacity(const neon_witness* w, int64_t cap) {
+    neon_list* l = neon_list_new(w);
+    if (cap > 0) {
+        l->cap = (size_t)cap;
+        l->data = (char*)malloc((size_t)cap * w->size);
+        if (l->data == NULL) neon_trap("out of memory");
+    }
+    return l;
+}
+
+
+// Copy a shared list before a mutation, retaining each element for the copy.
+static neon_list* neon_list_ensure_unique(neon_list* l) {
+    if (l->header.rc == 1) {
+        return l;
+    }
+    size_t sz = l->w->size;
+    neon_list* c = neon_list_new_with_capacity(l->w, (int64_t)(l->len ? l->len : 1));
+    memcpy(c->data, l->data, l->len * sz);
+    c->len = l->len;
+    if (l->w->retain) {
+        for (size_t i = 0; i < c->len; i++) l->w->retain(c->data + i * sz);
+    }
+    neon_release((neon_header*)l);
+    return c;
+}
+
+
+neon_list* neon_list_push(neon_list* l, const void* elem) {
+    size_t sz = l->w->size;
+    l = neon_list_ensure_unique(l);
+    if (l->len == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 4;
+        l->data = (char*)realloc(l->data, ncap * sz);
+        if (l->data == NULL) neon_trap("out of memory");
+        l->cap = ncap;
+    }
+    memcpy(l->data + l->len * sz, elem, sz);
+    l->len++;
+    return l;
+}
+
+neon_list* neon_list_set(neon_list* l, int64_t i, const void* elem) {
+    if (i < 0 || (size_t)i >= l->len) {
+        neon_trap("list index out of range");
+    }
+    size_t sz = l->w->size;
+    l = neon_list_ensure_unique(l);
+    char* slot = l->data + (size_t)i * sz;
+    if (l->w->release) l->w->release(slot);
+    memcpy(slot, elem, sz);
+    return l;
+}
+
+neon_list* neon_list_concat(neon_list* a, neon_list* b) {
+    size_t sz = a->w->size;
+    neon_list* r = neon_list_new_with_capacity(a->w, (int64_t)(a->len + b->len));
+    memcpy(r->data, a->data, a->len * sz);
+    memcpy(r->data + a->len * sz, b->data, b->len * sz);
+    r->len = a->len + b->len;
+    if (a->w->retain) {
+        for (size_t i = 0; i < r->len; i++) a->w->retain(r->data + i * sz);
+    }
+    neon_release((neon_header*)a);
+    neon_release((neon_header*)b);
+    return r;
+}
+
+neon_str neon_str_join(neon_list* parts, neon_str sep) {
+    size_t total = 0;
+    for (size_t i = 0; i < parts->len; i++) {
+        total += ((neon_str*)parts->data)[i].len;
+    }
+    if (parts->len > 1) total += sep.len * (parts->len - 1);
+
+    neon_header* h = neon_alloc(total, neon_str_drop);
+    char* data = (char*)(h + 1);
+    size_t off = 0;
+    for (size_t i = 0; i < parts->len; i++) {
+        if (i > 0) {
+            memcpy(data + off, sep.data, sep.len);
+            off += sep.len;
+        }
+        neon_str e = ((neon_str*)parts->data)[i];
+        memcpy(data + off, e.data, e.len);
+        off += e.len;
+    }
+    neon_str s = {data, total, h};
+    neon_release((neon_header*)parts); // consumes parts (drops its str elements)
+    neon_release(sep.owner);
+    return s;
+}
+
+// ---- any (boxed erasure) ----
+
+static void neon_box_drop(void* p) {
+    neon_box* b = (neon_box*)p;
+    if (b->w->release) {
+        b->w->release((void*)(b + 1));
+    }
+    neon_free(b);
+}
+
+neon_value neon_box_new(const void* payload, const neon_witness* w, uint64_t tag) {
+    size_t extra = sizeof(neon_box) - sizeof(neon_header) + w->size;
+    neon_box* b = (neon_box*)neon_alloc(extra, neon_box_drop);
+    b->w = w;
+    b->type_tag = tag;
+    memcpy((void*)(b + 1), payload, w->size);
+    return (neon_value)b;
+}
+
+// ---- map ----
+//
+// Open addressing with linear probing. `ctrl` marks each slot empty, dead (a tombstone
+// left by a removal) or full; keys and values sit in parallel arrays sized by their
+// witnesses. Equality and hashing come from the key witness, so a `str` key compares by
+// content rather than by address.
+
+static void neon_map_drop(void* p) {
+    neon_map* m = (neon_map*)p;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->ctrl[i] != NEON_MAP_FULL) continue;
+        if (m->kw->value->release) m->kw->value->release(m->keys + i * m->kw->value->size);
+        if (m->vw->release) m->vw->release(m->vals + i * m->vw->size);
+    }
+    free(m->ctrl);
+    free(m->keys);
+    free(m->vals);
+    neon_free(m);
+}
+
+static neon_map* neon_map_alloc(const neon_key_witness* kw, const neon_witness* vw, size_t cap) {
+    neon_map* m = (neon_map*)neon_alloc(sizeof(neon_map) - sizeof(neon_header), neon_map_drop);
+    m->kw = kw;
+    m->vw = vw;
+    m->len = 0;
+    m->cap = cap;
+    m->ctrl = (unsigned char*)calloc(cap ? cap : 1, 1);
+    m->keys = (char*)malloc((cap ? cap : 1) * kw->value->size);
+    m->vals = (char*)malloc((cap ? cap : 1) * vw->size);
+    if (m->ctrl == NULL || m->keys == NULL || m->vals == NULL) neon_trap("out of memory");
+    return m;
+}
+
+neon_map* neon_map_new(const neon_key_witness* kw, const neon_witness* vw) {
+    return neon_map_alloc(kw, vw, 8);
+}
+
+// The slot a key belongs in: its own if present, else the first free slot on its probe.
+static size_t neon_map_slot(neon_map* m, const void* key, bool* found) {
+    size_t ksz = m->kw->value->size;
+    size_t mask = m->cap - 1;
+    size_t i = (size_t)m->kw->hash(key) & mask;
+    size_t first_dead = (size_t)-1;
+    for (size_t n = 0; n < m->cap; n++) {
+        unsigned char c = m->ctrl[i];
+        if (c == NEON_MAP_EMPTY) {
+            *found = false;
+            return first_dead != (size_t)-1 ? first_dead : i;
+        }
+        if (c == NEON_MAP_DEAD) {
+            if (first_dead == (size_t)-1) first_dead = i;
+        } else if (m->kw->eq(m->keys + i * ksz, key)) {
+            *found = true;
+            return i;
+        }
+        i = (i + 1) & mask;
+    }
+    *found = false;
+    return first_dead != (size_t)-1 ? first_dead : 0;
+}
+
+void* neon_map_find(neon_map* m, const void* key) {
+    bool found = false;
+    size_t i = neon_map_slot(m, key, &found);
+    return found ? m->vals + i * m->vw->size : NULL;
+}
+
+void* neon_map_at(neon_map* m, const void* key) {
+    void* v = neon_map_find(m, key);
+    if (v == NULL) {
+        neon_trap("key not present");
+    }
+    return v;
+}
+
+int64_t neon_map_len(neon_map* m) {
+    int64_t n = (int64_t)m->len;
+    neon_release((neon_header*)m);
+    return n;
+}
+
+bool neon_map_contains(neon_map* m, const void* key) {
+    bool r = neon_map_find(m, key) != NULL;
+    neon_release((neon_header*)m);
+    return r;
+}
+
+// A fresh map holding everything this one does, retaining each entry it copies.
+static neon_map* neon_map_clone(neon_map* m, size_t cap) {
+    neon_map* c = neon_map_alloc(m->kw, m->vw, cap);
+    size_t ksz = m->kw->value->size, vsz = m->vw->size;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->ctrl[i] != NEON_MAP_FULL) continue;
+        bool found = false;
+        size_t j = neon_map_slot(c, m->keys + i * ksz, &found);
+        memcpy(c->keys + j * ksz, m->keys + i * ksz, ksz);
+        memcpy(c->vals + j * vsz, m->vals + i * vsz, vsz);
+        c->ctrl[j] = NEON_MAP_FULL;
+        c->len++;
+        if (m->kw->value->retain) m->kw->value->retain(c->keys + j * ksz);
+        if (m->vw->retain) m->vw->retain(c->vals + j * vsz);
+    }
+    return c;
+}
+
+neon_map* neon_map_set(neon_map* m, const void* key, const void* val) {
+    // Shared, or too full to probe well: copy before mutating. Uniquely owned maps are
+    // updated in place, which is what makes the immutable interface cheap.
+    if (m->header.rc > 1 || (m->len + 1) * 4 >= m->cap * 3) {
+        size_t cap = (m->len + 1) * 4 >= m->cap * 3 ? m->cap * 2 : m->cap;
+        neon_map* c = neon_map_clone(m, cap);
+        neon_release((neon_header*)m);
+        m = c;
+    }
+    size_t ksz = m->kw->value->size, vsz = m->vw->size;
+    bool found = false;
+    size_t i = neon_map_slot(m, key, &found);
+    if (found) {
+        if (m->vw->release) m->vw->release(m->vals + i * vsz);
+    } else {
+        memcpy(m->keys + i * ksz, key, ksz);
+        m->ctrl[i] = NEON_MAP_FULL;
+        m->len++;
+    }
+    memcpy(m->vals + i * vsz, val, vsz);
+    return m;
+}
+
+// `keys`/`values` hand back a list; the element witness comes from codegen, which knows
+// the concrete element type.
+static neon_list* neon_map_collect(neon_map* m, const neon_witness* w, bool want_keys) {
+    neon_list* out = neon_list_new_with_capacity(w, (int64_t)m->len);
+    size_t esz = w->size;
+    size_t ksz = m->kw->value->size, vsz = m->vw->size;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->ctrl[i] != NEON_MAP_FULL) continue;
+        const char* src = want_keys ? m->keys + i * ksz : m->vals + i * vsz;
+        memcpy(out->data + out->len * esz, src, esz);
+        if (w->retain) w->retain(out->data + out->len * esz);
+        out->len++;
+    }
+    neon_release((neon_header*)m);
+    return out;
+}
+
+neon_list* neon_map_keys(neon_map* m, const neon_witness* w) {
+    return neon_map_collect(m, w, true);
+}
+
+neon_list* neon_map_values(neon_map* m, const neon_witness* w) {
+    return neon_map_collect(m, w, false);
 }

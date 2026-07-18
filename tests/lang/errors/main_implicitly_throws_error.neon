@@ -20,12 +20,12 @@ record Fizz { msg: str }
 impl Display for Boom {
     fn to_string(error: Boom) -> str { error.msg }
 }
-impl Error for Boom {}
+impl Error for Boom { fn message(e: Boom) -> str { e.msg } }
 
 impl Display for Fizz {
     fn to_string(error: Fizz) -> str { error.msg }
 }
-impl Error for Fizz {}
+impl Error for Fizz { fn message(e: Fizz) -> str { e.msg } }
 
 fn go(fail: bool) throws Boom -> i64 {
     if fail { throw Boom { msg: "boom" } } else { 7 }

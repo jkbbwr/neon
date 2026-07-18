@@ -13,7 +13,7 @@ record Boom { msg: str }
 impl Display for Boom {
     fn to_string(error: Boom) -> str { error.msg }
 }
-impl Error for Boom {}
+impl Error for Boom { fn message(e: Boom) -> str { e.msg } }
 
 fn go() throws Boom -> i64 {
     throw Boom { msg: "no" }

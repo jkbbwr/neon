@@ -3,11 +3,42 @@
 
 @native("neon_str_byte_len") fn byte_len(s: str) -> i64
 @native("neon_str_concat") fn concat(a: str, b: str) -> str
-@native("neon_str_slice") fn slice(s: str, from: i64, to: i64) throws IndexError -> str
-@native("neon_str_char_at") fn char_at(s: str, i: i64) throws IndexError -> str
-@native("neon_str_to_int") fn to_int(s: str) throws ParseError -> i64
+// The unchecked primitives. A native can return neither a tagged result nor an
+// `i64 | null` — both are layouts codegen generates per program — so the check, the error
+// and the union all live here, where the types are declared.
+internal mod raw {
+    @native("neon_str_slice_unchecked") fn slice_unchecked(s: str, from: i64, to: i64) -> str
+    @native("neon_str_char_at_unchecked") fn char_at_unchecked(s: str, i: i64) -> str
+    @native("neon_str_index_of") fn index_of(s: str, needle: str) -> i64
+    @native("neon_str_is_int") fn is_int(s: str) -> bool
+    @native("neon_str_parse_int") fn parse_int(s: str) -> i64
+}
+
+fn slice(s: str, from: i64, to: i64) throws IndexError -> str {
+    if from < 0 or from > to or to > byte_len(s) {
+        throw IndexError { message: "slice #{from}..#{to} out of range" };
+    }
+    raw::slice_unchecked(s, from, to)
+}
+
+fn char_at(s: str, i: i64) throws IndexError -> str {
+    if i < 0 or i >= byte_len(s) {
+        throw IndexError { message: "index #{i} out of range" };
+    }
+    raw::char_at_unchecked(s, i)
+}
+
+fn to_int(s: str) throws ParseError -> i64 {
+    if !raw::is_int(s) {
+        throw ParseError { message: "not an integer" };
+    }
+    raw::parse_int(s)
+}
 @native("neon_str_join") fn join(parts: List[str], sep: str) -> str
-@native("neon_str_find") fn find(s: str, needle: str) -> i64 | null
+fn find(s: str, needle: str) -> i64 | null {
+    let at = raw::index_of(s, needle);
+    if at < 0 { null } else { at }
+}
 @native("neon_str_contains") fn contains(s: str, needle: str) -> bool
 @native("neon_str_starts_with") fn starts_with(s: str, p: str) -> bool
 @native("neon_str_ends_with") fn ends_with(s: str, p: str) -> bool

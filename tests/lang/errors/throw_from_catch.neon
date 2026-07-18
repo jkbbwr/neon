@@ -11,12 +11,12 @@ record HighError { msg: str }
 impl Display for LowError {
     fn to_string(error: LowError) -> str { error.msg }
 }
-impl Error for LowError {}
+impl Error for LowError { fn message(e: LowError) -> str { e.msg } }
 
 impl Display for HighError {
     fn to_string(error: HighError) -> str { error.msg }
 }
-impl Error for HighError {}
+impl Error for HighError { fn message(e: HighError) -> str { e.msg } }
 
 fn low() throws LowError -> i64 {
     throw LowError { msg: "cable unplugged" }

@@ -9,12 +9,23 @@
 use super::*;
 
 /// Number every expression in pre-order. Returns how many there were.
-pub fn number_exprs(module: &mut Module) -> u32 {
-    let mut n = Numberer { next: 0 };
+/// Number every expression in a module, starting at `base`, and return the next free id.
+///
+/// `base` exists because ids must be unique across *all* modules in a compilation, not just
+/// within one: the stdlib is real Neon code whose bodies are checked and lowered alongside
+/// the program, and a `TypecheckResult` is keyed by `ExprId`. Numbering each module from
+/// zero would make those keys collide.
+pub fn number_exprs_from(module: &mut Module, base: u32) -> u32 {
+    let mut n = Numberer { next: base };
     for d in &mut module.decls {
         n.decl(d);
     }
     n.next
+}
+
+/// Number a standalone module from zero.
+pub fn number_exprs(module: &mut Module) -> u32 {
+    number_exprs_from(module, 0)
 }
 
 struct Numberer {
