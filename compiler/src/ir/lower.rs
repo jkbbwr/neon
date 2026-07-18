@@ -162,6 +162,7 @@ fn repr_key(r: &Repr) -> String {
         Repr::Union(_) => "union".into(),
         Repr::Var(n) => n.clone(),
         Repr::Recursive(_) => "rec".into(),
+        Repr::BoxedRec(a) => format!("box{a}"),
         Repr::Any => "any".into(),
         Repr::Never => "never".into(),
     }
@@ -267,9 +268,10 @@ pub fn lower_module<'a>(
     // types rather than from the lowered reprs: a back-edge carries only a `TyId`, so by
     // the time it is in the IR the unfolding it names is no longer reachable.
     let mut recursive = std::collections::HashMap::new();
-    let mut boxed = std::collections::HashSet::new();
+    let mut boxed = std::collections::HashMap::new();
     for (_, ty) in result.types() {
-        crate::ir::repr::recursive_unfoldings(&env.solver.t, ty, &mut recursive, &mut boxed);
+        crate::ir::repr::recursive_unfoldings(&env.solver.t, ty, &mut recursive);
+        crate::ir::repr::boxed_shapes(&env.solver.t, ty, &mut boxed);
     }
     Program { funcs, recursive, boxed }
 }

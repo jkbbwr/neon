@@ -54,6 +54,10 @@ pub enum Repr {
     /// A rigid type variable, abstract until monomorphisation. A `repr_of` result of
     /// `Var` in a fully monomorphic program is a bug the no-gaps test catches.
     Var(String),
+    /// A pointer to a heap-allocated recursive record, carried by its record *atom*. A
+    /// record whose cycle closes entirely by value has no finite inline layout, so every
+    /// value of it is this pointer — uniformly, at every use.
+    BoxedRec(u32),
     /// A back-edge of a recursive (`mu`) type: a pointer to the enclosing type, carried
     /// by its `TyId`. This is what gives a recursive type a finite representation, and
     /// it is the runtime indirection the recursion sits behind.
@@ -75,7 +79,11 @@ impl Repr {
     pub fn is_pointer(&self) -> bool {
         matches!(
             self,
-            Repr::Str | Repr::List(_) | Repr::Map(_, _) | Repr::Closure { .. }
+            Repr::Str
+                | Repr::List(_)
+                | Repr::Map(_, _)
+                | Repr::Closure { .. }
+                | Repr::BoxedRec(_)
         )
     }
 
@@ -100,22 +108,22 @@ impl Repr {
 /// The representation of a type. Total: every `TyId` maps to a `Repr`.
 pub fn repr_of(t: &Types, ty: TyId) -> Repr {
     let cyclic = cycle_participants(t, ty);
-    let boxed = boxed_types(t, ty);
-    // A type whose cycle closes entirely by value has no finite inline layout, so every
-    // value of it is a pointer — including at the root. That uniformity is the point:
-    // `Node` reached as a parameter and `Node` reached through `next` must be one C type.
-    if boxed.contains(&ty) {
-        return Repr::Recursive(ty);
-    }
+    let boxed = boxed_atoms(t, ty);
     repr_rec(t, ty, &cyclic, &boxed, true)
 }
 
-/// The *pointee* layout of a boxed recursive type — what `repr_of` deliberately will not
-/// give you, since it hands back the pointer.
-pub fn repr_shape(t: &Types, ty: TyId) -> Repr {
-    let cyclic = cycle_participants(t, ty);
-    let boxed = boxed_types(t, ty);
-    repr_components(t, ty, &cyclic, &boxed)
+/// The *pointee* layout of a boxed record — what `repr_of` will not give you, since a
+/// value of that type is the pointer.
+pub fn repr_shape(t: &Types, atom: u32, boxed: &HashSet<u32>) -> Repr {
+    record_repr(t, atom, &HashSet::new(), boxed)
+}
+
+/// Every boxed record atom reachable from `ty`, paired with its pointee layout.
+pub fn boxed_shapes(t: &Types, ty: TyId, out: &mut HashMap<u32, Repr>) {
+    let boxed = boxed_atoms(t, ty);
+    for a in &boxed {
+        out.entry(*a).or_insert_with(|| repr_shape(t, *a, &boxed));
+    }
 }
 
 /// Cut the recursion at any type that lies on a cycle, except the root being unfolded.
@@ -135,74 +143,13 @@ fn repr_rec(
     t: &Types,
     ty: TyId,
     cyclic: &HashSet<TyId>,
-    boxed: &HashSet<TyId>,
+    boxed: &HashSet<u32>,
     root: bool,
 ) -> Repr {
-    if boxed.contains(&ty) || (!root && cyclic.contains(&ty)) {
+    if !root && cyclic.contains(&ty) {
         return Repr::Recursive(ty);
     }
     repr_components(t, ty, cyclic, boxed)
-}
-
-/// Successors reached *by value* — the edges along which a layout must be laid out inline.
-/// A `List`/`Map` argument or an arrow's parameters and result are reached through a
-/// pointer, so they cannot make a layout infinite and are not edges here. A cycle made only
-/// of these value edges is one no amount of inlining terminates, and so must be boxed.
-fn value_successors(t: &Types, ty: TyId) -> Vec<TyId> {
-    let d = t.data(ty);
-    let mut out = Vec::new();
-    for atom in positive_atoms(&t.rec_bdd.paths(d.records)) {
-        // The opaque containers hold their elements behind a pointer.
-        if matches!(nominal_name(t, atom).as_deref(), Some("List") | Some("Map")) {
-            continue;
-        }
-        for (n, fty) in &t.rec_atoms[atom as usize].fields {
-            let s = t.name_str(*n);
-            if !s.starts_with('#') || s == "#inner" {
-                out.push(*fty);
-            }
-        }
-    }
-    for atom in positive_atoms(&t.tup_bdd.paths(d.tuples)) {
-        out.extend(t.tup_atoms[atom as usize].elems.iter().copied());
-    }
-    out.sort_unstable_by_key(|t| t.0);
-    out.dedup();
-    out
-}
-
-/// Types reachable from `root` that sit on a cycle with no pointer anywhere on it.
-fn boxed_types(t: &Types, root: TyId) -> HashSet<TyId> {
-    // Only the *records* on the cycle are boxed. A union sitting on one — `Node | null`,
-    // `Branch | Leaf` — needs no box of its own: once its record variant is a pointer the
-    // union is finite, and boxing it as well would bury the discriminant behind an
-    // indirection and lose the `null` arm entirely.
-    scc_cycles(root, &mut |v| value_successors(t, v))
-        .into_iter()
-        .filter(|&u| is_single_record(t, u))
-        .collect()
-}
-
-/// The boxed type a single-atom DNF path denotes, if any: a union variant that is itself
-/// a heap-allocated recursive record.
-fn boxed_for_atom(t: &Types, boxed: &HashSet<TyId>, pos: &[u32]) -> Option<TyId> {
-    let [only] = pos else { return None };
-    boxed.iter().copied().find(|&b| {
-        positive_atoms(&t.rec_bdd.paths(t.data(b).records)).as_slice() == [*only]
-    })
-}
-
-/// Whether a type is exactly one record atom and nothing else — a nominal record, as
-/// opposed to a union that happens to contain one.
-fn is_single_record(t: &Types, ty: TyId) -> bool {
-    let d = t.data(ty);
-    let atoms = t.atomset_of(d.atoms);
-    d.base == 0
-        && !atoms.neg
-        && atoms.names.is_empty()
-        && d.tuples == bdd::FALSE
-        && d.arrows == bdd::FALSE
-        && positive_atoms(&t.rec_bdd.paths(d.records)).len() == 1
 }
 
 /// Record every cyclic type reachable from `ty`, paired with its unfolding.
@@ -212,20 +159,9 @@ fn is_single_record(t: &Types, ty: TyId) -> bool {
 /// `repr_of(A)` directly — and both are correct. The backend needs this map to see that
 /// the two describe one type, and so emit one struct rather than two it then refuses to
 /// assign between.
-pub fn recursive_unfoldings(
-    t: &Types,
-    ty: TyId,
-    out: &mut HashMap<TyId, Repr>,
-    boxed_out: &mut HashSet<TyId>,
-) {
-    let boxed = boxed_types(t, ty);
-    for u in cycle_participants(t, ty).into_iter().chain(boxed.iter().copied()) {
-        // A boxed type maps to its pointee layout; everything else to its unfolding.
-        let is_boxed = boxed.contains(&u);
-        out.entry(u).or_insert_with(|| if is_boxed { repr_shape(t, u) } else { repr_of(t, u) });
-        if is_boxed {
-            boxed_out.insert(u);
-        }
+pub fn recursive_unfoldings(t: &Types, ty: TyId, out: &mut HashMap<TyId, Repr>) {
+    for u in cycle_participants(t, ty) {
+        out.entry(u).or_insert_with(|| repr_of(t, u));
     }
 }
 
@@ -261,23 +197,26 @@ fn successors(t: &Types, ty: TyId) -> Vec<TyId> {
 /// components, keeping those with more than one member or a self-edge. A type not on a
 /// cycle is never cut, so an acyclic program produces exactly the reprs it did before.
 fn cycle_participants(t: &Types, root: TyId) -> HashSet<TyId> {
-    scc_cycles(root, &mut |v| successors(t, v))
+    scc_cycles(&[root], &mut |v| successors(t, v))
 }
 
 /// Tarjan's SCC over an arbitrary successor relation, keeping every node that lies on a
 /// cycle — a component of more than one node, or a node with an edge to itself.
-fn scc_cycles(root: TyId, succ: &mut dyn FnMut(TyId) -> Vec<TyId>) -> HashSet<TyId> {
-    struct Scc<'a> {
-        succ: &'a mut dyn FnMut(TyId) -> Vec<TyId>,
-        index: HashMap<TyId, u32>,
-        low: HashMap<TyId, u32>,
-        on_stack: HashSet<TyId>,
-        stack: Vec<TyId>,
+fn scc_cycles<K: Copy + Eq + std::hash::Hash>(
+    roots: &[K],
+    succ: &mut dyn FnMut(K) -> Vec<K>,
+) -> HashSet<K> {
+    struct Scc<'a, K> {
+        succ: &'a mut dyn FnMut(K) -> Vec<K>,
+        index: HashMap<K, u32>,
+        low: HashMap<K, u32>,
+        on_stack: HashSet<K>,
+        stack: Vec<K>,
         next: u32,
-        out: HashSet<TyId>,
+        out: HashSet<K>,
     }
-    impl Scc<'_> {
-        fn visit(&mut self, v: TyId) {
+    impl<K: Copy + Eq + std::hash::Hash> Scc<'_, K> {
+        fn visit(&mut self, v: K) {
             self.index.insert(v, self.next);
             self.low.insert(v, self.next);
             self.next += 1;
@@ -322,11 +261,97 @@ fn scc_cycles(root: TyId, succ: &mut dyn FnMut(TyId) -> Vec<TyId>) -> HashSet<Ty
         next: 0,
         out: HashSet::new(),
     };
-    s.visit(root);
+    for &r in roots {
+        if !s.index.contains_key(&r) {
+            s.visit(r);
+        }
+    }
     s.out
 }
 
-fn repr_components(t: &Types, ty: TyId, cyclic: &HashSet<TyId>, boxed: &HashSet<TyId>) -> Repr {
+
+/// The record atoms reachable from `root` that sit on a cycle closing entirely by value,
+/// and so have no finite inline layout.
+///
+/// Keyed by atom, not by type. The type graph cannot answer this: the type system is
+/// equi-recursive and hash-consed, so the `TyId` for `Node` is never a successor of
+/// anything — `next: Node | null` names the *union's* id. The cycle is a self-loop on that
+/// union, and the record actually needing the box sits outside a TyId-keyed search.
+///
+/// Only records are boxed. A union on the cycle — `Node | null`, `Branch | Leaf` — needs no
+/// box of its own: once its record variant is a pointer the union is finite, and boxing it
+/// too would bury the discriminant behind an indirection and lose the `null` arm.
+fn boxed_atoms(t: &Types, root: TyId) -> HashSet<u32> {
+    let mut roots = Vec::new();
+    reachable_atoms(t, root, &mut roots, &mut HashSet::new());
+    scc_cycles(&roots, &mut |a| atom_value_successors(t, a))
+}
+
+/// Every record atom reachable from a type — the search space.
+fn reachable_atoms(t: &Types, ty: TyId, out: &mut Vec<u32>, seen: &mut HashSet<TyId>) {
+    if !seen.insert(ty) {
+        return;
+    }
+    let d = t.data(ty);
+    for a in positive_atoms(&t.rec_bdd.paths(d.records)) {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+        for (_, fty) in t.rec_atoms[a as usize].fields.clone() {
+            reachable_atoms(t, fty, out, seen);
+        }
+    }
+    for a in positive_atoms(&t.tup_bdd.paths(d.tuples)) {
+        for e in t.tup_atoms[a as usize].elems.clone() {
+            reachable_atoms(t, e, out, seen);
+        }
+    }
+    for a in positive_atoms(&t.arrow_bdd.paths(d.arrows)) {
+        let ar = t.arrow_atoms[a as usize].clone();
+        for p in ar.params {
+            reachable_atoms(t, p, out, seen);
+        }
+        reachable_atoms(t, ar.ret, out, seen);
+    }
+}
+
+/// The record atoms an atom's fields embed *by value*. A `List`/`Map` argument sits behind
+/// a pointer and an arrow behind a closure, so neither can make a layout infinite.
+fn atom_value_successors(t: &Types, atom: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for (n, fty) in t.rec_atoms[atom as usize].fields.clone() {
+        let s = t.name_str(n).to_string();
+        if s.starts_with('#') && s != "#inner" {
+            continue;
+        }
+        value_atoms_of(t, fty, &mut out, &mut HashSet::new());
+    }
+    out
+}
+
+/// The record atoms a type embeds by value, through unions and tuples but never through a
+/// pointer-backed constructor.
+fn value_atoms_of(t: &Types, ty: TyId, out: &mut Vec<u32>, seen: &mut HashSet<TyId>) {
+    if !seen.insert(ty) {
+        return;
+    }
+    let d = t.data(ty);
+    for a in positive_atoms(&t.rec_bdd.paths(d.records)) {
+        if matches!(nominal_name(t, a).as_deref(), Some("List") | Some("Map")) {
+            continue;
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    for a in positive_atoms(&t.tup_bdd.paths(d.tuples)) {
+        for e in t.tup_atoms[a as usize].elems.clone() {
+            value_atoms_of(t, e, out, seen);
+        }
+    }
+}
+
+fn repr_components(t: &Types, ty: TyId, cyclic: &HashSet<TyId>, boxed: &HashSet<u32>) -> Repr {
     let d = t.data(ty);
 
     // `any` is ⊤ — every kind full. It is the one erasure boundary, a boxed value with a
@@ -380,9 +405,9 @@ fn repr_components(t: &Types, ty: TyId, cyclic: &HashSet<TyId>, boxed: &HashSet<
         // The cut in `repr_rec` is keyed by `TyId` and a union's variants are expanded
         // from their record atoms, so without this the boxed record was laid out by value
         // inside the very union its own field points back through.
-        let r = match boxed_for_atom(t, boxed, &pos) {
-            Some(b) => Repr::Recursive(b),
-            None => record_intersection(t, &pos, cyclic, boxed),
+        let r = match pos.as_slice() {
+            [only] if boxed.contains(only) => Repr::BoxedRec(*only),
+            _ => record_intersection(t, &pos, cyclic, boxed),
         };
         if !records.contains(&r) {
             records.push(r);
@@ -434,7 +459,7 @@ fn positive_atoms(paths: &[(Vec<u32>, Vec<u32>)]) -> Vec<u32> {
 
 /// One DNF path's positive atoms, intersected: a single record carrying every field they
 /// require. One atom is the ordinary case — a nominal record, or a variant of a union.
-fn record_intersection(t: &Types, atoms: &[u32], cyclic: &HashSet<TyId>, boxed: &HashSet<TyId>) -> Repr {
+fn record_intersection(t: &Types, atoms: &[u32], cyclic: &HashSet<TyId>, boxed: &HashSet<u32>) -> Repr {
     if let [only] = atoms {
         return record_repr(t, *only, cyclic, boxed);
     }
@@ -455,7 +480,7 @@ fn record_intersection(t: &Types, atoms: &[u32], cyclic: &HashSet<TyId>, boxed: 
     Repr::Record { name, fields }
 }
 
-fn record_repr(t: &Types, atom_idx: u32, cyclic: &HashSet<TyId>, boxed: &HashSet<TyId>) -> Repr {
+fn record_repr(t: &Types, atom_idx: u32, cyclic: &HashSet<TyId>, boxed: &HashSet<u32>) -> Repr {
     let name = nominal_name(t, atom_idx);
 
     // The runtime containers are opaque nominal records carrying only their generic

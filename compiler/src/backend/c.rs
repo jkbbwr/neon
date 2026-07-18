@@ -202,6 +202,20 @@ fn emit_block(out: &mut String, types: &TypeTable, f: &Func, b: &Block) {
 fn emit_inst(out: &mut String, types: &TypeTable, f: &Func, inst: &crate::ir::ssa::Inst) {
     match &inst.op {
         Op::MakeList(elems) => emit_make_list(out, types, f, inst.result, elems),
+        // Reading out of a heap record hands the caller its own reference. Without the
+        // retain, `let n = node.next` followed by releasing `node` frees the child the
+        // parent owned, and the next use is a dangling read.
+        Op::Field { base, .. } if types.is_boxed(f.value_repr(*base)) => {
+            if let Some(r) = inst.result {
+                let rhs = op_rhs(types, f, inst.result, &inst.op);
+                let _ = writeln!(out, "{} = {rhs};", var(r));
+                let mut parts = Vec::new();
+                rc_parts(types, "neon_retain", f.value_repr(r), &var(r), &mut parts);
+                if !parts.is_empty() {
+                    let _ = writeln!(out, "{};", parts.join(", "));
+                }
+            }
+        }
         // A recursive record is heap-allocated, which is two statements: claim the memory,
         // then move the built value in. `neon_alloc` prepends the header and returns it,
         // and the wrapper carries that header first, so the pointer needs no adjusting.
@@ -213,8 +227,9 @@ fn emit_inst(out: &mut String, types: &TypeTable, f: &Func, inst: &crate::ir::ss
             let sty = types.c_type(shape);
             let _ = writeln!(
                 out,
-                "{} = ({wrapper}*)neon_alloc(sizeof({sty}), 0);",
-                var(r)
+                "{} = ({wrapper}*)neon_alloc(sizeof({sty}), {});",
+                var(r),
+                types.env_drop_ref(shape)
             );
             let _ = writeln!(out, "{}->value = {};", var(r), op_rhs(types, f, inst.result, &inst.op));
         }
@@ -348,7 +363,13 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
             format!("neon_map_new({}, {})", types.key_witness_ref(&k), types.witness_ref(&v))
         }
         "neon_map_set" => {
-            format!("neon_map_set({}, &{}, &{})", var(args[0]), var(args[1]), var(args[2]))
+            let (k, v) = map_kv(f, r);
+            format!(
+                "neon_map_set({}, {}, {})",
+                var(args[0]),
+                addr_of(types, f, args[1], &k),
+                addr_of(types, f, args[2], &v)
+            )
         }
         "neon_map_contains" => format!("neon_map_contains({}, &{})", var(args[0]), var(args[1])),
         "neon_map_keys" | "neon_map_values" => {
@@ -358,8 +379,15 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
         "neon_list_new" => format!("neon_list_new({w})"),
         "neon_list_new_with_capacity" => format!("neon_list_new_with_capacity({w}, {})", var(args[0])),
         // The element is passed by address; the list moves its bytes in through the witness.
-        "neon_list_push" => format!("neon_list_push({}, &{})", var(args[0]), var(args[1])),
-        "neon_list_set" => format!("neon_list_set({}, {}, &{})", var(args[0]), var(args[1]), var(args[2])),
+        "neon_list_push" => {
+            format!("neon_list_push({}, {})", var(args[0]), addr_of(types, f, args[1], &elem))
+        }
+        "neon_list_set" => format!(
+            "neon_list_set({}, {}, {})",
+            var(args[0]),
+            var(args[1]),
+            addr_of(types, f, args[2], &elem)
+        ),
         _ => unreachable!(),
     };
     let _ = writeln!(out, "{} = {};", var(r), rhs);
@@ -875,6 +903,19 @@ fn record_has_field(r: &Repr, field: &str) -> bool {
 /// Coerce a value into a target repr at a flow site. A concrete value flowing into a union
 /// is injected as `{tag, payload}`; `null` into a nullable pointer becomes NULL; a value
 /// whose repr already matches passes through.
+/// The address of a value as the container's slot type. A container copies
+/// `witness->size` bytes through this pointer, so a value that has not been injected into
+/// the slot's type first is read past its own end — a `1.0` handed to a `Map[str, Json]`
+/// is eight bytes where the witness promises the whole union. The one-element array
+/// literal gives the coerced value an address without a named temporary, and decays to the
+/// pointer the native wants.
+fn addr_of(types: &TypeTable, f: &Func, v: Value, target: &Repr) -> String {
+    if f.value_repr(v) == types.resolve(target) {
+        return format!("&{}", var(v));
+    }
+    format!("({}[]){{{}}}", types.c_type(target), coerce(types, f, v, target))
+}
+
 fn coerce(types: &TypeTable, f: &Func, v: Value, target: &Repr) -> String {
     coerce_expr(types, &var(v), f.value_repr(v), target)
 }

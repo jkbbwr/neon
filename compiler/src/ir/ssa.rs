@@ -25,9 +25,10 @@ pub struct Program {
     /// only an identity — `Repr::Recursive(ty)` says *which* type, not what it looks
     /// like — so the backend resolves it here to lay the type out and to refcount it.
     pub recursive: std::collections::HashMap<crate::typecheck::types::TyId, Repr>,
-    /// The recursive types whose cycle closes entirely by value, so every value of them is
-    /// a heap pointer. `recursive` holds their pointee layout rather than their unfolding.
-    pub boxed: std::collections::HashSet<crate::typecheck::types::TyId>,
+    /// Record atoms whose cycle closes entirely by value, paired with their pointee
+    /// layout. Every value of such a record is a `Repr::BoxedRec` pointer; this is what it
+    /// points at.
+    pub boxed: std::collections::HashMap<u32, Repr>,
 }
 
 /// One function. `params` are the entry block's parameters; `values` records the repr

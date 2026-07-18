@@ -24,12 +24,12 @@ pub struct TypeTable {
     recursive: HashMap<TyId, Repr>,
     /// Recursive types already registered, so a cycle is walked once rather than forever.
     resolved: HashSet<TyId>,
-    /// Types whose cycle closes by value, and so live on the heap.
-    boxed: HashSet<TyId>,
-    /// The heap wrapper for each boxed type: `struct nbN { neon_header header; nrN value; }`.
-    /// The header comes first, so an `nbN*` is also its `neon_header*` — the same trick
-    /// `neon_list` uses — and a field read stays a single `->`.
-    boxed_names: HashMap<TyId, String>,
+    /// Record atoms whose cycle closes by value, paired with their pointee layout.
+    boxed: HashMap<u32, Repr>,
+    /// The heap wrapper for each: `struct nbN { neon_header header; nrN value; }`. The
+    /// header comes first, so an `nbN*` is also its `neon_header*` — the trick `neon_list`
+    /// uses — and a field read stays a single `->`.
+    boxed_names: HashMap<u32, String>,
     /// Structural key → C struct name, for records and tuples.
     names: HashMap<String, String>,
     /// `(name, repr)` in discovery order; dependencies always registered before dependents.
@@ -159,12 +159,25 @@ impl TypeTable {
                 if self.resolved.insert(*ty) {
                     if let Some(u) = self.recursive.get(ty).cloned() {
                         self.register(&u);
-                        if self.boxed.contains(ty) {
-                            let name = format!("nb{}", self.defs.len());
-                            self.boxed_names.insert(*ty, name.clone());
-                            self.defs.push((name, Repr::Recursive(*ty)));
-                        }
                     }
+                }
+            }
+            // A heap-allocated record: register the layout it points at, then the wrapper
+            // that carries the header in front of it.
+            Repr::BoxedRec(atom) => {
+                if self.boxed_names.contains_key(atom) {
+                    return;
+                }
+                if let Some(shape) = self.boxed.get(atom).cloned() {
+                    let name = format!("nb{}", self.defs.len());
+                    self.boxed_names.insert(*atom, name.clone());
+                    self.defs.push((name, Repr::BoxedRec(*atom)));
+                    self.register(&shape);
+                    // The header/value layout is exactly a closure environment's, so the
+                    // same drop generator serves: release the counted fields, free the
+                    // block. `neon_release` calls `drop` unconditionally, so a boxed
+                    // record without one segfaults the moment its count reaches zero.
+                    self.intern_env_drop(&shape);
                 }
             }
             _ => {}
@@ -272,24 +285,21 @@ impl TypeTable {
     /// so anything that needs the shape — a layout, a refcount walk — goes through here.
     pub fn resolve<'a>(&'a self, r: &'a Repr) -> &'a Repr {
         match r {
-            // A boxed type *is* its pointer; resolving to the pointee would lay the heap
-            // object out inline again and reintroduce the infinite struct.
-            Repr::Recursive(ty) if self.boxed.contains(ty) => r,
             Repr::Recursive(ty) => self.recursive.get(ty).unwrap_or(r),
             _ => r,
         }
     }
 
-    /// Whether a repr is a pointer to a heap-allocated recursive value.
+    /// Whether a repr is a pointer to a heap-allocated recursive record.
     pub fn is_boxed(&self, r: &Repr) -> bool {
-        matches!(r, Repr::Recursive(ty) if self.boxed.contains(ty))
+        matches!(r, Repr::BoxedRec(_))
     }
 
-    /// The pointee layout of a boxed type, for construction and field access.
+    /// The wrapper name and pointee layout of a boxed record, for construction and field
+    /// access. A boxed value *is* the pointer, so this is the only way to its shape.
     pub fn boxed_shape(&self, r: &Repr) -> Option<(&str, &Repr)> {
-        let Repr::Recursive(ty) = r else { return None };
-        let name = self.boxed_names.get(ty)?;
-        Some((name, self.recursive.get(ty)?))
+        let Repr::BoxedRec(atom) = r else { return None };
+        Some((self.boxed_names.get(atom)?, self.boxed.get(atom)?))
     }
 
     /// The C type for a repr. Aggregates resolve to their struct name (by value); runtime
@@ -305,12 +315,10 @@ impl TypeTable {
             Repr::List(_) => "neon_list*".into(),
             Repr::Map(_, _) => "neon_map*".into(),
             Repr::Closure { .. } => "neon_closure".into(),
-            Repr::Recursive(ty) if self.boxed.contains(ty) => {
-                match self.boxed_names.get(ty) {
-                    Some(n) => format!("{n}*"),
-                    None => "neon_value".into(),
-                }
-            }
+            Repr::BoxedRec(atom) => match self.boxed_names.get(atom) {
+                Some(n) => format!("{n}*"),
+                None => "neon_value".into(),
+            },
             Repr::Record { .. } | Repr::Tuple(_) | Repr::Union(_) | Repr::Recursive(_) => self
                 .names
                 .get(&key_with(r, &self.recursive))
@@ -369,8 +377,8 @@ impl TypeTable {
         match repr {
             // The heap wrapper for a by-value cycle. The header is first, so the pointer
             // doubles as a `neon_header*` and refcounting needs no offset.
-            Repr::Recursive(ty) => {
-                if let Some(shape) = self.recursive.get(ty) {
+            Repr::BoxedRec(atom) => {
+                if let Some(shape) = self.boxed.get(atom) {
                     if let Some(sname) = self.names.get(&key_with(shape, &self.recursive)) {
                         self.emit_one(out, &sname.clone(), shape, done);
                     }
@@ -513,6 +521,7 @@ fn key_with(r: &Repr, rec: &HashMap<TyId, Repr>) -> String {
         Repr::Never => "x".into(),
         Repr::Var(v) => format!("V{v}"),
         Repr::Recursive(ty) => format!("Z{}", ty.0),
+        Repr::BoxedRec(a) => format!("P{a}"),
         Repr::Record { name, fields } => {
             let body: Vec<String> =
                 fields.iter().map(|(n, r)| format!("{n}={}", key(r))).collect();
