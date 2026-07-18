@@ -258,3 +258,43 @@ fn a_receiverless_method_with_no_expected_type_is_an_error() {
         "no receiver and no expectation is a diagnostic, never a guess"
     );
 }
+
+// ---- higher-kinded dispatch ----
+
+#[test]
+fn a_constructor_subject_dispatches_by_head() {
+    let mut e = env(
+        "record Box[T] { item: T }
+         protocol Container for C[_] { fn get[T](c: C[T]) -> T }
+         impl Container for Box { fn get[T](c: Box[T]) -> T { c.item } }",
+    );
+    let box_i = {
+        let n = e.solver.t.name("Box");
+        let i = e.solver.t.i64();
+        e.solver.t.nominal(n, vec![i], vec![])
+    };
+    let s = resolve(&mut e, "get", None, &[box_i], None).expect("resolves");
+    assert!(matches!(s.resolution, Resolution::Direct(_)));
+    // The method's own T follows the receiver: get(Box[i64]) returns i64.
+    let i = e.solver.t.i64();
+    assert_eq!(s.ret, i, "unwrap of Box[i64] is i64, not an opaque T");
+}
+
+#[test]
+fn a_constructor_subject_with_no_impl_for_the_head_is_rejected() {
+    let mut e = env(
+        "record Box[T] { item: T }
+         record Bag[T] { items: T }
+         protocol Container for C[_] { fn get[T](c: C[T]) -> T }
+         impl Container for Box { fn get[T](c: Box[T]) -> T { c.item } }",
+    );
+    let bag_i = {
+        let n = e.solver.t.name("Bag");
+        let i = e.solver.t.i64();
+        e.solver.t.nominal(n, vec![i], vec![])
+    };
+    assert!(matches!(
+        resolve(&mut e, "get", None, &[bag_i], None),
+        Err(DispatchError::NoImpl { .. })
+    ));
+}

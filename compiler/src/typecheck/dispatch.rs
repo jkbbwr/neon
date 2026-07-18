@@ -86,6 +86,17 @@ pub fn resolve(
         }
     };
 
+    // A constructor subject -- `protocol Container for C[_]` -- dispatches by the
+    // receiver's head rather than by a subject type, and each method carries its own
+    // generics. It is a separate path.
+    if env.protocols()[protocol.0].subject_arity > 0 {
+        let receiver = args.first().copied().or(expected);
+        let Some(receiver) = receiver else {
+            return Err(DispatchError::NoReceiver(method.to_string()));
+        };
+        return hkt_resolve(env, protocol, method, receiver);
+    }
+
     let subject = subject_var(env, protocol);
     let position = dispatch_position(env, protocol, method, subject);
 
@@ -111,6 +122,70 @@ pub fn resolve(
     }
 
     applicable(env, protocol, method, receiver)
+}
+
+/// Dispatch for a constructor-subject protocol. The impl is chosen by matching the
+/// receiver's head (`Box[i64]` has head `Box`) against the impl's target head, and
+/// the method's own generics are instantiated from the receiver -- so `unwrap(box)`
+/// with `box: Box[i64]` returns `i64`, not the method's opaque `T`.
+fn hkt_resolve(
+    env: &mut Env,
+    protocol: ProtocolId,
+    method: &str,
+    receiver: TyId,
+) -> Result<Selection, DispatchError> {
+    let name = env.protocols()[protocol.0].name.clone();
+    let Some(head) = nominal_head(env, receiver) else {
+        return Err(DispatchError::NoImpl {
+            protocol: name,
+            uncovered: receiver,
+        });
+    };
+
+    let impl_id = env
+        .impls_of(protocol)
+        .find(|(_, i)| i.target_head.as_deref() == Some(head.as_str()))
+        .map(|(id, _)| id);
+    let Some(impl_id) = impl_id else {
+        return Err(DispatchError::NoImpl { protocol: name, uncovered: receiver });
+    };
+
+    // Instantiate the method's generics from the receiver: match its first parameter
+    // (`c: Box[T]`) against the receiver (`Box[i64]`) to bind `T`, then substitute.
+    let m = env.impls()[impl_id.0].methods.iter().find(|m| m.name == method).cloned();
+    let (ret, throws) = match m {
+        Some(m) => {
+            let var_names: std::collections::HashSet<_> =
+                m.generics.iter().map(|g| env.solver.t.name(g)).collect();
+            let mut subst = std::collections::HashMap::new();
+            if let Some((_, param)) = m.params.first() {
+                super::generic::infer(&mut env.solver.t, *param, receiver, &var_names, &mut subst);
+            }
+            let ret = env.solver.t.substitute(m.ret, &subst);
+            let throws = env.solver.t.substitute(m.throws, &subst);
+            (ret, throws)
+        }
+        None => {
+            let never = env.solver.t.never();
+            (never, never)
+        }
+    };
+    Ok(Selection { protocol, resolution: Resolution::Direct(impl_id), ret, throws })
+}
+
+/// The constructor name of a nominal type -- `Box[i64]` → `"Box"` -- read from the
+/// reserved `#nominal` atom of its single record atom.
+fn nominal_head(env: &Env, ty: TyId) -> Option<String> {
+    let t = &env.solver.t;
+    let d = t.data(ty);
+    let atom = match t.rec_bdd.paths(d.records).as_slice() {
+        [(pos, neg)] if neg.is_empty() && pos.len() == 1 => &t.rec_atoms[pos[0] as usize],
+        _ => return None,
+    };
+    let tag = atom.get(t.nominal_label);
+    let td = t.data(tag);
+    let atoms = t.atomset_of(td.atoms);
+    (!atoms.neg && atoms.names.len() == 1).then(|| t.name_str(atoms.names[0]).to_string())
 }
 
 fn applicable(
