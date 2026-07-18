@@ -770,8 +770,10 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             let target = result.map(|r| f.value_repr(r).clone()).unwrap_or(Repr::Any);
             cast_expr(types, &var(*v), f.value_repr(*v), &target)
         }
-        // Maps and the tagged-result ops are emitted with the pieces that back them.
-        other => format!("/* TODO: {} */ 0", op_name(other)),
+        // Every op reachable in a lowered program has a case above. Emitting a plausible
+        // `0` for anything else produced a program that ran and answered wrongly, with the
+        // only evidence a comment in generated C nobody reads.
+        other => unreachable!("codegen: no emission for op `{}`", op_name(other)),
     }
 }
 

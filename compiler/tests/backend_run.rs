@@ -88,7 +88,19 @@ fn run_one(dir: &Path, rel: &str) -> Result<(), Failed> {
     std::fs::write(&c_file, &c).expect("write c");
 
     let out = Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()))
-        .args(["-std=c11", "-w", "-O0", "-o"])
+        // Sanitizers are on by default, not an opt-in sweep. A corpus that passes without
+        // them proves only that the answers look right: this suite ran green over a genuine
+        // stack-buffer-overflow, where a value handed to `neon_map_set` uncoerced had the
+        // witness memcpy 32 bytes out of an 8-byte double.
+        .args([
+            "-std=c11",
+            "-w",
+            "-O0",
+            "-g",
+            "-fno-omit-frame-pointer",
+            "-fsanitize=address,undefined",
+            "-o",
+        ])
         .arg(&exe)
         .arg(&c_file)
         .arg(runtime_root().join("src/rt.c"))
@@ -104,13 +116,22 @@ fn run_one(dir: &Path, rel: &str) -> Result<(), Failed> {
     // Bound the run: a backend bug can emit a program that never terminates, and a hung
     // child would otherwise stall the whole suite. `timeout` SIGKILLs after 10s.
     let run = Command::new("timeout")
-        .args(["-k", "1", "10"])
+        .args(["-k", "1", "30"])
         .arg(&exe)
+        .env("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
+        .env("UBSAN_OPTIONS", "print_stacktrace=1")
         .output()
         .expect("run exe");
     let code = run.status.code();
     if code == Some(124) || code == Some(137) {
         return Err(Failed::from("timed out"));
+    }
+
+    // A sanitizer report is a failure on its own terms, ahead of any output diff: the
+    // program may well print the right answer while corrupting memory to do it.
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    if let Some(report) = sanitizer_report(&stderr) {
+        return Err(Failed::from(format!("sanitizer:\n{report}")));
     }
 
     // A program that traps prints to stdout up to the fault, then exits with a code the
@@ -126,6 +147,19 @@ fn run_one(dir: &Path, rel: &str) -> Result<(), Failed> {
         return Err(Failed::from(format!("exit {code:?}, want {want_exit}\n  stderr: {err}")));
     }
     Ok(())
+}
+
+/// The first few lines of a sanitizer report, if the run produced one.
+fn sanitizer_report(stderr: &str) -> Option<String> {
+    let marks = ["AddressSanitizer", "LeakSanitizer", "runtime error:", "SUMMARY:"];
+    stderr.lines().any(|l| marks.iter().any(|m| l.contains(m))).then(|| {
+        stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 /// The exit code a program is expected to end with, from a `//@ exit: N` directive; 0 when
