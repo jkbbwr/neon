@@ -2,4 +2,4 @@ count: 3
 sum: 6
 key bytes: 3
 keys: 3
-empty: null immediately
+empty keys: 0

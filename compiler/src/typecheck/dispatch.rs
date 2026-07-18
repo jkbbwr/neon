@@ -94,7 +94,7 @@ pub fn resolve(
         let Some(receiver) = receiver else {
             return Err(DispatchError::NoReceiver(method.to_string()));
         };
-        return hkt_resolve(env, protocol, method, receiver);
+        return hkt_resolve(env, protocol, method, args, receiver);
     }
 
     let subject = subject_var(env, protocol);
@@ -132,6 +132,7 @@ fn hkt_resolve(
     env: &mut Env,
     protocol: ProtocolId,
     method: &str,
+    args: &[TyId],
     receiver: TyId,
 ) -> Result<Selection, DispatchError> {
     let name = env.protocols()[protocol.0].name.clone();
@@ -151,16 +152,18 @@ fn hkt_resolve(
         return Err(DispatchError::NoImpl { protocol: name, method: method.to_string(), uncovered: receiver });
     };
 
-    // Instantiate the method's generics from the receiver: match its first parameter
-    // (`c: Box[T]`) against the receiver (`Box[i64]`) to bind `T`, then substitute.
+    // Instantiate the method's generics from the arguments: match each parameter
+    // (`c: Box[T]`, `init: A`) against its argument to bind `T`, `A`, then substitute.
+    // The receiver alone is not enough -- `fold`'s accumulator `A` comes from `init`,
+    // not from the container -- so every argument feeds the inference.
     let m = env.impls()[impl_id.0].methods.iter().find(|m| m.name == method).cloned();
     let (ret, throws) = match m {
         Some(m) => {
             let var_names: std::collections::HashSet<_> =
                 m.generics.iter().map(|g| env.solver.t.name(g)).collect();
             let mut subst = std::collections::HashMap::new();
-            if let Some((_, param)) = m.params.first() {
-                super::generic::infer(&mut env.solver.t, *param, receiver, &var_names, &mut subst);
+            for ((_, param), arg) in m.params.iter().zip(args) {
+                super::generic::infer(&mut env.solver.t, *param, *arg, &var_names, &mut subst);
             }
             let ret = env.solver.t.substitute(m.ret, &subst);
             let throws = env.solver.t.substitute(m.throws, &subst);

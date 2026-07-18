@@ -54,10 +54,12 @@ collections/list_get_nullable_element_type.neon
 collections/list_get_out_of_range_throws.neon
 collections/list_index_negative_traps.neon
 collections/list_index_out_of_bounds_traps.neon
+collections/list_iteration.neon
 collections/list_push_does_not_mutate_base.neon
 collections/list_set_does_not_mutate_base.neon
 collections/map_get_missing_throws.neon
 collections/map_index_missing_key_traps.neon
+collections/map_iteration.neon
 collections/map_set_does_not_mutate_base.neon
 collections/nested_list_value_semantics.neon
 control/for_break_continue.neon
@@ -195,8 +197,10 @@ types/missing_field_non_nullable_rejected.neon
 types/missing_field_satisfies_nullable_field.neon
 types/mu_type_in_arrow_parameter.neon
 types/mu_type_in_arrow_throws_parameter.neon
+types/mu_type_json.neon
 types/mu_type_mutual_recursion_unsupported.neon
 types/mu_type_not_contractive.neon
+types/mu_type_recursive_alias.neon
 types/mu_type_through_arrow_return.neon
 types/mu_type_through_arrow_that_throws.neon
 types/mu_type_under_negation.neon

@@ -38,6 +38,17 @@ protocol Ord for T where T: Eq {
 // and there is no separate `message` method — the error text is its `to_string`.
 protocol Error for T where T: Display {}
 
+// Eager transformation over a one-parameter container `C[_]`. Every method returns
+// a fresh `C` (or, for `fold`, the accumulated value): the language is immutable, so
+// there is nothing lazy to thread and no iterator to allocate. A two-parameter type
+// like `Map[K, V]` is not a functor over one parameter, so it iterates through
+// `map::values`/`map::keys` first. See docs/design/stdlib.md.
+protocol Mappable for C[_] {
+    fn map[T, U](c: C[T], f: (T) -> U) -> C[U]
+    fn filter[T](c: C[T], keep: (T) -> bool) -> C[T]
+    fn fold[T, A](c: C[T], init: A, step: (A, T) -> A) -> A
+}
+
 // The errors the stdlib throws. Each is `Display` (its text is the message) and so
 // an `Error`.
 record IndexError { message: str }
@@ -71,3 +82,15 @@ impl Eq for str { @native("neon_str_eq") fn eq(a: str, b: str) -> bool }
 impl Ord for i64 { @native("neon_i64_cmp") fn cmp(a: i64, b: i64) -> Ordering }
 impl Ord for f64 { @native("neon_f64_cmp") fn cmp(a: f64, b: f64) -> Ordering }
 impl Ord for str { @native("neon_str_cmp") fn cmp(a: str, b: str) -> Ordering }
+
+// ---- List is a Mappable ----
+//
+// Here, not in std/collections/list.neon: `List` and `Mappable` both belong to the
+// prelude, so an impl elsewhere would be an orphan. The natives run one element at
+// a time, in order, over the contiguous buffer.
+
+impl Mappable for List {
+    @native("neon_list_map") fn map[T, U](c: List[T], f: (T) -> U) -> List[U]
+    @native("neon_list_filter") fn filter[T](c: List[T], keep: (T) -> bool) -> List[T]
+    @native("neon_list_fold") fn fold[T, A](c: List[T], init: A, step: (A, T) -> A) -> A
+}

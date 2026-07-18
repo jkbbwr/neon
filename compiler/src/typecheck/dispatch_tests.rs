@@ -281,6 +281,26 @@ fn a_constructor_subject_dispatches_by_head() {
 }
 
 #[test]
+fn a_constructor_subject_method_infers_generics_from_every_argument() {
+    // `fold`'s accumulator `A` comes from `init`, not from the container, so the
+    // return type is only right if inference reads all arguments, not just the
+    // receiver.
+    let mut e = env(
+        "record Box[T] { item: T }
+         protocol Folder for C[_] { fn fold[T, A](c: C[T], init: A) -> A }
+         impl Folder for Box { fn fold[T, A](c: Box[T], init: A) -> A { init } }",
+    );
+    let box_str = {
+        let n = e.solver.t.name("Box");
+        let s = e.solver.t.str();
+        e.solver.t.nominal(n, vec![s], vec![])
+    };
+    let i = e.solver.t.i64();
+    let s = resolve(&mut e, "fold", None, &[box_str, i], None).expect("resolves");
+    assert_eq!(s.ret, i, "fold's return is the accumulator's type, from `init`");
+}
+
+#[test]
 fn a_constructor_subject_with_no_impl_for_the_head_is_rejected() {
     let mut e = env(
         "record Box[T] { item: T }

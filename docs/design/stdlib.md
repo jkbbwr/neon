@@ -122,23 +122,26 @@ made covariance sound.
   iteration in most programs and it must be a C loop over a contiguous buffer. It is not
   extensible to user containers in v1, and that is fine.
 
-  Transformation is **eager, HKT `Mappable`**: `protocol Mappable for C[_]` with
-  `map`/`filter`/`fold` returning a new `C`. `Map[K,V]` does not fit `C[_]` (wrong
-  arity) and iterates via `map::values`/`map::entries` first — a two-parameter type is
-  not a functor over one. No `Iterator` type, no closure streams, no associated types:
-  an arrow-typed `Iter[T] = () -> (T, Iter[T])` boxes a closure per element, which is
-  strictly worse than eager + `rc == 1` reuse on both allocations and indirect calls.
+  Transformation is **eager, HKT `Mappable`**, now built: `protocol Mappable for C[_]`
+  in the prelude with `map`/`filter`/`fold`, and `impl Mappable for List`. `map` and
+  `filter` return a new `C`; `fold` is a **method** (not a free function), taking the
+  container, an accumulator seed, and a step. All three are called bare and dispatch
+  implicitly by the receiver's head. `Map[K,V]` does not fit `C[_]` (wrong arity) and
+  iterates via `map::keys`/`map::values` first — a two-parameter type is not a functor
+  over one. No `Iterator` type, no closure streams, no associated types: an arrow-typed
+  `Iter[T] = () -> (T, Iter[T])` boxes a closure per element, which is strictly worse
+  than eager + `rc == 1` reuse on both allocations and indirect calls.
 
   Pipeline effect order is interleaved by definition (see `decisions.md`), which
   reserves fusion for later with no purity tracking and no signature change. v1 lowers
   eager per stage.
 
-  Still open: the exact `Mappable` method set; whether `fold` is a method or a free
-  function; infinite sources (`iterate(0, f)`), which cannot be a `List` and are the one
-  genuine case a lazy type would serve — deferred until something needs it. **HKT
-  dispatch is designed in `dispatch.md` but unbuilt**, and `Mappable` cannot be called
-  until it exists — that, and first-class calls (`g(1)` on an arrow-typed local, which
-  the checker currently rejects), are the two real blockers.
+  Still open: infinite sources (`iterate(0, f)`), which cannot be a `List` and are the
+  one genuine case a lazy type would serve — deferred until something needs it. HKT
+  dispatch (`dispatch.md`) infers each method's own generics from **every** argument,
+  not just the receiver, which is what gives `fold` its accumulator type. The remaining
+  blocker for the wider surface is first-class calls (`g(1)` on an arrow-typed local),
+  which the checker still rejects.
 - **`Error` vs `Display`.** `Error` declares `message(e) -> str`; `Display` declares
   `to_string(v) -> str`. For an error those are the same string. Protocol supertraits
   exist (`protocol Ord for T where T: Eq`, pinned by the corpus), so the answer is

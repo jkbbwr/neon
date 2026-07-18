@@ -2,14 +2,14 @@
 //
 //   1. index + `xs[i]` in a `loop` — the loop stops at `len`, so every index is
 //      in range and the trap is never reached. This is exactly what `[]` is for:
-//      the code has already established that the element is there, so asserting
-//      presence costs nothing and reads as nothing.
-//   2. `list::iter`, which returns a closure yielding `T | null`: each call
-//      advances, and `null` means exhausted. `is null` is the loop's exit test.
-//      Here `null` means "no more elements" — an iterator's exhaustion signal,
-//      not a lookup's absence.
+//      the code has already established the element is there, so asserting presence
+//      costs nothing and reads as nothing.
+//   2. a `for` loop, the surface for element traversal. There is no iterator type
+//      and no closure stream: a list is a contiguous buffer and `for` is a C loop
+//      over it.
 //
-// Both must visit every element exactly once, front to back.
+// Both visit every element exactly once, front to back. `fold` (a `Mappable`
+// method) sums them without a mutable accumulator.
 
 use std::io;
 use std::string;
@@ -25,24 +25,17 @@ fn main() {
         i = i + 1;
     };
 
-    let next = list::iter(xs);
-    let total = 0;
-    loop {
-        match next() {
-            is null => break,
-            v => {
-                io::println(string::concat("by iter: ", to_string(v)));
-                total = total + v;
-            },
-        };
+    for v in xs {
+        io::println(string::concat("by for: ", to_string(v)));
     };
+
+    let total = fold(xs, 0, (acc: i64, v: i64) => acc + v);
     io::println(string::concat("total: ", to_string(total)));
 
-    // An empty list yields nothing at all.
+    // An empty list yields nothing at all: the `for` body never runs.
     let nothing: List[i64] = [];
-    let none = list::iter(nothing);
-    match none() {
-        is null => io::println("empty: null immediately"),
-        v => io::println("empty: yielded something"),
+    for v in nothing {
+        io::println("empty: yielded something");
     };
+    io::println(string::concat("empty len: ", to_string(list::len(nothing))));
 }
