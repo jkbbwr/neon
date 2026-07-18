@@ -157,8 +157,8 @@ impl fmt::Display for TypeError {
             ),
             TypeErrorKind::IfWithoutElse => write!(
                 f,
-                "this `if` is used as a value but has no `else`, so it has nothing to \
-                 be when the condition is false"
+                "this `if` is used as a value, so it needs an `else` branch -- without \
+                 one it has nothing to be when the condition is false"
             ),
             TypeErrorKind::ImpossibleCast { from, to } => write!(
                 f,

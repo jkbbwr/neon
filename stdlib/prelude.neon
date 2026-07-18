@@ -18,20 +18,6 @@ type Ordering = :lt | :eq | :gt
 opaque record List[T] {}
 opaque record Map[K, V] {}
 
-// The errors the stdlib throws. Each is `Display` (its text is the message) and so
-// an `Error`.
-record IndexError { message: str }
-record ParseError { message: str }
-record KeyError { message: str }
-
-impl Display for IndexError { fn to_string(v: IndexError) -> str { v.message } }
-impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
-impl Display for KeyError { fn to_string(v: KeyError) -> str { v.message } }
-
-impl Error for IndexError {}
-impl Error for ParseError {}
-impl Error for KeyError {}
-
 // ---- the protocols ----
 
 protocol Display for T {
@@ -51,6 +37,20 @@ protocol Ord for T where T: Eq {
 // An error is anything printable. `catch (e) { io::println("#{e}") }` just works,
 // and there is no separate `message` method — the error text is its `to_string`.
 protocol Error for T where T: Display {}
+
+// The errors the stdlib throws. Each is `Display` (its text is the message) and so
+// an `Error`.
+record IndexError { message: str }
+record ParseError { message: str }
+record KeyError { message: str }
+
+impl Display for IndexError { fn to_string(v: IndexError) -> str { v.message } }
+impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
+impl Display for KeyError { fn to_string(v: KeyError) -> str { v.message } }
+
+impl Error for IndexError {}
+impl Error for ParseError {}
+impl Error for KeyError {}
 
 // ---- primitive Display ----
 

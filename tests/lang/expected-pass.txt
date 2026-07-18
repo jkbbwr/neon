@@ -66,6 +66,10 @@ control/for_list.neon
 control/for_range.neon
 control/if_else_value.neon
 control/if_evaluates_one_branch.neon
+control/if_missing_else_as_argument.neon
+control/if_missing_else_in_return_position.neon
+control/if_missing_else_in_void_body.neon
+control/if_missing_else_is_an_error.neon
 control/if_statement_no_else.neon
 control/loop_break_value.neon
 control/nested_loops.neon

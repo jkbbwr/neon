@@ -201,11 +201,27 @@ impl Checker<'_> {
         t
     }
 
+    /// A bare `if` (no `else`) has no value, so it cannot fill a value position
+    /// whose expected type is unknown -- a binding without an annotation, or an
+    /// argument to a protocol method. Where the expected type is known, `if_expr`
+    /// rejects it against that type instead.
+    fn reject_bare_if(&mut self, e: &Expr) {
+        if let ExprKind::If { else_: None, .. } = &e.kind {
+            self.error(e.span.clone(), TypeErrorKind::IfWithoutElse);
+        }
+    }
+
     fn stmt(&mut self, module: &[String], s: &ast::Stmt) {
         match &s.kind {
             ast::StmtKind::Let { pat, ty, value } => {
                 let scope = Scope::new(module);
                 let want = ty.as_ref().map(|t| self.env.resolve(&scope, t));
+                // A binding consumes a value. With an annotation, `if_expr` already
+                // rejects a bare `if` against it; without one, there is no expected
+                // type to catch it, so say so here.
+                if want.is_none() {
+                    self.reject_bare_if(value);
+                }
                 let t = self.expr(module, value, want);
                 // The annotation is the binding's type when there is one: `let x:
                 // i64|str = 1` binds the wider type, not `i64`.
@@ -945,16 +961,17 @@ impl Checker<'_> {
         self.expr(module, cond, Some(b));
 
         let Some(other) = else_ else {
-            let t = self.block(module, then, None);
-            // Consumed as a value, an `if` with no `else` has nothing to be when the
-            // condition is false. The parser records the absence rather than
-            // substituting null, so the checker is the one that must say so.
-            if expected.is_some() {
+            self.block(module, then, None);
+            // With no `else`, the `if` yields `()` when the condition is false. That is
+            // fine wherever `()` is accepted -- a statement, or a `-> null`/`-> ()` tail
+            // -- and an error only where a real value is required.
+            let unit = self.env.solver.t.tuple(vec![]);
+            let rejects_unit = expected.is_some_and(|exp| !self.env.solver.is_subtype(unit, exp));
+            if rejects_unit {
                 self.error(e.span.clone(), TypeErrorKind::IfWithoutElse);
                 return self.poison();
             }
-            let _ = t;
-            return self.env.solver.t.tuple(vec![]);
+            return unit;
         };
 
         let a = self.block(module, then, expected);
@@ -1130,7 +1147,16 @@ impl Checker<'_> {
             return self.direct_call(module, e, &sig, generics, args, expected);
         }
 
-        let arg_tys: Vec<TyId> = args.iter().map(|a| self.expr(module, a, None)).collect();
+        let arg_tys: Vec<TyId> = args
+            .iter()
+            .map(|a| {
+                // An argument is a value position even when the callee is a protocol
+                // method whose parameter type is not yet known, so a bare `if` is
+                // reported here rather than as the `()` it would otherwise dispatch on.
+                self.reject_bare_if(a);
+                self.expr(module, a, None)
+            })
+            .collect();
         let (name, qualified) = match p.split_last() {
             // A bare name may have been imported as a specific protocol's method.
             Some((last, [])) => (last.clone(), self.env.imported_method(module, last)),

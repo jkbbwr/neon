@@ -1,0 +1,32 @@
+// A function with no return type returns unit: its body is a statement sequence
+// run for effect. An else-less `if` as the last statement is fine there --
+// nothing consumes its value, so requiring a pointless `else {}` would be noise.
+//
+// This is the shape that made the else rule worth writing down. It looks like
+// value position (it is the last thing in the body) but the body is void, so the
+// `if` is a statement, not a value.
+
+use std::io;
+
+fn announce(n: i64) {
+    if n > 0 {
+        io::println("positive");
+    }
+}
+
+fn last_statement_is_an_if(n: i64) {
+    io::println("checking");
+    if n > 0 {
+        io::println("positive");
+    } else if n < 0 {
+        io::println("negative");
+    }
+}
+
+fn main() {
+    announce(1);
+    announce(-1);
+    last_statement_is_an_if(1);
+    last_statement_is_an_if(0);
+    io::println("done");
+}
