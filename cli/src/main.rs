@@ -3,9 +3,30 @@ mod source;
 mod stdlib;
 mod sysroot;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::Result;
 use std::ffi::OsString;
+
+/// Which pipeline stage `neon ir` prints.
+#[derive(Clone, Copy, ValueEnum)]
+enum IrStage {
+    /// Straight out of lowering and monomorphisation, before any pass.
+    Lowered,
+    /// After the optimiser.
+    Opt,
+    /// After refcount insertion -- the IR that would be emitted.
+    Final,
+}
+
+impl From<IrStage> for neon_compiler::ir::Stage {
+    fn from(s: IrStage) -> Self {
+        match s {
+            IrStage::Lowered => neon_compiler::ir::Stage::Lowered,
+            IrStage::Opt => neon_compiler::ir::Stage::Optimised,
+            IrStage::Final => neon_compiler::ir::Stage::Final,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "neon", version, about = "The Neon toolchain")]
@@ -50,9 +71,9 @@ enum Command {
     /// Emit the intermediate representation for a source file.
     Ir {
         file: OsString,
-        /// Which pipeline stage to print: `lowered`, `opt`, or `final` (default).
-        #[arg(long, default_value = "final")]
-        stage: String,
+        /// Which pipeline stage to print. Defaults to the final, emit-ready IR.
+        #[arg(long, value_enum, default_value_t = IrStage::Final)]
+        stage: IrStage,
     },
     /// Print the resolved sysroot.
     Sysroot,
@@ -65,14 +86,7 @@ fn main() -> Result<()> {
         Command::Parse { file } => cmd::parse::run(&file),
         Command::Check { file, lib } => cmd::check::run(&file, lib),
         Command::Fmt { file, write, check } => cmd::fmt::run(&file, write, check),
-        Command::Ir { file, stage } => {
-            let stage = match stage.as_str() {
-                "lowered" => neon_compiler::ir::Stage::Lowered,
-                "opt" | "optimised" | "optimized" => neon_compiler::ir::Stage::Optimised,
-                _ => neon_compiler::ir::Stage::Final,
-            };
-            cmd::ir::run(&file, stage)
-        }
+        Command::Ir { file, stage } => cmd::ir::run(&file, stage.into()),
         Command::Sysroot => cmd::sysroot::run(),
     }
 }
