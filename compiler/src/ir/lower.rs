@@ -67,6 +67,7 @@ fn lower_fn(env: &Env, result: &TypecheckResult, module: &[String], f: &ast::FnD
         scope: vec![vec![]],
         terminated: false,
         loops: vec![],
+        handlers: vec![],
     };
 
     // Parameters are the entry block's parameters.
@@ -102,6 +103,10 @@ struct Lower<'a> {
     terminated: bool,
     /// The enclosing loops, innermost last, for `break` and `continue`.
     loops: Vec<LoopCtx>,
+    /// The enclosing `try` handlers, innermost last: the block a throwing call or a
+    /// `throw` jumps to on error, passing the error value. Empty means an error
+    /// propagates straight out of the function.
+    handlers: Vec<BlockId>,
 }
 
 /// What `break` and `continue` need: where to jump, and the loop-carried variables to
@@ -270,6 +275,18 @@ impl Lower<'_> {
             ExprKind::As { lhs, .. } => {
                 let v = self.lower_expr(lhs);
                 self.b.emit(Op::Cast(v), repr, ty)
+            }
+            ExprKind::Try { form, body, catch } => {
+                self.lower_try(*form, body, catch.as_ref(), repr, ty)
+            }
+            ExprKind::Throw(e) => {
+                let ev = self.lower_expr(e);
+                match self.handlers.last().copied() {
+                    Some(h) => self.b.terminate(Term::Jump(Target { to: h, args: vec![ev] })),
+                    None => self.b.terminate(Term::Throw(ev)),
+                }
+                self.terminated = true;
+                self.b.value(Repr::Never, ty)
             }
             ExprKind::Return(v) => {
                 let rv = v.as_ref().map(|e| self.lower_expr(e));
@@ -477,11 +494,13 @@ impl Lower<'_> {
             }
             // A direct call to a named module function: native symbol or a Neon body.
             if let Some(sig) = self.env.fn_named(&self.module, p) {
+                let throws = sig.throws;
                 let op = match &sig.native {
                     Some(sym) => Op::Native { symbol: sym.clone(), args: arg_vs },
                     None => Op::Call { func: mangle(&sig.module, &sig.name), args: arg_vs },
                 };
-                return self.b.emit(op, repr, ty);
+                let result = self.b.emit(op, repr.clone(), ty);
+                return self.wrap_throwing(result, throws, repr, ty);
             }
         }
         self.unhandled_note("call target", repr, ty)
@@ -506,9 +525,13 @@ impl Lower<'_> {
         match res {
             Resolution::Direct(impl_id) => {
                 let m = self.env.impls()[impl_id.0].methods.iter().find(|m| m.name == method);
-                match m.and_then(|m| m.native.clone()) {
-                    Some(sym) => self.b.emit(Op::Native { symbol: sym, args }, repr, ty),
-                    None => self.unhandled_note("dispatch to user impl", repr, ty),
+                let native_throws = m.map(|m| (m.native.clone(), m.throws));
+                match native_throws {
+                    Some((Some(sym), throws)) => {
+                        let result = self.b.emit(Op::Native { symbol: sym, args }, repr.clone(), ty);
+                        self.wrap_throwing(result, throws, repr, ty)
+                    }
+                    _ => self.unhandled_note("dispatch to user impl", repr, ty),
                 }
             }
             Resolution::Switch(_) => self.unhandled_note("dispatch switch", repr, ty),
@@ -565,6 +588,90 @@ impl Lower<'_> {
         self.b.switch_to(join);
         self.terminated = false;
         join_param.unwrap_or_else(|| self.unit(ty))
+    }
+
+    /// `try`/`try?`/`try!` and `try ... catch`. The body runs with an error handler
+    /// installed; a throwing call or `throw` inside jumps to it. On success the body's
+    /// value flows to the join; the handler propagates, softens to null, aborts, or runs
+    /// the catch.
+    fn lower_try(
+        &mut self,
+        form: ast::TryForm,
+        body: &Expr,
+        catch: Option<&ast::CatchArm>,
+        repr: Repr,
+        ty: TyId,
+    ) -> Value {
+        let join = self.b.new_block();
+        let join_p = self.b.block_param(join, repr.clone(), ty);
+        let handler = self.b.new_block();
+        let err_param = self.b.block_param(handler, Repr::Any, ty);
+
+        self.handlers.push(handler);
+        let body_v = self.lower_expr(body);
+        if !self.terminated {
+            self.b.terminate(Term::Jump(Target { to: join, args: vec![body_v] }));
+        }
+        self.handlers.pop();
+
+        self.b.switch_to(handler);
+        self.terminated = false;
+        if let Some(c) = catch {
+            self.scope.push(vec![]);
+            self.bind(&c.binding, err_param);
+            let cv = self.lower_block(&c.body).unwrap_or_else(|| self.unit(ty));
+            if !self.terminated {
+                self.b.terminate(Term::Jump(Target { to: join, args: vec![cv] }));
+            }
+            self.scope.pop();
+        } else {
+            match form {
+                ast::TryForm::Propagate => self.b.terminate(Term::Throw(err_param)),
+                ast::TryForm::Soften => {
+                    let n = self.b.emit(Op::ConstNull, Repr::Null, ty);
+                    self.b.terminate(Term::Jump(Target { to: join, args: vec![n] }));
+                }
+                ast::TryForm::Assert => {
+                    self.b.emit_void(Op::Native {
+                        symbol: "neon_panic".into(),
+                        args: vec![err_param],
+                    });
+                    self.b.terminate(Term::Unreachable);
+                }
+            }
+        }
+
+        self.b.switch_to(join);
+        self.terminated = false;
+        join_p
+    }
+
+    /// Wrap a call whose target may throw: check the tagged result and, on error, jump
+    /// to the enclosing handler with the error; on success continue with the ok value.
+    fn wrap_throwing(&mut self, result: Value, throws_ty: TyId, ok_repr: Repr, ty: TyId) -> Value {
+        if matches!(repr_of(&self.env.solver.t, throws_ty), Repr::Never) {
+            return result;
+        }
+        let iserr = self.b.emit(Op::IsErr(result), Repr::Bool, ty);
+        let err = self.b.emit(Op::UnwrapErr(result), Repr::Any, ty);
+        let ok_b = self.b.new_block();
+        match self.handlers.last().copied() {
+            Some(h) => self.b.terminate(Term::Branch {
+                cond: iserr,
+                then: Target { to: h, args: vec![err] },
+                els: Target { to: ok_b, args: vec![] },
+            }),
+            // The checker forbids a bare throwing call, so a handler is always present;
+            // defensively, propagate straight out.
+            None => self.b.terminate(Term::Branch {
+                cond: iserr,
+                then: Target { to: ok_b, args: vec![] },
+                els: Target { to: ok_b, args: vec![] },
+            }),
+        }
+        self.b.switch_to(ok_b);
+        self.terminated = false;
+        self.b.emit(Op::UnwrapOk(result), ok_repr, ty)
     }
 
     /// A `match` as a decision list: each arm tests the subject and, on a match, binds

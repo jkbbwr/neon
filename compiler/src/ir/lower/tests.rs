@@ -199,3 +199,18 @@ fn a_cast_reinterprets() {
     let ir = lower("newtype Meter = f64\nfn m(x: f64) -> Meter { x as Meter }");
     assert!(ir.contains("cast %0"), "{ir}");
 }
+
+#[test]
+fn try_and_throw_lower_to_tagged_result_control_flow() {
+    let ir = lower(
+        "record Bad { msg: str }
+         fn risky(n: i64) throws Bad -> i64 { if n < 0 { throw Bad { msg: \"neg\" } } else { n } }
+         fn use_propagate(n: i64) throws Bad -> i64 { try risky(n) }
+         fn use_soften(n: i64) -> i64 { (try? risky(n)) orelse 0 }
+         fn use_catch(n: i64) -> i64 { try risky(n) catch (e) { -1 } }",
+    );
+    // A throwing call is checked and, on error, jumps to a handler; throw terminates.
+    assert!(ir.contains("is_err"), "{ir}");
+    assert!(ir.contains("unwrap_ok"), "{ir}");
+    assert!(ir.contains("throw %"), "propagate re-throws: {ir}");
+}

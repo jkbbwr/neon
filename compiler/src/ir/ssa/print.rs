@@ -75,6 +75,9 @@ fn op(o: &Op) -> String {
         Op::MakeTuple(vs) => format!("tuple ({})", vals(vs)),
         Op::Elem { base, index } => format!("elem {}.{index}", val(*base)),
         Op::Cast(v) => format!("cast {}", val(*v)),
+        Op::IsErr(v) => format!("is_err {}", val(*v)),
+        Op::UnwrapOk(v) => format!("unwrap_ok {}", val(*v)),
+        Op::UnwrapErr(v) => format!("unwrap_err {}", val(*v)),
         Op::IsNull(v) => format!("is_null {}", val(*v)),
         Op::IsVariant { value, variant } => format!("is_variant {} {variant}", val(*value)),
         Op::MakeList(vs) => format!("list [{}]", vals(vs)),
@@ -88,6 +91,7 @@ fn term(t: &Term) -> String {
     match t {
         Term::Ret(Some(v)) => format!("ret {}", val(*v)),
         Term::Ret(None) => "ret".to_string(),
+        Term::Throw(v) => format!("throw {}", val(*v)),
         Term::Jump(tgt) => format!("jump {}", target(tgt)),
         Term::Branch { cond, then, els } => {
             format!("branch {}, {}, {}", val(*cond), target(then), target(els))

@@ -120,6 +120,11 @@ pub enum Op {
     /// `x as T` — a reinterpretation to a narrower or wrapping type: identity at
     /// runtime for a narrowing or a newtype, an extraction out of a union.
     Cast(Value),
+    /// A throwing call returns a tagged result. These read it: whether it is the error
+    /// case, and the value out of each side.
+    IsErr(Value),
+    UnwrapOk(Value),
+    UnwrapErr(Value),
     /// Whether a nullable value is null. Codegen: a null-pointer or tag test.
     IsNull(Value),
     /// Whether a value is the named variant of a union (a nominal member, or a
@@ -145,6 +150,8 @@ pub struct Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
     Ret(Option<Value>),
+    /// Return the error case of this throwing function's tagged result.
+    Throw(Value),
     Jump(Target),
     Branch { cond: Value, then: Target, els: Target },
     Switch { on: Value, arms: Vec<(SwitchKey, Target)>, default: Target },
