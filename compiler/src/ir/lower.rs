@@ -212,6 +212,23 @@ impl Lower<'_> {
             ExprKind::Call { callee, args, .. } => self.lower_call(e.id, callee, args, repr, ty),
             ExprKind::If { cond, then, else_ } => self.lower_if(cond, then, else_.as_deref(), repr, ty),
             ExprKind::Block(b) => self.lower_block(b).unwrap_or_else(|| self.unit(ty)),
+            ExprKind::Field { base, name } => {
+                let b = self.lower_expr(base);
+                self.b.emit(Op::Field { base: b, field: name.clone() }, repr, ty)
+            }
+            ExprKind::Tuple(elems) => {
+                let vs = elems.iter().map(|e| self.lower_expr(e)).collect();
+                self.b.emit(Op::MakeTuple(vs), repr, ty)
+            }
+            ExprKind::List(elems) => self.lower_list(elems, repr, ty),
+            ExprKind::RecordLit { path, fields, spread } => {
+                self.lower_record(path.as_deref(), fields, spread.as_deref(), repr, ty)
+            }
+            ExprKind::Index { base, index } => {
+                let b = self.lower_expr(base);
+                let i = self.lower_expr(index);
+                self.b.emit(Op::Index { base: b, index: i }, repr, ty)
+            }
             ExprKind::Return(v) => {
                 let rv = v.as_ref().map(|e| self.lower_expr(e));
                 self.b.terminate(Term::Ret(rv));
@@ -221,6 +238,50 @@ impl Lower<'_> {
             }
             _ => self.unhandled(e, repr, ty),
         }
+    }
+
+    fn lower_list(&mut self, elems: &[ast::Elem], repr: Repr, ty: TyId) -> Value {
+        // A spread (`..rest`) is a concatenation; not lowered yet, so mark it.
+        if elems.iter().any(|e| matches!(e, ast::Elem::Spread(_))) {
+            return self.unhandled_note("list spread", repr, ty);
+        }
+        let vs = elems
+            .iter()
+            .map(|e| match e {
+                ast::Elem::Value(x) => self.lower_expr(x),
+                ast::Elem::Spread(_) => unreachable!("guarded above"),
+            })
+            .collect();
+        self.b.emit(Op::MakeList(vs), repr, ty)
+    }
+
+    fn lower_record(
+        &mut self,
+        path: Option<&[String]>,
+        fields: &[ast::FieldInit],
+        spread: Option<&Expr>,
+        repr: Repr,
+        ty: TyId,
+    ) -> Value {
+        if spread.is_some() {
+            return self.unhandled_note("record spread", repr, ty);
+        }
+        // Emit fields in the repr's canonical order, so every value of a type is built
+        // the same way. A field the literal omits is a nullable optional -> null.
+        let order: Vec<String> = match &repr {
+            Repr::Record { fields, .. } => fields.iter().map(|(n, _)| n.clone()).collect(),
+            _ => fields.iter().map(|f| f.name.clone()).collect(),
+        };
+        let name = path.and_then(|p| p.last().cloned());
+        let mut built = Vec::new();
+        for fname in order {
+            let v = match fields.iter().find(|f| f.name == fname) {
+                Some(f) => self.lower_expr(&f.value),
+                None => self.b.emit(Op::ConstNull, Repr::Null, ty),
+            };
+            built.push((fname, v));
+        }
+        self.b.emit(Op::MakeRecord { name, fields: built }, repr, ty)
     }
 
     fn lower_str(&mut self, parts: &[ast::StrPart], repr: Repr, ty: TyId) -> Value {

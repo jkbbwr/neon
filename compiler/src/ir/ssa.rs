@@ -117,6 +117,10 @@ pub enum Op {
     MakeTuple(Vec<Value>),
     /// Read a tuple element.
     Elem { base: Value, index: usize },
+    /// Build a list from its elements, in order.
+    MakeList(Vec<Value>),
+    /// Index a list — `xs[i]`, which traps on a bad index rather than throwing.
+    Index { base: Value, index: Value },
 
     /// Retain / release, inserted by the refcount pass.
     Retain(Value),

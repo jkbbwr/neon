@@ -105,3 +105,22 @@ fn native_calls_and_native_impl_dispatch() {
     assert!(ir.contains("native \"neon_i64_to_string\"(%0)"), "{ir}");
     assert!(ir.contains("native \"neon_io_println\"(%1)"), "{ir}");
 }
+
+#[test]
+fn records_fields_and_tuples() {
+    let ir = lower(
+        "record Point { x: i64, y: i64 }
+         fn mk() -> Point { Point { x: 1, y: 2 } }
+         fn getx(p: Point) -> i64 { p.x }
+         fn pair() -> (i64, i64) { (3, 4) }",
+    );
+    assert!(ir.contains("record Point{x: %0, y: %1}"), "{ir}");
+    assert!(ir.contains("field %0.x"), "{ir}");
+    assert!(ir.contains("tuple (%0, %1)"), "{ir}");
+}
+
+#[test]
+fn a_list_literal_builds_a_list() {
+    let ir = lower("opaque record List[T] {}\nfn nums() -> List[i64] { [5, 6] }");
+    assert!(ir.contains("list [%0, %1]"), "{ir}");
+}
