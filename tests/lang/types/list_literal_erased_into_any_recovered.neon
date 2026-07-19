@@ -1,0 +1,23 @@
+// An erased list literal survives the round trip with its elements intact.
+//
+// The companion to list_literal_erased_into_any.neon, and the half that actually pins the
+// layout. Under the old `unwrap_or(List[any])` fallback this program *compiled*: the list
+// was allocated with 24-byte `any`-shaped slots and each element written as a bare 8-byte
+// `i64`, so every read after the first came out of the middle of a slot. Checking only
+// that the program builds would not have caught it -- the values have to be read back.
+//
+// The length is read as well as the elements: it is the field the runtime advances by the
+// witness's element size, so a slot-width mismatch shows up here before it shows up in a
+// value.
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    let li: any = [10, 20, 30];
+    let back = li as List[i64];
+    io::println("#{list::len(back)}");
+    io::println("#{back[0]}");
+    io::println("#{back[1]}");
+    io::println("#{back[2]}");
+}

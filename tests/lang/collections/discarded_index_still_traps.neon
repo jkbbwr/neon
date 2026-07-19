@@ -1,0 +1,25 @@
+//@ exit: 101
+
+// A trap is an effect, whether or not anyone reads the value.
+//
+// `xs[10]` here is a statement: nothing consumes the element. Dead-code elimination
+// removed the whole instruction on the grounds that its result was unused, and removed the
+// bounds check with it — so this program ran clean past the end of a three-element list and
+// exited 0. The same held for `1 / 0` and `1 % 0` as statements, while the identical
+// expressions trapped correctly the moment their results were used.
+//
+// The effect analysis classified everything that was not a call as pure. A trap ends the
+// program, which is about as observable as an effect gets, so indexing and the i64
+// arithmetic that can overflow or divide by zero are effectful regardless of what happens
+// to the result.
+//
+// The exit code is the point of the test: 101 means the trap fired. A 0 here is the bug.
+
+use std::io;
+
+fn main() {
+    let xs = [1, 2, 3];
+    io::println("before");
+    xs[10];
+    io::println("unreachable: the index above traps");
+}

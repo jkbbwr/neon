@@ -7,7 +7,9 @@
 //!   block parameter (ownership moves in with the argument);
 //! - a **view** holds nothing. `Field`, `Elem`, `Cast`, `UnwrapOk` and `UnwrapErr` hand
 //!   back a look into what their operand owns; `base_of` records the derivation, and
-//!   `root` follows it to the owner at the bottom of the chain.
+//!   `root` follows it to the owner at the bottom of the chain. The single exception is
+//!   a `Cast` that erases into `any`: it allocates a box and takes its operand's
+//!   reference, so it is an owner and a consuming use — see `erasing_casts`.
 //!
 //! Liveness is computed **over roots**: a use of a view is a use of its root, and views
 //! never appear in a live set. That one collapse is what lets a single analysis place
@@ -40,6 +42,7 @@
 //! release always runs, and nothing leaks. Moves at last use and `rc == 1` reuse are the
 //! refinements the optimiser adds on top; this establishes the balanced baseline.
 
+use super::repr::Repr;
 use super::ssa::{Block, BlockId, Func, Inst, Op, Program, Target, Term, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -59,10 +62,47 @@ pub fn insert(program: &mut Program) {
     }
 }
 
+/// The results of the one `Op::Cast` that is not a projection: erasing into `any`.
+///
+/// Every other cast reinterprets storage that already exists — narrowing a union reads a
+/// payload, widening injects into a tagged struct, an `any` -> concrete recovery points
+/// into the box. Erasure alone *allocates*: `coerce_expr` emits `neon_box_new`, which
+/// `neon_alloc`s a fresh header and `memcpy`s the payload in without retaining it. So the
+/// result is an owner, and the operand's reference **moves into** the box, whose
+/// `neon_box_drop` releases it via the witness.
+///
+/// Treating erasure as a view (which is what listing `Cast` unconditionally in `base_of`
+/// did) made the pass release the *record* and never the box: a leak of the box and
+/// everything it transitively owned. It was invisible for a flat record because an inline
+/// `Repr::Record` with no counted field is not in `ptr` at all, so `base_of`'s
+/// `ptr.contains(&base)` guard already rejected the edge and the cast was an owner by
+/// accident. A recursive record is a `Repr::BoxedRec` pointer, is counted, and took the
+/// view path.
+///
+/// `Any -> Any` is the identity in `coerce_expr` and stays a view; so does a `Never`
+/// source, which never carries a live reference.
+fn erasing_casts(f: &Func) -> HashSet<Value> {
+    let mut out = HashSet::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let (Some(v), Op::Cast(base)) = (inst.result, &inst.op) {
+                let src = f.value_repr(*base);
+                if matches!(f.value_repr(v), Repr::Any)
+                    && !matches!(src, Repr::Any | Repr::Never)
+                {
+                    out.insert(v);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Where a view was read out of: `Field`/`Elem`/`Cast`/`UnwrapOk`/`UnwrapErr` results
 /// alias what their operand owns rather than holding a reference of their own. `Index` is
-/// not here — `emit_index` retains what it reads, so that result owns itself.
-fn base_of(f: &Func, ptr: &HashSet<Value>) -> HashMap<Value, Value> {
+/// not here — `emit_index` retains what it reads, so that result owns itself. Nor is an
+/// erasing cast, which allocates a box rather than aliasing (see `erasing_casts`).
+fn base_of(f: &Func, ptr: &HashSet<Value>, erasing: &HashSet<Value>) -> HashMap<Value, Value> {
     let mut out = HashMap::new();
     for b in &f.blocks {
         for inst in &b.insts {
@@ -74,7 +114,7 @@ fn base_of(f: &Func, ptr: &HashSet<Value>) -> HashMap<Value, Value> {
                 _ => None,
             };
             if let Some((v, base)) = projected {
-                if ptr.contains(&v) && ptr.contains(&base) {
+                if ptr.contains(&v) && ptr.contains(&base) && !erasing.contains(&v) {
                     out.insert(v, base);
                 }
             }
@@ -121,11 +161,12 @@ fn insert_fn(f: &mut Func) {
     if ptr.is_empty() {
         return;
     }
-    let bases = base_of(f, &ptr);
+    let erasing = erasing_casts(f);
+    let bases = base_of(f, &ptr, &erasing);
     // A lifted lambda's environment parameter is borrowed: the closure value owns it and
     // may be called again. It stays in `ptr` so reads out of it are still views.
     let env_param: Option<Value> = f.env.is_some().then(|| f.params[0]);
-    let (live_in, live_out) = liveness(f, &ptr, &bases);
+    let (live_in, live_out) = liveness(f, &ptr, &bases, &erasing);
 
     let release = |v: Value| Inst { result: None, op: Op::Release(v) };
     let retain = |v: Value| Inst { result: None, op: Op::Retain(v) };
@@ -222,7 +263,7 @@ fn insert_fn(f: &mut Func) {
                 }
             }
 
-            let (consuming, borrowing) = operand_uses(&inst.op, &ptr);
+            let (consuming, borrowing) = operand_uses(inst, &ptr, &erasing);
             for w in consuming {
                 if bases.contains_key(&w) {
                     // A consumed view materialises a reference, and counts as a use of
@@ -321,6 +362,7 @@ fn liveness(
     f: &Func,
     ptr: &HashSet<Value>,
     bases: &HashMap<Value, Value>,
+    erasing: &HashSet<Value>,
 ) -> (HashMap<BlockId, HashSet<Value>>, HashMap<BlockId, HashSet<Value>>) {
     let mut live_in: HashMap<_, HashSet<Value>> =
         f.blocks.iter().map(|b| (b.id, HashSet::new())).collect();
@@ -349,7 +391,7 @@ fn liveness(
                         live.remove(&v);
                     }
                 }
-                let (c, br) = operand_uses(&inst.op, ptr);
+                let (c, br) = operand_uses(inst, ptr, erasing);
                 for w in c.into_iter().chain(br) {
                     live.insert(root_base(bases, w));
                 }
@@ -384,10 +426,14 @@ fn liveness(
 ///
 /// `Retain`/`Release` report no uses at all. They are the pass's own output; counting them
 /// as uses would make the analysis depend on its own results.
-fn operand_uses(op: &Op, ptr: &HashSet<Value>) -> (Vec<Value>, Vec<Value>) {
+fn operand_uses(
+    inst: &Inst,
+    ptr: &HashSet<Value>,
+    erasing: &HashSet<Value>,
+) -> (Vec<Value>, Vec<Value>) {
     let mut consuming = Vec::new();
     let mut borrowing = Vec::new();
-    match op {
+    match &inst.op {
         Op::Call { args, .. } | Op::Native { args, .. } | Op::MakeTuple(args) | Op::MakeList(args) => {
             consuming.extend(args.iter().copied())
         }
@@ -403,6 +449,9 @@ fn operand_uses(op: &Op, ptr: &HashSet<Value>) -> (Vec<Value>, Vec<Value>) {
             borrowing.push(*base);
             borrowing.push(*index);
         }
+        // An erasing cast is the one `Cast` that takes ownership: `neon_box_new` copies
+        // the payload into a box whose drop releases it, so the reference moves in.
+        Op::Cast(v) if inst.result.is_some_and(|r| erasing.contains(&r)) => consuming.push(*v),
         Op::Cast(v)
         | Op::IsNull(v)
         | Op::IsErr(v)

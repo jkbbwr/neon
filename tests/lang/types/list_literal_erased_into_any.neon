@@ -1,0 +1,28 @@
+// A list literal bound to `any` is built as a list, then erased.
+//
+// The checker adopts an expected type wholesale for a list literal (unlike a record
+// literal, whose type is nominal and independent of the expectation), so `let li: any =
+// [1, 2, 3]` typed the literal itself as `any`. Lowering then emitted `MakeList` with a
+// result repr of `Any`, and the backend had no element repr to size the slots or pick the
+// value-witness with. It used to guess `List[any]`: 24-byte slots written with 8-byte
+// `i64`s, and a witness that does not exist. Now the list is built at `List[i64]` and a
+// separate `Cast` erases it -- the same build-then-erase shape a record literal has.
+//
+// The binding must be *used*. `MakeList` is pure, so an unused one is removed by DCE and
+// the bug disappears with it.
+//
+// `is` names a head type only: it cannot ask a question about a type argument, so
+// `is List[str]` is also true here. That is the existing rule for every generic type (see
+// erased_runtime_type_keeps_its_name.neon), not something this file introduces. The `is
+// str` case is what shows the answer distinguishes rather than being blanket-true.
+
+use std::io;
+
+fn is_list(a: any) -> bool { a is List[i64] }
+fn is_str(a: any) -> bool { a is str }
+
+fn main() {
+    let li: any = [1, 2, 3];
+    io::println("#{is_list(li)}");
+    io::println("#{is_str(li)}");
+}

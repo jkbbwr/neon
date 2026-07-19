@@ -1,0 +1,32 @@
+// Erasing a recursive record into `any` allocates a box that OWNS the record:
+// `neon_box_new` copies the payload in without retaining it, and the box's drop
+// releases it through the witness. So the box is what has to be released, not
+// the record inside it.
+//
+// A recursive record is a heap pointer (`Repr::BoxedRec`) rather than an inline
+// struct, and the refcount pass used to treat every cast as a view of its
+// operand. That made it release the record and never the box: a leak of the box
+// and everything it transitively owned. A flat record escaped the bug only by
+// accident -- being inline and uncounted, it was never a view's base.
+
+use std::io;
+use std::string;
+
+record Node {
+    v: i64,
+    next: Node | null,
+}
+
+fn main() {
+    // A two-deep chain, so the leak would take the tail with it.
+    let x: any = Node { v: 1, next: Node { v: 2, next: null } };
+    if x is Node {
+        io::println("erased");
+    } else {
+        io::println("lost");
+    }
+
+    // Recovered through the box, then read: the box is still alive here.
+    let n = x as Node;
+    io::println(to_string(n.v));
+}

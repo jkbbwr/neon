@@ -14,7 +14,7 @@
 //! `<todo: ...>` string constant of the expected repr so the enclosing function still
 //! lowers and `compiler/tests/ir_lower.rs` can report what remains.
 
-use super::repr::{repr_of, Repr};
+use super::repr::{normalize_union, repr_of, Repr};
 use super::ssa::{Builder, BlockId, Func, Op, PrimOp, Program, Target, Term, Value};
 use crate::ast::{self, BinOp, Block, Decl, DeclKind, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use crate::typecheck::env::Env;
@@ -69,8 +69,12 @@ fn substitute_repr(r: &Repr, subst: &std::collections::HashMap<String, Repr>) ->
             rs.iter().map(|r| substitute_repr(r, subst)).collect(),
         ),
         Repr::List(e) => Repr::List(Box::new(substitute_repr(e, subst))),
-        Repr::Runtime { name, args } => Repr::Runtime {
-            name: name.clone(),
+        // Substitution reaches the arguments only: the nominal name and the C symbol name
+        // the type itself, and `Resource[T, E]` instantiated at `i64` is still a
+        // `Resource`. Both ride through untouched, together, so neither can drift.
+        Repr::Runtime { nominal, c_type, args } => Repr::Runtime {
+            nominal: nominal.clone(),
+            c_type: c_type.clone(),
             args: args.iter().map(|r| substitute_repr(r, subst)).collect(),
         },
         Repr::Nullable(e) => Repr::Nullable(Box::new(substitute_repr(e, subst))),
@@ -96,8 +100,13 @@ fn match_repr(template: &Repr, concrete: &Repr, subst: &mut std::collections::Ha
         (Repr::List(a), Repr::List(b)) | (Repr::Nullable(a), Repr::Nullable(b)) => {
             match_repr(a, b, subst)
         }
-        (Repr::Runtime { name: an, args: aa }, Repr::Runtime { name: bn, args: ba })
-            if an == bn =>
+        // Both halves must agree, not just the nominal. They are a pure function of one
+        // another, so this is equivalent to testing `nominal` alone — it is written out so
+        // the invariant is checked rather than assumed.
+        (
+            Repr::Runtime { nominal: an, c_type: ac, args: aa },
+            Repr::Runtime { nominal: bn, c_type: bc, args: ba },
+        ) if an == bn && ac == bc =>
         {
             aa.iter().zip(ba).for_each(|(x, y)| match_repr(x, y, subst));
         }
@@ -178,9 +187,12 @@ fn repr_key(r: &Repr) -> String {
         Repr::Null => "null".into(),
         Repr::Unit => "unit".into(),
         Repr::Tag => "tag".into(),
-        Repr::Runtime { name, args } if args.is_empty() => name.clone(),
-        Repr::Runtime { name, args } => {
-            format!("{name}_{}", args.iter().map(repr_key).collect::<Vec<_>>().join("_"))
+        // The Neon name, matching what `Record` does one arm below: a mangled name spells
+        // the *type*, and two distinct Neon types that happened to share a C symbol would
+        // otherwise mangle to one monomorphisation instance.
+        Repr::Runtime { nominal, args, .. } if args.is_empty() => nominal.clone(),
+        Repr::Runtime { nominal, args, .. } => {
+            format!("{nominal}_{}", args.iter().map(repr_key).collect::<Vec<_>>().join("_"))
         }
         Repr::Record { name: Some(n), .. } => n.clone(),
         Repr::Record { .. } => "rec".into(),
@@ -1025,7 +1037,22 @@ impl Lower<'_> {
                 ast::Elem::Value(x) => self.lower_expr(x),
                 ast::Elem::Spread(_) => unreachable!("guarded above"),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // The checker adopts an expected type wholesale for a list literal, so
+        // `let xs: any = [1, 2, 3]` hands us `Any` — a repr with no list in it at all.
+        // A list is still what gets *built*, and the builder needs the element repr: it
+        // sizes the slots and picks the value-witness the runtime copies and releases by.
+        // So build at the literal's real repr and erase afterwards, which is exactly the
+        // shape a record literal already has (`MakeRecord` at `Flat`, then a `Cast`).
+        //
+        // Only bare `Any` takes this path. Every other repr that fails to show a list is
+        // left to ice in the backend rather than guessed at here: guessing an element
+        // width is the specific mistake the ice was added to stop.
+        if repr == Repr::Any {
+            let elem = normalize_union(vs.iter().map(|&v| self.b.value_repr(v).clone()).collect());
+            let built = self.b.emit(Op::MakeList(vs), Repr::List(Box::new(elem)), ty);
+            return self.b.emit(Op::Cast(built), repr, ty);
+        }
         self.b.emit(Op::MakeList(vs), repr, ty)
     }
 

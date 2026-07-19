@@ -1,0 +1,19 @@
+// The same round trip with a pointer element type.
+//
+// `List[str]` is the case a wrong witness gets caught by the *refcount* rather than by the
+// slot width: `str` slots are retained and released through the element value-witness, so
+// a missing or mismatched witness is a leak or a double-free rather than a garbled number.
+// That is why this is a separate file from the `i64` one -- the two fail differently, and
+// a sanitizer report is the expected failure mode here, not wrong output.
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    let ls: any = ["alpha", "beta", "gamma"];
+    let back = ls as List[str];
+    io::println("#{list::len(back)}");
+    io::println("#{back[0]}");
+    io::println("#{back[1]}");
+    io::println("#{back[2]}");
+}

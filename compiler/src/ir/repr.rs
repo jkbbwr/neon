@@ -45,20 +45,32 @@ pub enum Repr {
     List(Box<Repr>),
     /// A `Map[K, V]` — an immutable HAMT.
     Map(Box<Repr>, Box<Repr>),
-    /// A refcounted object the runtime owns, named by the C type it is a pointer to and
-    /// carrying whatever generic arguments the backend needs to see (a payload's element
-    /// type, so a witness can be emitted for it).
+    /// A refcounted object the runtime owns, carrying whatever generic arguments the
+    /// backend needs to see (a payload's element type, so a witness can be emitted for it).
     ///
-    /// This is what `@runtime("neon_file")` on a record produces. It replaces one
-    /// hardcoded `Repr` variant per runtime type: the C type is `{name}*`, the mangled
-    /// key and the printed form are derived from `name` and `args`, and refcounting,
-    /// pointer-ness and substitution are uniform across all of them — which is why those
-    /// arms collapse rather than multiply. Only equality, ordering and hashing genuinely
-    /// differ per type, and those live in one name-keyed table in the C emitter.
+    /// This is what `@runtime("neon_resource") opaque record Resource[T, E]` produces, and
+    /// it carries *both* halves of that declaration under names that cannot be mistaken for
+    /// each other:
+    ///
+    /// - `nominal` is the Neon name (`Resource`) — the type's identity. It is what the
+    ///   printed form, the mangled key and the boxed type tag are built from, so
+    ///   `x is Resource` on an erased value compares the same string the source wrote.
+    /// - `c_type` is the C symbol (`neon_resource`) — a spelling of the pointee, nothing
+    ///   more. Only `ctype::c_type` may read it, to emit `{c_type}*`.
+    ///
+    /// A single `name` field holding the C symbol was the earlier design, and it is
+    /// precisely why `type_tag_name` had no Neon name to answer with and every `is` against
+    /// a runtime-backed type was false. `c_type` is a pure function of `nominal` (one
+    /// lookup in `Types::runtime_types`), so the two can never disagree by construction.
+    ///
+    /// Replacing one hardcoded `Repr` variant per runtime type is still the point:
+    /// refcounting, pointer-ness and substitution are uniform across all of them. Only
+    /// equality, ordering and hashing genuinely differ per type, and those live in one
+    /// name-keyed table in the C emitter.
     ///
     /// `List` and `Map` are still their own variants; folding them in is mechanical but
     /// their element reprs feed witness emission, so they move separately.
-    Runtime { name: String, args: Vec<Repr> },
+    Runtime { nominal: String, c_type: String, args: Vec<Repr> },
     /// A closure: a function pointer plus a boxed environment. `throws` is part of the
     /// calling convention, not the layout: a throwing closure's function returns the
     /// tagged result `Union([ret, throws])` rather than `ret`, exactly like a named
@@ -576,12 +588,16 @@ fn record_repr(t: &Types, atom_idx: u32, cyclic: &HashSet<TyId>, boxed: &HashSet
     // a payload's element type reaches the backend and can get a witness.
     //
     // A new runtime-backed type is a stdlib declaration, not a compiler edit.
-    if let Some(sym) = name.as_deref().and_then(|n| t.runtime_types.get(n)) {
+    if let Some((nominal, sym)) = name.as_deref().and_then(|n| Some((n, t.runtime_types.get(n)?)))
+    {
         let args = (0..)
             .map_while(|i| field_ty(t, atom_idx, &format!("#{i}")))
             .map(|a| repr_rec(t, a, cyclic, boxed, false))
             .collect();
-        return Repr::Runtime { name: sym.clone(), args };
+        // Both halves are in hand at exactly this point: the table is keyed by the Neon
+        // name and holds the C symbol. Carrying only the symbol here is what made
+        // `x is Resource` unanswerable downstream.
+        return Repr::Runtime { nominal: nominal.to_string(), c_type: sym.clone(), args };
     }
 
     // `List` and `Map` still have their own reprs: their element types drive witness

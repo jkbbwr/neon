@@ -1,0 +1,42 @@
+// The mirror cases of the erasure-owns-its-payload rule. Each one would be a
+// double release -- a use-after-free -- if the cast both moved the record into
+// the box and left the record to be released on its own.
+//
+// A record erased twice, an erasure whose source outlives it, an erasure passed
+// to a function, and an erasure in a loop.
+
+use std::io;
+use std::collections::list;
+use std::string;
+
+record Node {
+    v: i64,
+    next: Node | null,
+}
+
+fn name(a: any) -> str {
+    if a is Node { "node" } else { "other" }
+}
+
+fn main() {
+    // Erased twice from one record: two boxes, two references taken, and the
+    // record still readable afterwards.
+    let n = Node { v: 7, next: null };
+    let a: any = n;
+    let b: any = n;
+    io::println(name(a));
+    io::println(name(b));
+    io::println(to_string(n.v));
+
+    // Consumed by a callee rather than dropped locally.
+    let c: any = Node { v: 8, next: null };
+    io::println(name(c));
+
+    // Erased in a loop, and stored into a collection that outlives the body.
+    let xs: List[any] = [];
+    for i in [1, 2, 3] {
+        let e: any = Node { v: i, next: null };
+        xs = list::push(xs, e);
+    }
+    io::println(to_string(list::len(xs)));
+}

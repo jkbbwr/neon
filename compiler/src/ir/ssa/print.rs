@@ -193,9 +193,11 @@ pub fn repr(r: &Repr) -> String {
         Repr::Null => "null".into(),
         Repr::Unit => "()".into(),
         Repr::Tag => "tag".into(),
-        Repr::Runtime { name, args } if args.is_empty() => name.clone(),
-        Repr::Runtime { name, args } => {
-            format!("{name}[{}]", args.iter().map(repr).collect::<Vec<_>>().join(", "))
+        // The Neon name: this dump is read against Neon source, where the type is spelled
+        // `Resource[i64, E]`, not `neon_resource[...]`.
+        Repr::Runtime { nominal, args, .. } if args.is_empty() => nominal.clone(),
+        Repr::Runtime { nominal, args, .. } => {
+            format!("{nominal}[{}]", args.iter().map(repr).collect::<Vec<_>>().join(", "))
         }
         Repr::BoxedRec(a) => format!("box#{a}"),
         Repr::Record { name, fields } => {

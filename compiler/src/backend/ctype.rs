@@ -404,12 +404,13 @@ impl TypeTable {
                 Some(Repr::Record { name: Some(n), .. }) => n.clone(),
                 _ => key(r),
             },
-            // KNOWN GAP, and the reason this is not an `ice`. `Repr::Runtime` carries the
-            // *C symbol* from `@runtime("neon_resource")`, not the Neon name `Resource`,
-            // so there is nothing here to name the type with and `a is Resource` on an
-            // erased runtime-backed value answers `false`. Closing it means carrying the
-            // nominal name on the repr, in `ir/repr.rs`.
-            Repr::Runtime { .. } => key(r),
+            // The Neon name, exactly as the `Record` arm above uses its own. `is` against
+            // an erased value compares this tag with `fnv1a` of the name the source wrote
+            // (`Op::IsVariant`'s `Any` arm in c.rs), so anything but the nominal makes
+            // `a is Resource` false for every `Resource`. The generic arguments are
+            // deliberately *not* in the tag: `is` names a head type, and the source cannot
+            // write `a is Resource[i64, E]` to be tested against.
+            Repr::Runtime { nominal, .. } => nominal.clone(),
             // Anonymous shapes have no name to test against; their structure is the
             // identity, and `variant_name` in c.rs asks the same question the same way, so
             // the two sides of an `is` still agree.
@@ -440,7 +441,9 @@ impl TypeTable {
             Repr::Tag => "uint64_t".into(),
             Repr::List(_) => "neon_list*".into(),
             Repr::Map(_, _) => "neon_map*".into(),
-            Repr::Runtime { name, .. } => format!("{name}*"),
+            // The only reader of `c_type`. Unchanged: the repr is a pointer to the C struct
+            // the runtime declares, and the Neon name has no bearing on how it is spelled.
+            Repr::Runtime { c_type, .. } => format!("{c_type}*"),
             Repr::Closure { .. } => "neon_closure".into(),
             Repr::BoxedRec(atom) => match self.boxed_names.get(atom) {
                 Some(n) => format!("{n}*"),
@@ -652,9 +655,20 @@ fn key_with(r: &Repr, rec: &HashMap<TyId, Repr>) -> String {
         Repr::Null => "n".into(),
         Repr::Unit => "u".into(),
         Repr::Tag => "t".into(),
-        Repr::Runtime { name, args } if args.is_empty() => format!("N{name}"),
-        Repr::Runtime { name, args } => {
-            format!("N{name}[{}]", args.iter().map(key).collect::<Vec<_>>().join(","))
+        // BOTH halves are in the key, and that is the point. This key is the interning
+        // identity for structs, value-witnesses and key-witnesses: two reprs sharing it get
+        // one C struct and one witness. Keying by the C symbol alone merged any two Neon
+        // types that named the same symbol into a single witness — the exact collision
+        // `ice` in this file exists to catch, arriving silently instead. Keying by the
+        // nominal alone would be safe today only because `c_type` is a function of
+        // `nominal`; spelling both keeps the key honest if that ever stops holding, and
+        // costs nothing since the key never leaves this table.
+        Repr::Runtime { nominal, c_type, args } if args.is_empty() => format!("N{nominal}@{c_type}"),
+        Repr::Runtime { nominal, c_type, args } => {
+            format!(
+                "N{nominal}@{c_type}[{}]",
+                args.iter().map(key).collect::<Vec<_>>().join(",")
+            )
         }
         Repr::Any => "a".into(),
         Repr::Never => "x".into(),

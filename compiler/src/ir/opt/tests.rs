@@ -29,9 +29,23 @@ fn constant_arithmetic_folds_to_a_single_constant() {
 
 #[test]
 fn a_dead_pure_computation_is_removed() {
-    let ir = optimized("fn f(x: i64) -> i64 { let unused = x * x; x }");
-    // `unused` is pure and never read, so its multiply is dropped.
+    let ir = optimized("fn f(x: f64) -> f64 { let unused = x * x; x }");
+    // `unused` is pure and never read, so its multiply is dropped. `f64` because IEEE
+    // arithmetic cannot trap; see the i64 companion below.
     assert!(!ir.contains("prim.mul"), "dead multiply removed: {ir}");
+}
+
+/// The i64 companion: an unread multiply is *kept*, because `i64` arithmetic traps on
+/// overflow and deleting it would delete the trap.
+///
+/// This is the same rule `overflowing_constant_arithmetic_is_left_for_the_runtime` applies
+/// to constant folding, which already refuses to fold `i64::MAX + 1` for exactly this
+/// reason. The two passes disagreed: folding respected the trap while dead-code
+/// elimination removed it, so `xs[10]` and `1 / 0` as statements ran clean and exited 0.
+#[test]
+fn a_dead_i64_computation_is_kept_because_it_can_trap() {
+    let ir = optimized("fn f(x: i64) -> i64 { let unused = x * x; x }");
+    assert!(ir.contains("prim.mul"), "trapping multiply kept: {ir}");
 }
 
 #[test]

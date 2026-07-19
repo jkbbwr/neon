@@ -7,7 +7,8 @@
 //! instruction is pure and every callee is pure; the callee condition is a monotonic
 //! fixpoint over the call graph.
 
-use super::ssa::{Op, Program};
+use super::repr::Repr;
+use super::ssa::{Func, Op, PrimOp, Program};
 use std::collections::{HashMap, HashSet};
 
 /// Whether a native symbol has an observable effect. A native's body is opaque to the
@@ -50,7 +51,7 @@ pub fn analyze(program: &Program) -> HashMap<String, bool> {
                 continue; // already effectful
             }
             let effectful = f.blocks.iter().any(|b| {
-                b.insts.iter().any(|inst| op_is_effectful(&inst.op, &pure, &program.pure_natives))
+                b.insts.iter().any(|inst| op_is_effectful(f, &inst.op, &pure, &program.pure_natives))
             });
             if effectful {
                 pure.insert(f.name.clone(), false);
@@ -76,6 +77,7 @@ pub fn analyze(program: &Program) -> HashMap<String, bool> {
 /// optimiser regardless. `throw` is a terminator, not an `Op`, so it has no arm here and
 /// is never a deletion candidate.
 pub fn op_is_effectful(
+    f: &Func,
     op: &Op,
     pure: &HashMap<String, bool>,
     pure_natives: &HashSet<String>,
@@ -89,6 +91,21 @@ pub fn op_is_effectful(
         Op::Call { func, .. } => !pure.get(func).copied().unwrap_or(false),
         // An indirect call cannot be seen through: pessimistically effectful.
         Op::CallClosure { .. } => true,
+        // Indexing traps -- out of bounds for a list, absent key for a map -- and a trap
+        // ends the program, which is as observable as an effect gets. Deleting one because
+        // nobody reads the element is deleting the check: `xs[10]` as a statement ran
+        // clean past the end of a three-element list.
+        Op::Index { .. } => true,
+        // i64 arithmetic traps too, on overflow and on division by zero. The operand repr
+        // is what decides it: the f64 forms follow IEEE and produce an infinity or a NaN
+        // rather than trapping, so they stay pure and stay eliminable. That distinction is
+        // worth the lookup — calling all arithmetic effectful would make almost every
+        // function effectful and leave DCE with nothing it may remove, while calling it
+        // all pure deleted `1 / 0`.
+        Op::Prim(
+            PrimOp::Add | PrimOp::Sub | PrimOp::Mul | PrimOp::Div | PrimOp::Rem | PrimOp::Neg,
+            operands,
+        ) => operands.iter().any(|&v| matches!(f.value_repr(v), Repr::I64)),
         // Everything else is a pure function of its operands.
         _ => false,
     }
@@ -114,16 +131,34 @@ mod tests {
     }
 
     #[test]
-    fn arithmetic_is_pure_io_is_not() {
+    fn io_is_effectful_and_reaches_its_callers() {
         let e = analyze_src(
             "@native(\"neon_io_println\") fn println(s: str)
-             fn double(x: i64) -> i64 { x + x }
              fn shout(s: str) { println(s); }
              fn calls_io(s: str) { shout(s); }",
         );
-        assert_eq!(e.get("double"), Some(&true), "arithmetic is pure");
         assert_eq!(e.get("shout"), Some(&false), "calls io -> effectful");
         assert_eq!(e.get("calls_io"), Some(&false), "reaches io transitively");
+    }
+
+    /// `i64` arithmetic traps -- on overflow, and on division by zero -- so a function
+    /// doing it is effectful and a call to it may not be deleted for having an unused
+    /// result. `f64` follows IEEE and produces an infinity or a NaN instead of trapping,
+    /// so it stays pure and stays eliminable.
+    ///
+    /// The distinction is worth the operand check. Calling all arithmetic effectful would
+    /// make almost every function effectful and leave dead-code elimination with nothing
+    /// to remove; calling it all pure deleted `1 / 0`.
+    #[test]
+    fn i64_arithmetic_traps_and_f64_does_not() {
+        let e = analyze_src(
+            "fn double(x: i64) -> i64 { x + x }
+             fn scale(x: f64) -> f64 { x * 2.0 }
+             fn compare(a: i64, b: i64) -> bool { a < b }",
+        );
+        assert_eq!(e.get("double"), Some(&false), "i64 `+` can overflow-trap");
+        assert_eq!(e.get("scale"), Some(&true), "f64 arithmetic cannot trap");
+        assert_eq!(e.get("compare"), Some(&true), "a comparison cannot trap");
     }
 
     #[test]

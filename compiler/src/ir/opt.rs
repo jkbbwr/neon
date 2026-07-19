@@ -156,14 +156,29 @@ fn dead_code(
     pure_natives: &HashSet<String>,
 ) -> bool {
     let used = used_values(f);
+
+    // Decide first, then mutate. The effect test reads operand reprs out of `f` — an i64
+    // `+` can trap where the f64 one cannot — and `retain` holds a mutable borrow, so the
+    // two cannot overlap.
+    let keep: Vec<Vec<bool>> = f
+        .blocks
+        .iter()
+        .map(|b| {
+            b.insts
+                .iter()
+                .map(|inst| {
+                    let dead = inst.result.is_some_and(|v| !used.contains(&v));
+                    !(dead && !effects::op_is_effectful(f, &inst.op, pure, pure_natives))
+                })
+                .collect()
+        })
+        .collect();
+
     let mut changed = false;
-    for b in &mut f.blocks {
+    for (b, keep) in f.blocks.iter_mut().zip(keep) {
         let before = b.insts.len();
-        b.insts.retain(|inst| {
-            let dead = inst.result.is_some_and(|v| !used.contains(&v));
-            let removable = dead && !effects::op_is_effectful(&inst.op, pure, pure_natives);
-            !removable
-        });
+        let mut keep = keep.into_iter();
+        b.insts.retain(|_| keep.next().unwrap_or(true));
         changed |= b.insts.len() != before;
     }
     changed

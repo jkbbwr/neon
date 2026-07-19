@@ -63,6 +63,7 @@ collections/list_generics_are_covariant.neon
 collections/list_get_nullable_element_type.neon
 collections/list_get_out_of_range_throws.neon
 collections/list_index_negative_traps.neon
+collections/discarded_index_still_traps.neon
 collections/list_index_out_of_bounds_traps.neon
 collections/list_iteration.neon
 collections/list_push_does_not_mutate_base.neon
@@ -232,13 +233,19 @@ types/atom_not_in_union_rejected.neon
 types/atom_singleton_type.neon
 types/atom_union.neon
 types/atom_union_mixed_with_other_types.neon
+types/erased_recursive_record_is_released.neon
 types/erased_recursive_record_keeps_its_name.neon
+types/erased_recursive_record_shares_its_payload.neon
+types/erased_runtime_type_keeps_its_name.neon
 types/generic_record_covariant.neon
 types/generics_are_covariant.neon
 types/intersection_flattens.neon
 types/intersection_requires_every_operand.neon
 types/is_against_a_type_outside_the_union.neon
 types/is_narrows_the_binding.neon
+types/list_literal_erased_into_any.neon
+types/list_literal_erased_into_any_recovered.neon
+types/str_list_literal_erased_into_any.neon
 types/missing_field_non_nullable_rejected.neon
 types/missing_field_satisfies_nullable_field.neon
 types/mu_type_in_arrow_parameter.neon
