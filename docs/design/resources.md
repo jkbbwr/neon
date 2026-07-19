@@ -1,8 +1,13 @@
 # Design: resources and cleanup
 
-Status: **designed, not implemented** (2026-07-19). Nothing below exists in the compiler
-yet; `std::fs`'s `File` is currently a compiler-known name in `record_repr`, which this
-replaces.
+Status: **implemented** (2026-07-19). `std::resource` is a real stdlib module,
+`std::fs` is built on it, and `tests/lang/resources/` pins the behaviour.
+
+This file is the *argument*. The module's own header
+(`stdlib/std/resource.neon`) is the current, deliberately-written reference for the
+API and is not repeated here; `docs/decisions.md` §"Cleanup is a value, not a keyword"
+records the decision. Read those for what it does. Read this for why the shape is what
+it is.
 
 ## The problem
 
@@ -46,43 +51,69 @@ transactions, one-shot tokens. A file handle is not one of those.
 
 ## The type
 
-    // std/resource.neon
-    @runtime("neon_resource")
-    opaque record Resource[T, E] {}
+    // stdlib/std/resource.neon
+    @runtime("neon_resource") opaque record Resource[T, E] {}
 
-A refcounted runtime object holding a payload, a cleanup function, and an armed flag.
+A refcounted runtime object holding a payload, a cleanup closure, and an armed flag
+(`runtime/include/neon/resource.h`).
 
 It is a **library type in a stdlib module**, not a language construct: `@runtime` is the
-only thing the compiler contributes, and it *replaces* the hardcoded name table in
-`record_repr` rather than adding to it. `List` and `Map` carry the same annotation, so the
-special-case count goes from three to zero and `File` stops being magic. `@runtime` is
-stdlib-only, like markers — it names a C type the backend must know.
+only thing the compiler contributes. That annotation replaces what used to be a literal
+string match on `"File"` in `ir/repr.rs::record_repr`, and the annotation is now what
+produces `Repr::Runtime { nominal, c_type, args }`. One caveat against the original claim
+that "the special-case count goes from three to zero": `List` and `Map` are **still their
+own `Repr` variants**, because their element reprs feed witness emission and so move
+separately (`ir/repr.rs`, `Repr::Runtime` doc comment; `TODO.md` item 17 tracks the rest of
+the untangling, including getting them out of the prelude). `File` did stop being magic.
+`@runtime` is stdlib-only, like markers; see `docs/design/annotations.md`.
 
-Two rejected shapes, for the record:
+Two rejected shapes, for the record — with the first one revisited, because the shipped
+design is closer to it than the original argument admitted:
 
 - **`resource record File { fd: i64 }`** — a declaration modifier. Forced and correct, but
   a modifier that silently changes a type's representation is too large a consequence to
   hang on a keyword the reader may not know.
-- **A guard *field*** (`record File { fd: i64, guard: Resource }`). Natural field access and
-  no wrapper, but the payload stays reachable independently, so use-after-close is silent —
-  and nothing forces the guard to be there at all. It prevents leaking without preventing
-  use-after-release, which is half the value.
+- **A guard *field*** (`record File { fd: i64, guard: Resource }`). Rejected because the
+  payload stays reachable independently, so use-after-close is silent, and nothing forces
+  the guard to be there.
+
+  **What shipped is a guard field** — `opaque record File { r: Resource[i64, IoError] }` —
+  and the objection is answered not by opacity but by *deleting the payload field*. The fd
+  lives inside the resource and comes back only through `get`, which checks the flag. There
+  is no second route to it, so there is nothing to use after close. Opacity is a second
+  fence, not the argument.
+
+  Opacity is now genuinely enforced (three routes closed: field read, literal, destructuring
+  — `tests/lang/records/opaque_hides_its_contents.neon`) and module-path forgery is refused
+  (`tests/lang/types/a_module_path_may_not_be_forged.neon`). But **it does not hold in
+  general**: nominal identity is a bare name, so a second module declaring `record File`
+  declares the *same type* and can build one. See `TODO.md` item 1, which names
+  `std::fs`'s guard explicitly. The fence the shipped `File` leans on is the missing field,
+  which survives that bug; the `opaque` marking does not.
 
 ## API
 
-    fn new[T, E](payload: T, cleanup: (T) throws E -> ()) -> Resource[T, E]
+As shipped (`stdlib/std/resource.neon`):
+
+    fn new[T, E](payload: T, cleanup: (T) throws E -> null) -> Resource[T, E]
     fn get[T, E](r: Resource[T, E]) throws ReleasedError -> T
-    fn release[T, E](r: Resource[T, E]) throws E
+    fn release[T, E](r: Resource[T, E]) throws E -> null
     fn take[T, E](r: Resource[T, E]) -> T | null
     fn is_live[T, E](r: Resource[T, E]) -> bool
+    fn using[T, E, R](r: Resource[T, E], body: (T) -> R) throws E | ReleasedError -> R
 
-`E` is the error the cleanup may throw, carried on the arrow type (`(T) throws E -> ()`,
-the shape `types/arrow_type_throws.neon` pins). Encoding it as `throws` rather than a
-returned union buys three things:
+Cleanup is `(T) throws E -> null`. **`()` is not a type in this language** — the unit type
+is `null`, and earlier drafts of this file wrote `()`, which cost an implementer real time.
+`throws E -> null` is the shape `tests/lang/types/arrow_type_throws.neon` and
+`tests/lang/closures/generic_throws_parameter.neon` pin.
+
+Encoding `E` as `throws` rather than a returned union buys three things:
 
 - `release` composes with `try`/`catch` like anything else that fails.
 - Infallible cleanup is `Resource[T, never]`, whose `release` throws `never`, so the caller
-  needs no `try` at all. A returned `E | ()` cannot express that.
+  needs no `try` at all. A returned `E | null` cannot express that. `never` is writable in
+  source as of 2026-07-19 precisely for this case —
+  `tests/lang/types/never_is_writable.neon` writes the annotation and calls `release` bare.
 - **Double release needs no sentinel and no cached result.** `release` disarms first; if it
   was already disarmed there is nothing to run and it returns normally. Idempotence falls
   out of the encoding instead of being engineered.
@@ -93,27 +124,42 @@ borrowck) nor Swift (which does not prevent it) offers here, and it costs one fl
 operations that were about to make a syscall.
 
 `release` is an ordinary Neon function, not a native: a native cannot build the tagged
-result a throwing function returns. It calls two small natives — disarm-and-take, and
-fetch-the-cleanup — and does the calling itself, so `throws` works normally. Less C, not
-more.
+result a throwing function returns. It calls two small natives — `raw::disarm` and
+`raw::cleanup` — and does the calling itself, so `throws` works normally. Less C, not more.
+
+`take` disarms and hands the payload out *without* running cleanup, so the caller takes
+responsibility for it. On the drop path the payload is moved out and the source slot
+zeroed, so the release in `neon_resource_finish` cannot reach bytes whose ownership has
+already gone — a scalar payload hides that bug and a `str` payload turns it into a
+use-after-free, which is why `tests/lang/resources/resource_with_refcounted_payload.neon`
+exists.
 
 ## Shape for `std::fs`
 
-    opaque record File { r: Resource[i64, IoError] }
+    opaque record File { r: resource::Resource[i64, IoError] }
+
+Shipped, and the runtime's hand-written `neon_file` is gone: `runtime/src/file.c` now holds
+only the `neon_io_*` natives, and the handle is a resource like any other.
 
 `File` *holds* a resource rather than being a newtype over one: a newtype costs an
 `as Resource[i64, IoError]` cast in every accessor, and holding one composes if something
 ever needs two. `File` stays an ordinary inline record whose single field is refcounted, so
 copying it retains, and `Resource` never appears in a user-facing type.
 
-    fn close(f: File) throws IoError {
-        try resource::release(f.r)
+    fn close(f: File) throws IoError -> null {
+        try resource::release(f.r);
+        null
     }
 
-    fn read_all(f: File) throws IoError -> str {
-        let fd = try resource::get(f.r)      // throws if already closed
-        ...
+    fn fd_of(f: File) throws IoError -> i64 {
+        try resource::get(f.r) catch (e) {
+            throw IoError { message: "this file is already closed" }
+        }
     }
+
+`fd_of` translating `ReleasedError` into `IoError` is the reason `Resource` stays out of
+`std::fs`'s public error types. `tests/lang/collections/iolist_and_files.neon` runs the
+whole path end to end.
 
 ## When cleanup runs
 
@@ -126,6 +172,12 @@ copying it retains, and `Resource` never appears in a user-facing type.
 | reachable only through a cycle | yes, but when the collector runs — **not prompt** |
 | `neon_trap` / `_exit` | **no** — no unwinding, by design |
 
+`tests/lang/resources/resource_cleanup_runs_at_last_use.neon` pins the first row, including
+the part that surprises: cleanup prints *before* the line after the construction, because
+the last use is the construction. It also pins an optimiser property — constructing a
+resource looks pure, so DCE would delete it and the cleanup with it if the native did not
+count as effectful. `neon_resource_new` deliberately carries no `@pure`.
+
 Two rules worth stating outright, because both surprise:
 
 **Only the explicit path can observe failure.** Drop has no error channel, so automatic
@@ -137,20 +189,22 @@ close error is genuinely awkward.
 gives LIFO; last-use ARC gives "whenever each one's last use was", which can interleave. If
 two resources must be torn down in order, one has to hold the other.
 
-## What the compiler owes
+## What the compiler contributes
 
-- `@runtime` on a record → a runtime-pointer repr, replacing the name table in
-  `record_repr`.
-- `resource::new` is a codegen-assisted native (it needs `T`'s value-witness for the
-  payload), in the same category as `neon_list_new`.
-- A **monomorphic cleanup adapter** per instantiation, with the fixed signature
-  `void(neon_header*, void*)`, so the runtime can call cleanup blind. The adapter knows `T`
-  and `E`; it loads the payload, calls the closure, inspects the tagged result and
-  **releases the error rather than propagating it**. Forgetting that release leaks on the
-  *automatic* path only — invisible to the explicit path, which is exactly the shape of bug
-  that ships. `emit_thunks` is the precedent.
-- `get` uses the native out-parameter convention (`-> (bool, T)` compiling to
-  `bool f(neon_resource*, void* out)`), which landed 2026-07-19.
+- `@runtime` on a record → `Repr::Runtime`, replacing the name table in `record_repr`.
+  `expand.rs::Runtime` rejects it on anything but a record and rejects a record with fields:
+  the C type owns the layout, so a field here would describe one it does not have.
+- `raw::new` is a codegen-assisted native (it needs `T`'s value-witness for the payload),
+  in the same category as `neon_list_new`.
+- A **monomorphic cleanup drop** per instantiation, reached through `header.drop` rather
+  than a field of its own — `neon_alloc` already takes a per-object drop and one
+  indirection is enough. The emitted drop knows `T` and `E`; it takes the payload if still
+  armed, calls the closure, inspects the tagged result and **releases the error rather than
+  propagating it**, then calls the shared `neon_resource_finish`. Forgetting that release
+  leaks on the *automatic* path only — invisible to the explicit path, which is exactly the
+  shape of bug that ships.
+- `raw::get` and `raw::disarm` use the native out-parameter convention (`-> (bool, T)`
+  compiling to `bool f(neon_resource*, void* out)`).
 
 ## Resurrection
 
@@ -163,50 +217,59 @@ independent reasons:
   count never reached zero.
 - There is nowhere to put it. The closure is constructed *before* the resource exists, so
   it cannot capture it; captures are by value and sealed
-  (`closures/capture_is_by_value_and_sealed.neon`); records are immutable; there are no
-  mutable globals; and cleanup's return value is discarded on the drop path.
+  (`tests/lang/closures/capture_is_by_value_and_sealed.neon`); records are immutable; there
+  are no mutable globals; and cleanup's return value is discarded on the drop path.
 
-Immutability closes the hole that makes resurrection a real hazard in Rust and Swift. The
-drop should still assert `rc == 0` afterwards: one comparison on a path that just made a
-syscall, and it fails loudly if the language ever grows mutable shared state.
+Immutability closes the hole that makes resurrection a real hazard in Rust and Swift.
+
+*Undocumented:* this file previously asked for an `rc == 0` assertion after the drop. No
+such assertion is in `runtime/src/resource.c` today and nothing records whether it was
+considered and dropped or simply not written.
 
 ## Scope-lifetime resources: `using`
 
 A lock guard's last use is the `lock` call itself, so under last-use ARC it releases *before*
-the section it was meant to protect. The fix needs no language change -- only a function that
-touches the resource on the far side of the body:
+the section it was meant to protect. The fix needs no language change — only a function that
+touches the resource on the far side of the body. Shipped, in `std::resource`:
 
-    fn using[T, E, R](r: Resource[T, E], body: (T) -> R) throws E -> R {
-        let out = body(try get(r))
-        try release(r)                  // <- the last use of `r` is HERE
+    fn using[T, E, R](r: Resource[T, E], body: (T) -> R) throws E | ReleasedError -> R {
+        let payload = try get(r);
+        let out = body(payload);
+        try release(r);                 // <- the last use of `r` is HERE
         out
     }
 
-    using(lock::new(m), (l) => {
-        // the lock is held for exactly this region
-    })
+Two differences from the original sketch, both consequences of `get` being fallible: the
+clause is `throws E | ReleasedError`, not `throws E`, and the payload is fetched once up
+front rather than inside the call. `body` is `(T) -> R` — it does not throw, so a throwing
+body needs its own `try` inside the lambda.
 
 Because `r` is used *after* `body(...)` returns, the refcount pass must keep it alive across
 the whole call. That is the entire trick: the combinator owns a region, and the region is
 visible as a lambda rather than implied by a brace.
 
 The failure path is right for free. If `body` throws, `release` never runs explicitly, but
-ARC releases `r` on the throwing edge and cleanup fires anyway -- so the normal path observes
+ARC releases `r` on the throwing edge and cleanup fires anyway — so the normal path observes
 the cleanup error and the throwing path still cleans up silently, which is the two-path rule
 already stated above.
 
 This is deliberately **not** `defer`: nothing is registered and nothing is deferred. The cost
-is the ordinary one for a scope combinator -- the body is a lambda, so control flow cannot
-cross it. See the `return` note below, which makes that worse than it should be.
+is the ordinary one for a scope combinator — the body is a lambda, so control flow cannot
+cross it.
+
+*No corpus file exercises `using`.* It type-checks and is written against shipped
+primitives, but nothing in `tests/lang/resources/` calls it, so it is unproven at runtime.
 
 ## Open
 
-- **Prerequisite: throwing closures.** Cleanup is specified as `(T) throws E -> ()`, and no
-  value of that type can currently be built — a lambda cannot throw and a named throwing
-  function cannot be used as a value, so throwing arrow types are uninhabited. Until that is
-  fixed only `Resource[T, never]` is constructible, which means `release` cannot report a
-  failure and `fs::close` cannot surface a close error — the whole point of the explicit
-  path. See `docs/finalpush.md` for the attempt that was made and reverted, and why.
 - **Cycles.** A resource reachable only through a cycle closes when the collector runs.
   Every other path here is deterministic; this one is not, and it is the single guarantee
   this design cannot make.
+- **Opacity is not identity.** See `TODO.md` item 1. The shipped `File` does not depend on
+  it (there is no payload field to reach), but any *other* resource wrapper that keeps a
+  payload alongside its guard would.
+
+Throwing closures — listed here for months as the unmet prerequisite — landed. A lambda can
+throw (`tests/lang/closures/throwing_lambda.neon`), a named throwing function is usable as a
+value (`throwing_fn_as_value.neon`), and a throwing arrow survives a generic slot
+(`generic_throws_parameter.neon`), which is what `resource::new` needs.

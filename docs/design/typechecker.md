@@ -1,6 +1,17 @@
 # Design: the type checker
 
-**Status:** proposed. Nothing built yet.
+**Status:** built. `compiler/src/typecheck/` is the implementation; this file is the
+argument for its shape, and the record of where the shape and the code disagree.
+
+Two rules for reading it:
+
+- The **module docs are more current than this file** and are not duplicated here. Where
+  a section says "see `types.rs`", read `types.rs` — a second copy is a second thing to
+  drift.
+- Anything marked **Does not hold** is a property this document once asserted and the
+  code does not have. It is left in, marked, because the failure mode this project spent
+  a day chasing was exactly the other choice: prose asserting a property that had stopped
+  being true, and readers trusting it. Open items have a number into `TODO.md`.
 
 ## The bet
 
@@ -17,347 +28,450 @@ It is a real bet. It buys `T | null` with no Option, `{name: str}` structural pa
 that nominal records satisfy, exhaustiveness that falls out of `s ∧ ¬covered = ∅`, and
 `:ok | :err` unions. It costs a decision procedure that is genuinely subtle.
 
-## v1 scope
+The four features that had to be in from the start, because each is load-bearing and
+retrofitting any of them means rewriting the decision procedure: arrows with contravariant
+parameters, full negation, μ-types, and atom singletons. All four are in.
 
-All four of these, because each one is load-bearing and adding them later means
-rewriting the decision procedure:
+## Why it is one BDD per kind
 
-- **Arrows** (`(A) -> B`), with contravariant parameters. Closures and protocol methods
-  need them on day one.
-- **Full negation** (`!T`). Negation is what makes emptiness the whole game; without it
-  subtyping could be a structural walk.
-- **μ-types**, which need coinduction.
-- **Atom singletons** (`:ok` as a type), which interact with exhaustiveness.
+Worth stating because it dictates everything else.
 
-## What the previous implementation got wrong, structurally
+The previous implementation put **every kind of atom in one BDD** — primitives, records,
+arrows, tuples, type variables. The consequence was `is_path_satisfiable`: the algorithm
+carried a *path* of atom assumptions down the tree and, at every `Any` leaf, re-bucketed
+that whole path by kind to decide satisfiability. Two things follow:
 
-Worth stating because it dictates the design.
+1. **It cannot memoise.** Its own comment said so. That is why the checker was exponential.
+2. **It cannot do recursion.** Deciding `mu type A = :ok | List[A]` requires assuming a
+   recursive query and looking for a contradiction; there was nowhere to put the assumption.
 
-It put **every kind of atom in one BDD** — primitives, records, arrows, tuples, type
-variables. The consequence is `is_path_satisfiable`: the algorithm carries a *path* of
-atom assumptions down the tree and, at every `Any` leaf, re-buckets that whole path by
-kind to decide satisfiability. Two things follow:
+Both are one root cause: mixing kinds forces path-sensitivity, path-sensitivity forbids
+memoisation, and without memoisation there is no fixpoint to be coinductive about.
 
-1. **It cannot memoise.** Its own comment says so: *"We intentionally do NOT memoize
-   results here. The is_any() terminal's result is path-sensitive."* That is true of that
-   algorithm, and it is why the checker is exponential.
-2. **It cannot do recursion.** There is no coinduction in `is_empty` at all. Deciding
-   `mu type A = :ok | List[A]` requires assuming a recursive query and checking for
-   contradiction; there is nowhere to put the assumption.
+So a type is not one BDD. It is `TyData` (`types.rs`), one field per kind:
 
-Both are the same root cause: mixing kinds forces path-sensitivity, and path-sensitivity
-forbids memoisation, and without memoisation there is no fixpoint to be coinductive about.
-
-## The design
-
-### 1. Separate by kind
-
-A type is not one BDD. It is a **descriptor** with one field per kind, each a BDD over
-only that kind's atoms:
-
-    struct Descriptor {
-        base:    BaseSet,        // i64, str, bool, f64, null, ... — a bitmask
-        atoms:   AtomSet,        // :ok, :err — a finite-or-cofinite set of names
-        records: Bdd<RecordAtom>,
-        tuples:  Bdd<TupleAtom>,
-        arrows:  Bdd<ArrowAtom>,
+    pub struct TyData {
+        pub base:    BaseSet,    // i64, f64, str, bool, null, undef — a u8 bitmask
+        pub atoms:   AtomSetId,  // :ok, :err — a finite-or-cofinite name set
+        pub vars:    AtomSetId,  // rigid type variables, same machinery as atoms
+        pub records: BddId,
+        pub tuples:  BddId,
+        pub arrows:  BddId,
     }
 
+(The old name in this document was `Descriptor`. It is `TyData`, and a `TyId` is an index
+into one arena's `Vec<TyData>`.)
+
 Union, intersection and negation are **field-wise**. Emptiness is **every field empty**,
-decided independently. An `i64` is never a record, so the kinds never interact, and no
-path has to be carried anywhere.
+decided independently. An `i64` is never a record, so the kinds never interact and no path
+has to be carried anywhere. Each kind's emptiness depends only on that kind's atoms, so it
+memoises on the node. That is the whole fix.
 
-This is the whole fix. Each kind's emptiness depends only on that kind's atoms, so it
-memoises on the node.
+`base` is a bitmask because the primitives are a fixed finite set. It carries a sixth bit,
+`B_UNDEF`, which is not a value and unwritable in source: field-wise record decomposition
+needs a total map from label to type, so "absent" has to be a member of the field lattice
+and complement has to be taken within a universe that includes it.
 
-`base` is a bitmask because the primitives are a fixed finite set. `atoms` is
-finite-or-cofinite (`{:ok, :err}` or "everything except `{:ok}`"), because atom names are
-countably infinite but any one type mentions finitely many.
+`atoms` and `vars` are finite-or-cofinite (`{:ok, :err}`, or "everything except `{:ok}`"),
+because names are countably infinite but any one type mentions finitely many. A negated
+name set is never empty, which is why `empty.rs` can treat a non-empty atom component as
+proof of inhabitation without looking at the names.
 
-### 2. Emptiness, per kind
+### Emptiness, per kind
+
+`empty.rs`, and its module doc is the current statement.
 
 - **base**: mask == 0.
-- **atoms**: the set is empty (or, if cofinite, never — its complement is finite).
-- **records / tuples**: collect the BDD path's positive and negative atoms, then decompose
-  field-wise. `⋀ᵢ{ℓ: tᵢ} ∧ ⋀ⱼ¬{ℓ: sⱼ}` is empty iff for every way of assigning each
-  negative to a field it must differ on, some field's intersection is empty.
+- **atoms / vars**: the set is empty, i.e. positive with no names.
+- **records / tuples**: per BDD cube, meet the positives componentwise, then ask whether
+  the negatives cover the result. Escaping a negative means differing on *some* component,
+  and the choice has to be searched.
 - **arrows**: the hard one.
 
       ⋀_{i∈P}(sᵢ→tᵢ)  ≤  (s→t)
       iff  ∀ P' ⊆ P:  s ≤ ⋁_{i∈P'} sᵢ   or   ⋀_{i∈P∖P'} tᵢ ≤ t
 
   Exponential in the number of positive arrows in one intersection, which in real programs
-  is one or two. Cite: Frisch, Castagna, Benzaken, *Semantic subtyping* (JACM 2008), §4.
+  is one or two. Frisch, Castagna, Benzaken, *Semantic subtyping* (JACM 2008), §4.
 
-### 3. Recursion is coinductive
+### Recursion is coinductive
 
-`mu type A = :ok | List[A]` becomes a `TypeRef` atom plus a side table — never inlined, so
-the atom's identity does not depend on the declaration being resolved yet. This is
-**equi-recursive**: `A` and its unfolding are the same type. No fold/unfold, no tag, no
-allocation.
+A recursive type is built by reserving an id before its body exists (`reserve`/`define`),
+so the body can name it and the graph simply has a cycle. Equi-recursive: `A` and its
+unfolding are the same type. No fold/unfold, no tag, no allocation.
 
-Emptiness carries an **assumption set**. On re-entering a query already in progress,
-return "empty" and continue. If the derivation completes without contradiction, the
-assumption was consistent and the type really is empty. That is the standard treatment:
-assume the goal, look for a contradiction.
+Emptiness carries an **assumption set**. Re-entering a query already in progress returns
+"empty" and continues; if the derivation completes without contradiction the assumption was
+consistent. What makes that sound rather than wishful is `Solver::tainted`: a result reached
+under an assumption never enters the memo, so an answer true only relative to a guess cannot
+be replayed as unconditional. **Contractivity is what makes it terminate**, and it is
+checked at the declaration (`env.rs`), not here.
 
-**Contractivity is what makes this terminate**, and it is checked at the declaration, not
-here — every recursive occurrence must sit beneath a constructor, so unfolding always
-makes progress. The rules (covariant positions only, no recursion beneath negation, no
-mutual recursion in v1) are in `decisions.md`.
+The cycle also has to be survived by everything else that walks a type. `Types::substitute`
+did not: `record Node { next: Node | null }` passed to any generic function walked the graph
+as a tree and overflowed the compiler's stack. It now carries its own guard (`Progress`, in
+`types.rs`) that reserves an id on re-entry and closes the cycle, plus a memo so a shared
+subtype is rebuilt once. The same fix also stopped it losing the *cofinite* variable
+component: `σ(any)` had not been `any`.
 
-### 4. Hash-consing
+### Hash-consing
 
-Descriptors are interned; equality is an id comparison. This is what makes the memo
-tables work at all, and it is why the emptiness cache can key on `(node, node)` rather
-than on a structural hash.
+Names, atom sets, `TyData` and the three shape atoms are all interned. Equal ids denote
+equal sets — but **not conversely**: a type reached through a μ unfolding or a deferred
+boolean op can be a second id for the same set. So `==` on `TyId` is a fast path, and the
+real question is `Solver::is_equiv`, which is `is_subtype` both ways.
 
-### 5. Nominal records satisfy structural types
+## Nominal types have no machinery of their own
 
-Decided. A `NominalRecord` atom carries its name and generic args; the side table holds
-its fields. When a nominal is checked against a structural type, it **expands** to its
-field shape. Nominal-vs-nominal stays a name comparison — `Red {}` and `Green {}` are
-distinct despite sharing a shape.
+A nominal record is an **ordinary record** carrying a reserved `#nominal` field whose type
+is the atom of its name; generic arguments ride along as `#0`, `#1`, .... `#` is not an
+identifier character, so those labels cannot collide with source.
 
-`opaque` is module-scoped, so expansion is only permitted where the fields are visible.
-The same query can legitimately answer differently in two modules.
+The payoff: nominal disjointness, nominal-satisfies-structural and generic covariance are
+not three rules to keep consistent. They are all the field-wise record decomposition, which
+was going to be written anyway.
 
-### 6. There is no `Erased`, and no way to write one
+**Does not hold — nominal identity is a bare name.** `env.rs::record_body` interns
+`t.name(&r.name)`, the bare identifier, so two modules each declaring `record Secret`
+declare the **same type**. Every claim about nominal distinctness is scoped to *one*
+name, not to a declaration. `TODO.md` §1 has the repro and the reason it is not a local
+fix (`dispatch::nominal_head` reads the name back bare, `ordered.rs` matches literal
+`"List"`/`"Map"`). Pinned, deliberately unlisted, as
+`tests/lang/types/a_nominal_name_is_not_a_module_identity.neon`.
 
-`any` is **⊤** — the type inhabited by every value. It is not an erasure marker, and the
-type language has no way to say "I do not know".
+**Does not hold — emptiness is not module-relative.** This document used to say `opaque`
+made expansion module-scoped, so the same query could legitimately answer differently in
+two modules. It does not. There is one global arena with no notion of a module, and
+`opaque` is enforced entirely as an *access check* in `check.rs`
+(`check_opaque_name` / `check_opaque_path` / `opacity_permits`): reading a field, building
+a literal, updating via spread and destructuring are rejected outside the declaring
+module, its descendants and its immediate parent.
+
+That is a simpler design than the one described, and it is worth having stated, because
+it has a consequence nobody wrote down: a **structural annotation walks around it.**
+Verified 2026-07-19:
+
+    internal mod vault { opaque record Secret { code: i64 } ... }
+    fn peek(s: { code: i64 }) -> i64 { s.code }   // accepted, prints 7
+
+`opaque` guards the *name*, not the shape. Undocumented, and not obviously either wrong or
+intended — a set-theoretic system says an opaque record genuinely *is* a `{code: i64}`, so
+the alternative is a real design decision rather than a bug fix.
+
+## There is no `Erased`, and no way to write one
+
+`any` is **⊤** — inhabited by every value. It is not an erasure marker, and the type
+language has no way to say "I do not know".
 
 The previous implementation conflated the two: `any` parsed to `TypeSpecKind::Erased`,
-which became `Type::Erased`. Once "the top type" and "I could not work it out" are the
-same value, every unknown silently becomes `any` — and ~70 of its ~108 `Erased`
-constructions were exactly that, a fallback rather than a decision.
+which became `Type::Erased`. Once "the top type" and "I could not work it out" are the same
+value, every unknown silently becomes `any`, and ~70 of its ~108 `Erased` constructions were
+exactly that — a fallback rather than a decision. There is no `Erased` anywhere in
+`compiler/src` today; the only remaining occurrences are these post-mortems.
 
-Structurally, here:
+Structurally: `TyData` has no `Erased` variant, `any` is every kind full, and when the
+checker cannot determine a type it **emits a diagnostic**. There is nothing to fall back
+*to*, so no fallback can be written.
 
-- `Descriptor` has **no `Erased` variant**. `any` is every kind full. There is nothing to
-  fall back *to*, so no fallback can be written.
-- When the checker cannot determine a type, it **emits a diagnostic**. It does not return
-  a type, because there is no type meaning "unknown" to return.
-- Erasure is a **lowering** concern, not a typing one. A value of type ⊤ needs a uniform
-  runtime representation; that is a consequence of ⊤, not its meaning, and it is decided
-  in codegen. The checker never mentions it.
+Erasure is a **lowering** concern. A value of ⊤ needs a uniform runtime representation;
+that is a consequence of ⊤, not its meaning, and it is decided in `ir/repr.rs`. Whether
+`any` should be allowed to *hold* a container at all is still open — `let a: any = [1,2,3]`
+works today, and the answer also decides `List[any]` and `Map[str, any]` (`TODO.md` §14).
 
-  This is a deferral, not a solution, and it carries an **obligation**: lowering must define
-  a *total* map from `Descriptor` to representation. `i64 | str` has no layout until
-  something picks one. Boxing a known union is a legitimate answer; the old disaster was not
-  boxing per se, it was boxing because the type was *unknown*. Keeping the checker's answers
-  (below) means lowering is never in that position — but if the repr map has a hole, codegen
-  will grow a fallback to fill it, and `*_Any` is exactly what that fallback looks like.
-  **This map is undesigned and is the next design pass.**
+### The poison is a rigid variable, not a variant
 
-There is one poison, and it is not erasure:
+    Env::error_ty()      // a rigid variable named `#error`
 
-    Descriptor::Error   // recovery only
+Recovery only. It is produced **only** where a diagnostic has already been emitted, and
+callers check `Env::is_error` before complaining, so one bad expression yields one error
+rather than twenty and checking continues through the rest of the file.
 
-It exists so one bad expression does not produce a cascade of downstream complaints, it is
-produced **only** where a diagnostic has already been emitted, and it **cannot reach
-lowering** — a failed typecheck does not lower. It is a diagnostics device, not a type.
-`Error` is not ⊤ and not ⊥: it satisfies nothing and is satisfied by nothing, so it cannot
-silently make a constraint pass. (Typing an error expression `never` would be worse than
-useless: `never <: T` for every `T`, so every downstream check would vacuously succeed.)
+It is a variable under a name source cannot write, so it is disjoint from every nameable
+type: `error <: T` and `T <: error` are both false. It is *not* outside the lattice —
+`error <: any` still holds — so the force of the poison is `is_error`, not the subtype
+relation. Typing an error expression `never` would be actively worse: `never <: T` for
+every `T`, so every downstream check would vacuously succeed and the cascade would be
+silent instead of noisy.
 
-A test asserts that no `Descriptor::Error` survives a successful check, and that the only
-route to ⊤ is a user writing `any`.
+Poison never reaches lowering, because a failed check does not lower.
 
-### 7. Type variables, generics, and constructors
+**Weaker than documented.** This file used to claim a test asserts no poison survives a
+successful check and that the only route to ⊤ is a written `any`. The guards that exist
+are `compiler/tests/ir_lower.rs`'s `no_type_variable_survives_lowering` and
+`any_never_appears_unless_the_source_type_is_any`, and `TODO.md` §10 records that both are
+aimed at a program the pipeline never builds: they lower with `libs = &[]`, use a different
+entry point than `cli/src/frontend.rs`, and scan only `f.values()`. Rebuilt correctly the
+answer is still 0, so this is latent rather than live — but the assertion is not currently
+carrying the weight the paragraph above puts on it.
 
-`fn f[T](x: T) -> T` must be checked **once, with `T` opaque** — not only at call sites,
-or a generic body's errors surface at every caller instead of at the definition. So the
-descriptor needs a `TypeVar` atom, and `protocol Container for C[_]` needs a
-type-constructor application atom (`C[T]` where `C` is itself a variable).
+## Type variables and generics
 
-Variables are atoms like any other; a bound `where T: Display` is a constraint checked at
-the instantiation, not a bound baked into the atom. Generic arguments are **covariant**
-(`decisions.md`) — sound because collections are values.
+`fn f[T](x: T) -> T` is checked **once, with `T` opaque** — not only at call sites, or a
+generic body's errors surface at every caller instead of at the definition. `vars` is that
+opacity: a rigid variable is a singleton disjoint from everything, using the same
+finite-or-cofinite machinery as atoms rather than a sixth BDD.
 
-Full polymorphic set-theoretic types (Castagna's later work: type variables under
-union/intersection/negation, with a semantic notion of instantiation) are a non-goal. v1
-generics are parametric, checked with opaque variables, and monomorphised per call site.
+A bound (`where T: Display`) is a constraint checked at the instantiation, not baked into
+the atom. Generic arguments are **covariant** (`../decisions.md`) — sound because
+collections are values. Inference is structural matching (`generic.rs`), not Castagna's
+subtype inference: a variable binds to the first concrete type it meets and stays there, so
+`push(xs: List[i64], "s")` is a mismatch rather than a silent widening. Widening is
+explicit — a turbofish, or the expected type applied first.
 
-### 8. Arrows carry their error type
+Full polymorphic set-theoretic types (Castagna & Xu 2011: variables under
+union/intersection/negation with a semantic notion of instantiation) are a non-goal.
+Generics here are parametric, checked with opaque variables, and monomorphised per call
+site.
 
-    ArrowAtom { params: Vec<Ty>, ret: Ty, throws: Ty }
+**Open:** the solver is first-wins and returns what it managed; `direct_call` substitutes
+without checking coverage, so an unsolved parameter reaches codegen as an ICE
+(`TODO.md` §5).
+
+## Arrows carry their error type
+
+    ArrowAtom { params: Vec<TyId>, throws: TyId, ret: TyId }
 
 `throws` is covariant, like the return: a function that throws less can stand where one
-that throws more is expected. `main` is `() throws Error -> ()` and its signature is fixed
-(`decisions.md`).
+throwing more is expected.
 
-### 9. Bidirectional: `expected` flows down
+**`never` is the sound default for an absent `throws`.** A function that throws nothing has
+`never` there, and that has to be the resolution of a missing clause. The tempting
+alternative — ⊤ — both erases the error path and, because everything is a subtype of ⊤,
+switches off the check that a thrown value is an error at all. `main`'s implicit channel is
+not a type for the same reason: it is a *rule* (`Throws::ImplicitError` in `check.rs`),
+whatever escapes must implement `Error`, checked per throw site.
+
+## Bidirectional: `expected` flows down
 
 Not a nicety — the system does not work without it.
 
     let nested: Json = [[1.0], ["a"]]
 
-Bottom-up, the inner literals are `List[f64]` and `List[str]`. Only the *expected* type
-tells them they are `List[Json]`. Covariance makes that a subtype question rather than an
-equality one, but the expected type still has to reach the literal for there to be a
-question at all. The same mechanism decides which of `u8`/`i64` a bare `1` is, and is why
-`let x: u8 = 999` must be rejected at the literal.
+Bottom-up the inner literals are `List[f64]` and `List[str]`. Only the *expected* type tells
+them they are `List[Json]`. Covariance makes that a subtype question rather than an equality
+one, but the expected type still has to reach the literal for there to be a question. The
+same mechanism is why `let x: u8 = 999` must be rejected at the literal.
 
-So every check is `check(expr, expected: Option<Ty>) -> Ty`, and `expected` threads through
-branches, arms, arguments and elements.
+So every check is `expr(e, expected: Option<TyId>) -> TyId`, and `expected` threads through
+branches, arms, arguments and elements. A generic direct call checks each argument
+**twice** — once while solving the type parameters, then again under the solution, which is
+what lets an expected type reach a lambda argument — and relies on `check_all`'s
+deduplication to keep that from doubling diagnostics.
 
-### 10. Narrowing
+## Narrowing, and the module that is not connected to it
 
-`match s { is Circle => ... }` refines `s` to `Circle` inside the arm; `if p != null` does
-the same for the else branch. Narrowing is a *set* operation — the arm's binding is
-`s ∧ Circle`, the fallthrough is `s ∧ ¬Circle`. It is a set of queries the checker makes
-inline, not a pass of its own.
+Narrowing is a *set* operation. `match s { is Circle => ... }` binds `s ∧ Circle` in the
+arm and leaves `s ∧ ¬Circle` for the fallthrough.
 
 Exhaustiveness falls out: the match covers `s` iff `s ∧ ¬(⋁ arms)` is empty, and the
-residual of that subtraction is a *type* naming exactly what was missed. Redundancy is the
-same query — an arm is redundant iff `arm ∧ s ∧ ¬(⋁ earlier)` is empty, which catches both
-"an earlier arm already took it" and "the subject was never that", because those are one
-fact.
+residual of that subtraction is a **type** naming exactly what was missed — which is what
+`print.rs` exists to render. Redundancy is the same query, and catches both "an earlier arm
+already took it" and "the subject was never that", because those are one fact.
 
 **The union is over the *exact* arms only, and getting this wrong makes the check
 worthless.** An arm is exact when matching it proves the value is *every* value of its
-type: `is T`, `:ok`, `null`, `_`. A literal is not. `match n { 1 => ... }` has an arm of
-type `i64`, but it matches one `i64` — count it as covering `i64` and the match reports
-exhaustive with every other integer unhandled. So an inexact arm contributes `never` to
-coverage and subtracts nothing from the fallthrough. A **guard** makes any arm inexact, for
-the same reason: it can always decline.
+type: `is T`, `:ok`, `null`, `_`. A literal is not — `match n { 1 => ... }` has an arm of
+type `i64` but matches one `i64`, and counting it as covering `i64` reports the match
+exhaustive with every other integer unhandled. An inexact arm contributes `never` to
+coverage and subtracts nothing. A **guard** makes any arm inexact, for the same reason: it
+can always decline. Atoms and `null` are exact because they are genuine singletons, which is
+the same property that makes `:ok | :err` exhaustiveness work and why `../decisions.md`
+refuses to widen an atom to its carrier type.
 
-Atoms and `null` are exact because they are genuine singletons. That is the same property
-that makes `:ok | :err` exhaustiveness work at all, and it is why `decisions.md` refuses to
-widen an atom to its carrier type.
+`bool` needs a special case on top: it is one base bit rather than `:true | :false`, so a
+`true` arm's type is the whole of `bool` and subtracting it would exhaust the type after one
+arm. The two literals are tracked by hand and `bool` is subtracted only once both have been
+seen unguarded.
 
-**An empty branch is a diagnostic, never silently-dead code** — see the rigid-variable
-section below for why that is a soundness rule and not a nicety. `narrow.rs` enforces it by
-construction: a refinement's branches are unreadable except through `classify`, which hands
-back `ThenImpossible` / `ElseImpossible` rather than an empty type a caller could bind.
+### Where this is actually implemented
 
-### 11. Protocols and dispatch
+**Does not hold — `narrow.rs`'s refinement API has zero callers** (`TODO.md` §9).
 
-The subsystem `resolved_calls` comes from. **Specified in `dispatch.md`** — see it for the
-algorithm, bounded impls, HKT subjects, and defaults.
+The module encoding the soundness argument below — `Refined` with no `then_ty` to read on
+the impossible case, `Projected` with no `never`, 52 unit tests, a long module doc — is
+only half connected. `check.rs` uses `narrow::Test`, `project_field` and `project_elem`.
+It does **not** call `narrow`, `narrow_is`, `narrow_null`, `narrow_not_null`,
+`narrow_atom`, `record_test`, `residual`, `is_exhaustive` or `redundant_arms`. Nothing
+outside `narrow.rs` mentions `Refined` except a comment.
 
-The shape that matters here: the checker records its choice, and nothing downstream
-re-resolves. This is where the previous implementation's `method_to_protocol` map was
-last-write-wins, and the fix is the same as the `expr_types` keystone — record the decision
-at the point it is made.
+What runs instead:
 
-## Rigid type variables, and the trap in them
+- `check.rs::match_expr` reimplements narrowing inline with a raw `intersect` against a
+  running `remaining` residual. It gets the *result* right, including the empty-arm
+  diagnostic and exhaustiveness, and its own doc comment explains why.
+- **`if` and `while` do not narrow at all.** `if x is str { x }` on `x: i64 | str` is a
+  diagnostic — `expected str, found i64 | str`. Verified 2026-07-19.
+- Redundant-arm reporting does not happen: `redundant_arms` is written, tested, and
+  uncalled.
 
-Inside `fn show[T](x: T)`, `T` is opaque: a singleton disjoint from every concrete type,
-represented with the same finite-or-cofinite machinery as atoms. That is what lets a
-generic body be checked once instead of per call site.
+A green suite over a disconnected module reads exactly like a green suite over a connected
+one. That is the point of the entry in `TODO.md`.
 
-It has a sharp edge, and the edge is a **soundness** issue rather than a limitation:
+### The trap: an empty branch is a diagnostic, never dead code
+
+Inside `fn show[T](x: T)`, `T` is opaque. That has a sharp edge, and it is **soundness**
+rather than a limitation:
 
     fn g(s: str) -> str { s }
     fn f[T](x: T) -> str {
         if x is i64 { g(x) } else { "no" }   // x : T ∧ i64 = never
     }
 
-`T ∧ i64` is empty, so the then-branch binds `x: never` — and `never <: str`, so `g(x)`
-typechecks **vacuously**. Then `f(5)` instantiates `T := i64`, the branch is live, and `g`
-receives an `i64`. The checker accepted a wrong program.
+`T ∧ i64` is empty, so a narrowing implementation binds `x: never` — and `never <: str`, so
+`g(x)` typechecks **vacuously**. Then `f(5)` instantiates `T := i64`, the branch is live,
+and `g` receives an `i64` through a `str` slot. This is the error-recovery trap entered by a
+different door: a type meaning "cannot happen" satisfies everything downstream, so the
+cascade is silent rather than noisy.
 
-This is the same trap the error-recovery section below describes, entered by a different
-door: a type meaning "cannot happen" satisfies everything downstream, so the cascade is
-silent rather than noisy.
+**The rule: a test the subject could never satisfy is reported, and no arm is ever handed
+an empty binding.** In `match_expr` both halves are implemented: the impossible test is a
+`Mismatch` against the *subject* (not against `remaining`, since an exhausted `remaining`
+is the ordinary trailing-`_` case), and a binding that comes out empty is replaced with
+poison rather than `never`. Pinned by
+`tests/lang/match/impossible_arm_on_a_type_parameter.neon`.
 
-**The rule: an empty branch from a narrowing is a diagnostic, never silently-dead code.**
-`x is i64` where `x: T` is rejected as "this test can never succeed". With that guardrail
-rigid variables are sound; without it they are worse than not having variables at all. The
-same applies to two distinct variables, since `T ∧ U = ∅` while `T := U := i64` is a legal
-instantiation.
+In `if`, the same program is rejected — but *incidentally*, because `if` does not narrow,
+so `x` stays `T` and `g(x)` fails on `T` not being `str`. Right answer, wrong reason; it
+will stop being the right answer the day `if` learns to narrow, which is precisely why
+that work has to go through `narrow.rs` rather than around it.
 
-So: a type parameter cannot be narrowed, **and cannot be pretended to have been narrowed
-either**. Polymorphic semantic subtyping (Castagna & Xu 2011) is the real answer and is not
-v1.
+So a type parameter cannot be narrowed, **and cannot be pretended to have been narrowed
+either.** Polymorphic semantic subtyping is the real answer and is not this version.
 
-## Error recovery
+## `as` is a reinterpretation, not a checked cast
 
-The parser recovers; so does the checker. A file with ten type errors should report ten,
-not one per compile cycle.
+`check.rs`'s `As` arm gates on one question: is `from ∧ to` inhabited, or does a newtype
+boundary bridge the two (`m as f64` for `newtype Meter = f64` is exactly what a newtype is
+for, and the two are disjoint). If not, `ImpossibleCast`.
 
-`Descriptor::Error` is the poison. It is produced **only** where a diagnostic has already
-been emitted, it satisfies nothing and is satisfied by nothing, and **any check involving
-it emits no further diagnostic**. So one bad expression yields one error rather than
-twenty, and checking continues through the rest of the function and the rest of the file.
+That is the only check. The assertion is **never discharged at runtime**. Verified
+2026-07-19: `let n: str | null = null; n as str` compiles, runs, and yields `""`.
+`(x: i64|str) as str` on an `i64` reads garbage.
 
-It is not ⊤ and not ⊥. `never` would be actively worse: `never <: T` for every `T`, so
-every downstream check would vacuously succeed and the cascade would be silent instead of
-noisy.
+The checker is arguably right not to reject these — `as` exists to assert what the checker
+cannot prove — but it is a reinterpret cast wearing a checked cast's name. Making it trap
+is a language decision with a cost on every narrowing, and it is unmade: `TODO.md` §15.
 
-Poison never reaches lowering, because a failed check does not lower. A test asserts that
-no `Error` survives a successful check.
+## Protocols are bounds, never types
+
+A protocol name is not a type and cannot appear in a type position. It constrains a
+parameter (`where T: Display`) or names a set of impls to dispatch through. The reason is
+the one above: inside a generic body `T` is opaque, so there is no `impl P for T` to find
+and there never will be — the call resolves against the **bound in scope**, and the bound
+is discharged at the call site once `T` is a real type.
+
+Everything else about the subsystem is `dispatch.md`. The shape that matters here: the
+checker records its choice and **nothing downstream re-resolves**. That is the same fix as
+the `expr_types` keystone — record the decision at the point it is made — applied to what
+was a last-write-wins `method_to_protocol` map.
+
+**Not checked:** a protocol method's *default body*. `check.rs`'s `decls` calls
+`fn_body(module, m, &[])` for it, so the protocol's subject is unbound and any mention of
+`T` in the body is `unknown type T`. Verified 2026-07-19; `TODO.md` §6. `dispatch.rs`'s
+`result_of` carries a fallback for an impl relying on a default, and its doc records that
+the path is currently unreachable for exactly this reason.
+
+## The keystone: `TypecheckResult` carries per-expression types
+
+`result.rs`, and its module doc is the current list. The rule it enforces is
+one-directional: **lowering asks, it never derives.**
+
+    expr_types      ExprId -> TyId      <- this one
+    resolved_calls  ExprId -> Resolution
+    caught_types    ExprId -> TyId      the union a `try` can catch
+    generic_args    ExprId -> [(name, TyId)]
+    declared_types  ExprId -> TyId      a `let`'s annotation, keyed on its initialiser
+    tested_types    ExprId -> TyId      the type an `is` asks about, resolved
+    resolved_lambdas                    written, read by nothing
+
+The previous implementation kept only the resolutions and **threw every expression type
+away**. IR lowering had to re-derive them, which is why `infer.rs` existed; it could not
+always succeed, so it fell back to `Erased`; that leaked into `NeonValue` boxing, which
+invented vtables, which produced `*_Any` collections with 24-byte slots that `push` read as
+8 — an ASan stack-buffer-overflow on every `list::new()`.
+
+One discarded hashmap, four subsystems of consequences. It is still the single most
+important line here.
+
+Keying is `ExprId`, assigned at parse time and unique across the whole compilation
+(`ast::number_exprs_from`), so one result covers every module including the stdlib. The old
+`span.start` key was fragile; a *collapsing* key is the same failure with a longer fuse, and
+`TODO.md` §12 tracks the class. One instance is live in the checker: `check.rs:619` writes
+an interpolation hole's `to_string` resolution to the **hole expression's own** `ExprId`,
+overwriting that expression's own call resolution, so `"#{area(q)}"` miscompiles
+(`TODO.md` §2).
+
+## One error channel
+
+`check_all` returns every diagnostic. Read the return value and you have seen everything.
+
+This used to be two channels — the return value, and `Env::errors`, where resolving a type
+annotation raises — and a caller reading one silently dropped the other's. `let x:
+NoSuchType = 5` compiled, and the poison it produced reached codegen. There were 23 call
+sites and every one had to remember. `check_all` now drains `Env::errors` into its result,
+so `env.errors()` is empty afterwards and a caller cannot double-report either. The list is
+sorted by span so the two phases interleave in source order, and deduplicated on
+(span, kind).
+
+Callers that gate on *declarations* — read `env.errors()` after `build_with`, refuse to
+check bodies against signatures that did not resolve — are unaffected, because they read
+that list before this runs.
+
+**Still wrong:** a `TypeError` has no file id, so a stdlib diagnostic renders against the
+user's file at a fabricated location (`TODO.md` §13).
 
 ## Module layout
 
     typecheck/
-      types.rs     Descriptor, atoms, hash-consing, union/intersect/negate
-      empty.rs     the emptiness decision procedure, per kind, with the assume-set
-      subtype.rs   s <: t  ==  is_empty(s ∧ ¬t)   (thin)
-      env.rs       records, aliases, protocols, impls; the mu side table
-      resolve.rs   ast::TypeSpec -> Descriptor. Contractivity and covariance live here.
-      narrow.rs    pattern and condition refinement; exhaustiveness
-      dispatch.rs  protocol resolution (needs its own design pass)
-      check/       the checker: walks the AST, computes a type for every expression
+      bdd.rs       the shared BDD, one arena per shape kind
+      types.rs     TyId, TyData, atoms, hash-consing, union/intersect/negate, substitute
+      empty.rs     Solver: the emptiness procedure, per kind, with the assume set.
+                   `is_subtype` and `is_equiv` live here — there is no subtype.rs
+      env.rs       records, aliases, protocols, impls, coherence; contractivity; the poison
+      resolve.rs   ast::TypeSpec -> TyId, and Scope (module + rigid variables)
+      generic.rs   structural matching to solve a generic call's arguments
+      narrow.rs    refinement, projection, exhaustiveness — the refinement half uncalled
+      ordered.rs   does a type have a structural order (`<`, `marker Ord`)
+      dispatch.rs  protocol resolution — see dispatch.md
+      print.rs     TyId -> readable Neon syntax, so a residual can be a diagnostic
+      check.rs     the checker: a type for every expression
       result.rs    TypecheckResult
-
-## The keystone: TypecheckResult carries per-expression types
-
-    pub struct TypecheckResult {
-        expr_types: HashMap<ExprId, Descriptor>,   // <- this
-        resolved_calls: HashMap<ExprId, ProtocolSelection>,
-        resolved_lambdas: HashMap<ExprId, Signature>,
-    }
-
-The previous implementation kept only the last two and **threw every expression type
-away**. IR lowering then had to re-derive them, which is why `infer.rs` existed; it could
-not always succeed, so it fell back to `Erased`; that leaked into `NeonValue` boxing,
-which invented vtables, which produced `*_Any` collections with 24-byte slots that `push`
-read as 8-byte — an ASan stack-buffer-overflow on every `list::new()`.
-
-One discarded hashmap, four subsystems of consequences. It is the single most important
-line in this document.
-
-Keying: nodes need stable identity. The previous implementation keyed on `span.start`,
-which is fragile. Give AST nodes an `ExprId` at parse time instead.
 
 ## The checker layer is where the soundness holes were
 
-The solver answers subtyping questions correctly; the layer above asked the wrong ones.
-All of these were **accepted** by the previous implementation:
+The solver answers subtyping questions correctly; the layer above asked the wrong ones. All
+of these were **accepted** by the previous implementation and are rejected now:
 
     let x: u8 = 999          // literal out of range
     let y: i64 = 1 + 2.5     // no implicit numeric promotion
     -"hi"                    // operator typing
     p.field                  // field access on a partial union
+    !5                       // `not` on a non-bool
 
-None of these are solver bugs. They are the checker not checking. The rewrite is mostly
-this layer, and it needs `expected` threaded downwards — a literal's type depends on what
-it is checked *against*, which is also what makes `[[1.0], ["a"]] : Json` work at all.
+None were solver bugs. They were the checker not checking, and that is still where to look
+first: the current list in `TODO.md` is dominated by the same layer.
 
-## Non-goals for v1
+## Non-goals
 
-- Mutual recursion between μ-aliases (a clear "not yet supported" error).
+- Mutual recursion between μ-aliases (a clear "not yet supported" error; pinned by
+  `tests/lang/types/mu_type_mutual_recursion_unsupported.neon`).
 - Type inference beyond local propagation of an expected type. Signatures are explicit.
-- Polymorphic set-theoretic types in their full generality (Castagna's later work). v1
-  generics are parametric and monomorphised at the call site.
+- Polymorphic set-theoretic types in their full generality.
 
 ## Risks
 
 - **Arrows are where this gets hard.** The decomposition is exponential in the number of
-  positive arrows in one intersection. Fine in practice, but it is the first place to look
-  when something hangs.
-- **Coinduction is easy to get subtly wrong.** Assuming the wrong polarity gives an
-  unsound "yes". Every recursive test must be checked in *both* directions.
-- **The expansion of nominal-to-structural interacts with `opaque` and with contractivity**
-  — the same nominal is a data constructor in its own module and an atom outside. Emptiness
-  queries are therefore module-relative, which is unusual and easy to forget.
-- **Protocol dispatch** is specified in `dispatch.md`. It leans on emptiness harder than
-  anything else here — every candidate impl is an `S ∧ target ≠ ∅` query — and bounded-impl
-  discharge adds a *second* coinductive fixpoint alongside the one in `empty.rs`. Two
-  interacting assumption stacks is the subtlest thing in the checker.
+  positive arrows in one intersection. Fine in practice, but the first place to look when
+  something hangs.
+- **Coinduction is easy to get subtly wrong.** Assuming the wrong polarity gives an unsound
+  "yes". Every recursive test must be checked in *both* directions. The `tainted` flag is
+  the load-bearing part; it is one boolean between correct and a memoised guess.
+- **A cyclic type graph is a hazard for every walk over it, not just for `is_empty`.**
+  `substitute` proved that by overflowing the stack on an ordinary `record Node`. Anything
+  new that recurses over `TyData` needs its own guard, and there is no shared one to
+  inherit.
 - **Covariance plus `expected` propagation may hide inference gaps.** Covariance makes many
   checks succeed that invariance would have rejected, so a missing `expected` thread shows
   up later and further away than it otherwise would.
+- **A green test suite over a disconnected module is indistinguishable from a green suite
+  over a connected one.** `narrow.rs` is the standing example.

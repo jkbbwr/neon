@@ -1,4 +1,4 @@
-# Open work
+# TODO
 
 Everything known-broken or undecided as of 2026-07-19, distilled from six middle-end
 audits, a compiler-wide collapsing-key sweep, three CBMC models and a fuzzing run.
@@ -219,6 +219,39 @@ forces `opacity_permits` to treat the root as a non-container — see the except
   meaningfully. Deliberate or oversight, unknown.
 - `tests/lang/records/spread_with_override.neon` is `known-bug`: `P { y: 9, ..a }` does not
   parse, because `allow_trailing()` on the field list eats the comma the spread needs.
+
+---
+
+### 13a. Code comments contradicted by the code they document
+
+Found while rewriting the design docs; all flagged rather than fixed.
+
+- `ir/repr.rs` — `Repr::Map`'s doc says "an immutable HAMT". `runtime/src/map.c` is an
+  open-addressed table with control bytes, copy-on-write above `rc > 1`.
+- `ir/repr.rs` module doc — describes the value-witness as `(size, retain, release, drop)`.
+  The struct is `(size, retain, release, eq, cmp)` and there is no `drop`.
+- `NEON_IMMORTAL` is read by `neon_retain`/`neon_release` and **set by nothing**. Either
+  string literals are not actually immortal, or the flag is dead.
+- `backend/c.rs::emit_term` — `Term::Throw` in a non-throwing function emits
+  `neon_panic(var(v))` with the value raw, while `neon_panic` takes a `neon_str`. Whether
+  lowering can produce that shape is unconfirmed.
+
+### 13b. The stdlib never goes through `expand`
+
+So a stdlib `@cfg` is silently ignored, and a typo'd stdlib annotation is undiagnosed.
+`@runtime` and `@pure` still work because their readers go to the AST rather than to
+`Meta`. No reasoning for this exists anywhere in the code.
+
+### 13c. CBMC cannot reach map resize, clone or drop
+
+The heap is modelled as untyped bytes, so a witness release read out of a heap map is a
+symbolic function pointer, and CBMC resolves it across every address-taken
+`void(*)(void*)` — including the map's own drop — recursing to the unwind bound. One resize
+did not finish in 400s; the same harness against a static map finished in 0.25s.
+
+**Unverified as a result:** "resize preserves live entries and drops tombstones", and
+copy-on-write at `rc > 1`. Needs `goto-instrument --restrict-function-pointer` in the model
+pipeline, or types that distinguish a drop from a witness release.
 
 ---
 

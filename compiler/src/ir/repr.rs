@@ -75,8 +75,10 @@ pub enum Repr {
     /// calling convention, not the layout: a throwing closure's function returns the
     /// tagged result `Union([ret, throws])` rather than `ret`, exactly like a named
     /// throwing function. It is a field rather than folded into `ret` because folding
-    /// changed the type graph and broke recursive arrow types — the union's struct and
-    /// its value-witness resolved the back-edge differently (see finalpush.md).
+    /// changed the type graph and broke recursive arrow types: the union's struct and its
+    /// value-witness resolved the back-edge differently, so the witness emitted `.env` on a
+    /// `void*`. A field leaves the type graph identical and combines the two only where the
+    /// C signature is built.
     Closure { params: Vec<Repr>, throws: Box<Repr>, ret: Box<Repr> },
     /// A tagged union of two or more distinct variants.
     Union(Vec<Repr>),

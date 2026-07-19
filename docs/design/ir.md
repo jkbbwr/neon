@@ -1,84 +1,16 @@
-# The IR, and the road to a backend
+# The IR, and the backend it exists for
 
-Status: **built.** The IR pipeline is implemented and tested — the representation map,
-the SSA data structure and printer, lowering with monomorphisation, the effect
-analysis, the optimiser, and reference-count insertion — and wired end to end behind
-`neon ir`. 147 of the 153 checkable corpus programs lower fully (the rest are edge cases:
-indirect call targets, an abstract dispatch receiver). What remains of this document's
-plan is the **backend**: `emit_c` behind the `Backend` seam, and a runtime with real
-`neon_*` bodies. The design below stands as written; this note records that everything
-up to the backend now exists.
+Status: **built, end to end.** The representation map, the SSA data structure and its
+printer, lowering with monomorphisation, the effect analysis, the optimiser, refcount
+insertion, the C emitter and the C runtime all exist and are wired behind `neon compile`,
+`neon build` and `neon run`; `neon ir --stage` prints any intermediate stage. What is
+*deferred* is volume in the optimiser, not architecture — see the last section, which
+distinguishes the two honestly.
 
-## Decisions (settled)
-
-The prose below predates these and is superseded by them where they disagree.
-
-**Backend & CLI.** C, emitting C **source text**, compiled by shelling out to `cc`
-configured through env vars and/or `neon.toml`. One `.c` for the whole program. Verbs:
-`neon compile` → executable; `neon codegen` → emit C; `neon ir [--stage]` → emit IR
-text; `neon build` → build a `neon.toml` project to an executable.
-
-**Memory.** Reference counting, **non-atomic, 64-bit** counts (single-threaded v1,
-x86-64). **No leaks, and no cycle collector — because immutability makes every value
-acyclic.** A cycle needs mutation or a value-level fixpoint to tie the knot; Neon has
-neither, so a recursive *type* still only ever holds finite, acyclic *values*, and
-refcounting is complete — the last release always runs. Allocation goes through a
-swappable runtime shim (`neon_alloc`/`neon_free`), selected by the existing
-`--allocator` / `neon.toml` mechanism. `atexit` runs teardown; globals release there.
-
-**Representations.** **Inline aggregates** — records, tuples and containers store
-elements *by value*, not boxed (`List[Point]` has `Point`-sized slots). Generic
-containers carry a per-element **value-witness** — `{ size, retain, release, eq, cmp }`
-generated for each monomorphic element type — so they can copy, drop and compare elements
-whose shape they cannot see. `cmp` is null when the element has no structural order (a
-union); the checker rejects ordering such a container, so callers need not test it. Unions are inline `{tag, payload}` when they fit; nullable-of-
-pointer is a null pointer, no tag. `bool` is one byte. Atoms are tagged by a **64-bit
-hash of the name**, globally consistent with no intern table (collisions astronomically
-unlikely, checkable within a program). Closures are `{ fn_ptr, env }` with a **null env**
-when capture-free, so those allocate nothing.
-
-**Runtime ABI (frozen contract).** Object header `{ u64 rc; u32 flags; void(*drop)(void*) }`
-— `drop` per-object so the runtime frees what it holds with no switch; a `flags` bit
-marks **immortal** objects. **String literals are immortal `.rodata`**: a static header
-whose immortal flag makes retain/release no-ops and needs no copy. Other `str` is a flat
-refcounted byte buffer; slices are `{buf, offset, len}` views sharing it. `List` stores
-elements inline (size from the witness) plus the witness for bulk retain/drop. `Map` is a
-**flat open-addressing (Swiss-table) hash map** with copy-on-write: an update mutates in
-place when the map is unshared (`rc == 1`, via FBIP) and copies only when shared. A HAMT
-would exist to avoid that O(n) copy on a persistent update, but reuse already handles the
-common unshared case, and the flat table wins decisively on cache behaviour; HAMT is
-deferred behind the same `map::` surface for the rare heavily-shared-and-updated workload.
-
-**Errors.** A throwing call returns a **tagged result** `{ tag, union{ ok, err } }`; the
-caller checks the tag. This is the calling convention of every throwing function,
-*including one reached through a closure*: `Repr::Closure` carries its `throws`, a
-throwing lambda's lifted function (and a named throwing function's adapter thunk) returns
-the tagged result, and a closure call unwraps it exactly like a direct call. An uncaught
-error reaching `main` prints `to_string` to **stderr** and exits with the chosen panic
-code.
-
-**Codegen & IR.** Full **monomorphisation** (no generic boxing), instances mangled from
-`(fn, concrete types)`, termination trusted to `TooDeep`. **SSA with block arguments**;
-loops carry state as header block args. IR values typed by **both** `Repr` and `TyId`.
-**Value-level** instructions (`GetField`/`MakeAggregate`); the backend lowers aggregates
-to memory. Primitive ops (`i64` add, compare) are **IR instructions**, not native calls.
-`const` is **compile-time folded**. The C `main` initialises the runtime and packs
-`argc`/`argv` (though `fn main()` takes none in v1).
-
-**Optimisation.** An always-on set (fold, DCE, simplify-CFG, refcount-pair cancellation)
-run at **maximum aggression by default** — no `-O` to opt into. Inline wherever able.
-Debug info (`#line`) only under a debug flag.
-
-**Textual form.** A **custom, LLVM-ish-but-deliberately-distinct** syntax (not mistakable
-for LLVM). **Printer only, never a parser.** Stage selectable via a `neon ir` argument.
-
-**Testing.** Corpus `.stdout` files become end-to-end execution oracles; IR dumps guard
-passes.
-
-**Effects.** An IR-level analysis, **pessimistic**: a call is effectful unless cheaply
-proven pure (a primitive op, a `@native`-tagged-`pure`, or a fn transitively calling only
-pure). Two states, `pure` vs `effectful`; default effectful, so there is nothing to prove
-about effectful code. Never in a signature.
+This document is the design and the reasoning. It is deliberately **not** an API listing:
+where a module doc in the code says the same thing more precisely, this file points at it
+rather than keeping a second copy that can drift. The code decides; where this file and a
+module doc disagree, the module doc is nearer the code and this file is the bug.
 
 ## Why an IR at all, and the one lesson from the graveyard
 
@@ -87,319 +19,549 @@ down every type the checker had already worked out — because the checker threw
 `expr_types` away. That re-derivation could not always succeed, so it fell back to
 `Erased`, `Erased` leaked into a boxed `NeonValue` with an invented vtable, the vtable
 produced `*_Any` collections with 24-byte slots that `push` read as 8, and a
-`list::new()` was an ASan overflow. One discarded hashmap, four subsystems of
-consequence.
+`list::new()` was an ASan overflow. One discarded hashmap, four subsystems of consequence.
 
-The IR exists so that never happens again. It consumes `TypecheckResult` (`ty` /
-`call` / `lambda`, keyed by `ExprId`) and **re-derives nothing**. Every expression
-already has a type; every call already has a `Resolution`; every lambda already has an
-arrow. The IR's job is to make those facts *explicit and total* — a representation for
-every type with no "unknown" case — and hand them to a backend.
+The IR exists so that never happens again. It consumes `TypecheckResult` (`ty` / `call` /
+`lambda`, keyed by `ExprId`) and **re-derives nothing**. Every expression already has a
+type; every call already has a `Resolution`; every lambda already has an arrow. The IR's
+job is to make those facts *explicit and total* — a representation for every type, with no
+"unknown" case — and hand them to a backend.
 
 ## The shape of the pipeline
 
 ```
 typed AST + TypecheckResult
-  → monomorphise         (IR→IR; generics become concrete instances)
-  → lower to SSA          (dispatch resolved to calls/switches; reprs assigned)
-  → optimise              (IR→IR; a pass pipeline over SSA — see below)
-  → insert refcounts      (IR→IR; retain/release/free made explicit)
-  → optimise refcounts    (IR→IR; elide redundant pairs, in-place reuse)
-  → Backend::emit         (a trait; C is the only implementation, for now)
+  → lower to SSA            (dispatch resolved; generics monomorphised; reprs assigned)
+  → optimise                (IR→IR, a pass pipeline over SSA, to a fixpoint)
+  → insert refcounts        (IR→IR; retain/release made explicit)
+  → backend::c::emit        (one C translation unit for the whole program)
 ```
 
-Every pass above `emit` is **backend-independent**. Only the last step knows what a
-target looks like. That split is the whole portability story: a second backend
-reimplements `Backend`, and nothing above it moves. Refcount insertion runs *after* the
-value-level optimiser on purpose — dead code is gone before its retains and releases
-would be written, so they never need to be optimised away.
+`ir::compile` (`compiler/src/ir/mod.rs`) is exactly this, with a `Stage` to stop early.
+Monomorphisation is not a separate IR→IR pass: it happens *during* lowering, as call sites
+discover which instances exist.
+
+The order is forced, not chosen, and `ir::compile`'s doc says why. The optimiser must run
+before refcounting because it rewrites control flow and refcount placement is pinned to a
+specific CFG; refcounting must be last because it splits edges and is not idempotent.
+`Stage::Lowered` and `Stage::Optimised` carry no retains or releases at all, so only
+`Stage::Final` is safe to emit — the earlier stages exist for `neon ir` to print.
+
+Every pass above `emit` is **backend-independent**. Only the last step knows what a target
+looks like, and that split is the whole portability story.
+
+## The seam is a module boundary, not a trait
+
+An earlier draft of this document specified a `Backend` trait with `declare_type` /
+`emit_fn` / `finish`. **It does not exist and was not built.** The seam is
+`compiler/src/backend/`: `c::emit(&Program) -> String` is the single entry point, and
+`ctype` — the C struct names, the witness names, the mangling scheme — is private to the
+module so nothing outside can depend on the shape of the generated source.
+
+That is the same line the trait was for (runtime-ABI knowledge and lowering on one side,
+target syntax on the other) drawn with one fewer abstraction, and it is validated by one
+real backend rather than asserted by two half ones. A second backend would introduce the
+trait then, against two implementations that exist.
+
+A backend receives a program that is already fully lowered — monomorphised, refcounted,
+every repr concrete — and is **not permitted to make semantic decisions about it**.
+Anything it cannot express is a bug upstream, which is why `ctype::c_type` calls `ice()`
+on a repr it cannot pin rather than picking something that compiles. `c_type` is an
+exhaustive match with no catch-all arm; the fallbacks inside its arms (an unregistered
+aggregate, a back-edge that does not resolve, a boxed record with no wrapper, a surviving
+`Repr::Var`) all panic. Every one of those was once a silent `neon_value`, and each
+silence cost a bug: an unpinned repr becomes a bare `void*` that C accepts anywhere, so the
+value is not erased — it is *typed* as erased while holding unboxed bits, with no header,
+witness or tag.
 
 ## Representations are abstract
 
-The representation map is `TyId → Repr`, and `Repr` is a *descriptor*, never a C type:
+The representation map is `TyId → Repr` (`ir/repr.rs`), and `Repr` is a *descriptor*, never
+a C type. The variants, in the code's own order:
 
 ```
 Repr =
-  | Scalar { bits: 1|8|64, kind: int | float | bool }
-  | Tag { count }                         // atoms, enum-like unions: a small integer
-  | Aggregate { fields: [Repr] }          // record, tuple — ordered, unnamed here
-  | Union { tag: Repr, variants: [Repr] } // a tagged union
-  | Box(Repr)                             // a pointer to a heap object (see below)
-  | Closure { params: [Repr], throws: Repr, ret: Repr } // fn pointer + environment;
-                                          // throws ≠ never ⇒ fn returns Union([ret, throws])
-  | Runtime(RtType)                       // str, List, Map — owned by the runtime ABI
+  | I64 | F64 | Bool | Str | Null | Unit
+  | Tag                                     // an atom or a union of atoms: a 64-bit hash
+  | Record { name: Option<String>, fields: [(String, Repr)] }
+  | Tuple([Repr])
+  | List(Repr) | Map(Repr, Repr)
+  | Runtime { nominal, c_type, args: [Repr] }   // a runtime-owned refcounted object
+  | Closure { params: [Repr], throws: Repr, ret: Repr }
+  | Union([Repr])                           // two or more distinct variants
+  | Nullable(Repr)                          // `T | null`, T pointer-backed: a null pointer
+  | Var(String)                             // rigid, abstract until monomorphisation
+  | BoxedRec(u32)                           // a record whose cycle closes by value
+  | Recursive(TyId)                         // a `mu` back-edge
+  | Any                                     // the one erasure boundary
+  | Never                                   // uninhabited
 ```
 
-The C backend turns `Aggregate` into a `struct`, `Union` into a `struct { tag; union }`,
-`Scalar{64,int}` into `int64_t`. An LLVM backend turns the same descriptors into LLVM
-types; Cranelift into slot sets. **The IR never commits to padding, pointer width, or
-field offsets** — that is each backend's arithmetic to do. This is the exact discipline
-the graveyard broke when "different C structs leaked into the type system."
+The C backend turns `Record`/`Tuple`/`Union` into named `struct`s, `I64` into `int64_t`,
+`Nullable` into the bare pointer. **The IR never commits to padding, pointer width, or
+field offsets** — that is each backend's arithmetic. This is the exact discipline the
+graveyard broke when "different C structs leaked into the type system."
 
-The map is **total by construction**: `⊤` (`any`) is the only type without a fixed
-representation, and the checker forbids it except at the one deliberate erasure
-boundary, so lowering meets no `any` it did not expect. The test for this pass is
-mechanical — every `TyId` reachable from a corpus program maps to a `Repr` with no gap.
-That test *is* the guarantee erasure cannot return.
+The map is **total by construction**: `repr_of` has no unknown case, and the
+no-component case comes out as `Never` rather than as an absence a caller has to guess at.
+`Var` is abstract but not unknown — it exists only inside a generic body and is gone after
+monomorphisation, guarded by `no_type_variable_survives_lowering` in
+`compiler/tests/ir_lower.rs` and by `c_type`'s panic. `Any` is erased but not a fallback —
+it is reached only when the source wrote `any`. That totality *is* the guarantee erasure
+cannot return.
+
+Three variants deserve their reasoning stated here, because it is design and not detail.
+
+**`Runtime { nominal, c_type, args }`** replaced a hardcoded name table — `record_repr`
+matched the strings `List`, `Map` and `File` — with a declaration: `@runtime("neon_file")`
+on a field-less `record`. That is what lets a runtime-backed type live in an ordinary
+stdlib module instead of being a name the compiler recognises. It carries *both* halves
+under names that cannot be confused: `nominal` is the Neon name and the type's identity
+(the printed form, the mangled key, the boxed type tag), while `c_type` is a spelling of
+the pointee that only `ctype::c_type` may read. A single `name` field holding the C symbol
+was the earlier design and is precisely why `type_tag_name` had no Neon name to answer with
+and every `is` against a runtime-backed type was false. Refcounting, pointer-ness and
+substitution are uniform across all such types; only equality, ordering and hashing
+genuinely differ, and those live in one name-keyed table in the emitter. `List` and `Map`
+remain their own variants because their element reprs feed witness emission.
+
+**`Closure`'s `throws`** is calling convention, not layout: a throwing closure's function
+returns the tagged result `Union([ret, throws])`, exactly like a named throwing function.
+It is a separate field rather than folded into `ret` because folding changed the type graph
+and broke recursive arrow types — the union's struct and its value-witness resolved the
+back-edge differently, so the witness emitted `.env` on a `void*`.
+
+**`Recursive` is not a pointer.** It names a type without describing it, and the named type
+may well be an inline union: `mu type A = :ok | List[A]` is `{tag, payload}` by value, whose
+recursion terminates through the list's pointer. Calling it a pointer had the refcount pass
+emit `neon_retain((neon_header*)x)` against a stack union. `Program::recursive` and
+`Program::boxed` are the side tables the backend resolves back-edges through.
 
 ### Inline aggregates and the value-witness
 
-Aggregates are stored **by value**, not boxed. A record lives inline in whatever holds
-it; a `List[Point]` has `Point`-sized slots, not a slot of pointers-to-`Point`. Scalars
-(`i64`, `f64`, `bool`, atom tag, pointer) are their natural width; a union is inline
-`{tag, payload}` when it fits, and nullable-of-pointer collapses to a nullable pointer
-with no tag.
+Aggregates are stored **by value**, not boxed. A record lives inline in whatever holds it;
+a `List[Point]` has `Point`-sized slots, not a slot of pointers-to-`Point`.
 
-The cost of "by value" is that a generic container cannot see the shape of what it
-holds, yet still has to copy and drop it. That is what the **value-witness** is for: for
-each monomorphic element type, the compiler generates a static `{ size, retain, release,
-drop }`, and `neon_list_new` takes it. Only *bulk* runtime operations (grow, clone,
-drop-all) go through the witness; element *access* is emitted by codegen, which knows the
-type statically and reads the slot directly. The witness is one static table per element
-*type*, resolved at compile time — not a per-*value* vtable, which is the thing the
-graveyard's erasure produced and this design refuses.
+The cost of "by value" is that a generic container cannot see the shape of what it holds,
+yet still has to copy, drop and compare it. That is what the **value-witness** is for: one
+static table per element *type*, generated by codegen and passed to `neon_list_new`.
+
+```c
+typedef struct neon_witness {
+    size_t size;
+    void (*retain)(void* elem);
+    void (*release)(void* elem);
+    bool (*eq)(const void* a, const void* b);
+    int (*cmp)(const void* a, const void* b);
+} neon_witness;
+```
+
+`retain`/`release` are NULL when the element holds nothing counted. `eq` is always present
+— equality is total on every type. `cmp` is NULL when the element has no structural order
+(a union, which would need an invented rank between its arms); the checker rejects ordering
+such a list, so a non-NULL `cmp` is the caller's precondition, not something to test at run
+time. Hashing is *not* here: it is layered into `neon_key_witness { value, hash, eq }`,
+because only a map key is hashed and folding it in would make every element type carry two
+null pointers forever. Any list, by contrast, can be compared, which is why `eq`/`cmp` did
+not get the same treatment.
+
+Only *bulk* runtime operations (grow, clone, drop-all, structural `==`/`<`) go through the
+witness; element *access* is emitted by codegen, which knows the type statically and reads
+the slot directly. The witness is a static table per type resolved at compile time — not a
+per-*value* vtable, which is the thing the graveyard's erasure produced and this design
+refuses.
 
 This is more machinery than boxing every aggregate, and it is the deliberate trade: no
-per-element allocation, at the cost of generating and threading witnesses. Word-or-box
-(box every aggregate, one pointer per slot, no witness) is the simpler fallback if inline
-storage proves painful before it proves fast.
+per-element allocation, at the cost of generating and threading witnesses. Word-or-box (box
+every aggregate, one pointer per slot, no witness) is the simpler fallback if inline storage
+ever proves painful before it proves fast.
 
 ## The shared contract: the runtime ABI
 
-This is the part that does not move between backends, and the part worth being precise
-about. Every backend links the same `runtime/` (a C library today), so everything that
-**crosses the runtime boundary** has a layout `rt.h` dictates and all backends honour.
-Everything that does not is a backend's private choice.
+This is the part that does not move between backends. The runtime's public surface is
+`runtime/include/libneon_rt.h`, an **umbrella** header that includes twelve per-area
+headers under `runtime/include/neon/` (`core`, `lifecycle`, `trap`, `arith`, `string`,
+`list`, `map`, `any`, `resource`, `file`, `io`, `math`). Emitted C includes only the
+umbrella. Every area header is self-contained and includable on its own — tests and the
+CBMC models in `runtime/models/` rely on that, and the umbrella's include order is
+deliberately not a dependency ordering. The implementation is eleven translation units in
+`runtime/src/`, one per area, plus a private `internal.h`.
 
-**1. The object header.** Every heap object — every aggregate, every `str`, `List`,
-`Map`, every closure environment — begins with the same header:
+The runtime **ships as prebuilt static archives**, not as C source compiled on every build:
+`runtime/CMakeLists.txt` builds three variants — `libneon_rt.a` (`-O3`),
+`libneon_rt_debug.a` (`-O0 -g -DNEON_DEBUG`, which turns on the runtime's own assertions),
+and `libneon_rt_san.a` (`-fsanitize=address,undefined`). `BuildConfig::runtime_variant`
+in `cli/src/buildcfg.rs` picks one from the build mode and the requested sanitizers, and it
+**refuses rather than substituting**: an uninstrumented archive inside a sanitized program
+is a silent hole, because ASan cannot see an overflow that happens in code compiled without
+`-fsanitize`. The link's own `-fsanitize` flags are derived from the chosen variant rather
+than from the user's request, which makes the archive-versus-flags mismatch unrepresentable.
+
+Three consequences of prebuilding are worth knowing rather than rediscovering: the runtime
+is not LTO'd even in release builds (an LTO archive carries bitcode specific to the compiler
+that produced it, which is not the `cc` that links a user's program); it is not built
+`-march=native` (built once, for an unknown target); and `cflags`/`-D` a user passes reach
+their program only, never the runtime.
+
+**1. The object header.** Every heap object — every boxed record, `str` allocation, `List`,
+`Map`, `neon_box`, `neon_resource`, closure environment — begins with:
 
 ```c
-typedef struct { uint64_t rc; uint32_t flags; void (*drop)(void*); } neon_header;
+typedef struct neon_header { uint64_t rc; uint32_t flags; void (*drop)(void*); } neon_header;
+#define NEON_IMMORTAL 1u
 ```
 
-`rc` is the (non-atomic, 64-bit) reference count; `flags` carries the **immortal** bit
-for `.rodata` objects like string literals; `drop` is how to free *this* object (it
-releases the object's own counted fields, then frees). `neon_retain(void*)` and
-`neon_release(void*)` operate on the header alone, are no-ops on an immortal object, and
-are the only refcount primitives. A backend emits calls to these two symbols; it never
-open-codes the count. Putting `drop` *in the header* rather than in a type-indexed table
-is what lets the runtime free
-an object it holds (a list element, a map value) without a compile-time switch — the
-header carries its own destructor.
+`rc` is the non-atomic 64-bit count. `drop` frees *this* object, releasing its own counted
+fields first. Putting `drop` in the header rather than in a type-indexed table is what lets
+the runtime free an object it holds — a list element, a map value — with no compile-time
+switch. `neon_retain`/`neon_release` operate on the header alone, are no-ops on NULL and on
+an immortal object, and are the only refcount primitives; a backend emits calls to these two
+symbols and never open-codes the count. `neon_alloc(bytes, drop)` allocates
+`sizeof(neon_header) + bytes` and initialises the count to 1.
 
-**2. `str`, `List`, `Map`.** Their layouts live in `rt.h` and the `neon_*` natives read
-and write them directly, so they are ABI. `str` is a flat refcounted byte buffer, with
-slices as `{buf, offset, len}` views sharing it; a **string literal is an immortal
-`.rodata` object** whose header flag makes retain/release no-ops and needs no copy.
-`List` stores elements **inline** and carries the element's **value-witness** (`{ size,
-retain, release, eq, cmp }`), so grow/clone/drop-all and the structural `==`/`<` work over
-elements the runtime cannot see the shape of, while codegen reads and writes slots directly
-by their known `Repr`.
-`Map` is a **flat Swiss-table hash map**, copy-on-write: mutated in place when unshared
-(FBIP), copied only when shared — the persistent-sharing job a HAMT would do is already
-covered by reuse for the common case, and the flat layout is far kinder to the cache.
+*Undocumented / unbuilt, recorded rather than described:* nothing in the compiler or the
+runtime ever **sets** `NEON_IMMORTAL` today. Only `neon_retain`/`neon_release` read it. The
+immortal path that literals actually take is a different mechanism (below).
 
-**3. Closures.** A closure value is `{ void (*fn)(void* env, ...); neon_header* env }` —
-a function pointer and a boxed environment holding the captures. A native that takes a
-closure (`map`, `filter`, `fold`) calls `fn(env, args...)`. This pair is ABI, because
-`Mappable`'s natives invoke it.
+**2. `str`, `List`, `Map`.** Their layouts are ABI because the `neon_*` natives read and
+write them directly.
 
-**Everything else is backend-internal.** A boxed record's field layout past the header,
-the calling convention for Neon-to-Neon calls, how control flow is emitted — a native
-never reads a record's fields (natives are generic over element type via the header and
-the slot), so the same backend that wrote a record is the only thing that reads it, and
-its layout need not be in `rt.h`. The shared contract is deliberately *small*: header +
-retain/release, the three runtime types, and the closure pair. That is the entire price
-of reusing one C runtime from any backend.
+`str` is a **view plus an owner**, not a `{buf, offset, len}` triple:
+
+```c
+typedef struct { char* data; size_t len; neon_header* owner; } neon_str;
+```
+
+`data`/`len` is the pair libc wants; `owner` is the refcounted allocation it points into,
+and slices share it. **A string literal has `owner == NULL`** — static, never freed, with
+retain and release no-ops because both return early on NULL. That is the immortality
+mechanism in force; the header flag is the unused one.
+
+`List` stores elements inline (`len` used of `cap` slots, each `w->size` bytes) and carries
+the witness for bulk retain/drop and for structural `==`/`<`. The header is first, so a
+`neon_list*` is also its `neon_header*`.
+
+`Map` is a **flat open-addressing hash table** with a `ctrl` byte per slot
+(empty/tombstone/full) and keys and values in parallel arrays sized by their witnesses, and
+it is **copy-on-write**: `neon_map_set` mutates in place when the map is uniquely owned and
+the load factor allows, and clones first when `rc > 1` or when growth is needed. That is
+what makes the immutable interface cheap. A HAMT would exist to avoid the O(n) copy on a
+persistent update, but uniqueness already handles the common case and the flat table wins
+decisively on cache behaviour; HAMT stays deferred behind the same `map::` surface for the
+rare heavily-shared-and-updated workload.
+
+*Flag, not a fix:* `Repr::Map`'s doc comment in `ir/repr.rs` describes it as "an immutable
+HAMT". That is stale — `runtime/src/map.c` is the open-addressed table described above.
+
+**3. Closures.** `typedef struct { void* fn; neon_header* env; } neon_closure;` — a
+function pointer and a boxed environment holding the captures, with a NULL `env` when
+capture-free, so those allocate nothing. A native that takes a closure calls
+`fn(env, args...)`. This pair is ABI because the stdlib's higher-order natives invoke it.
+An ordinary function used as a closure value gets an **adapter thunk** with the `(env,
+args…)` shape; a lifted lambda already has it.
+
+**4. `any`.** One boundary, one representation: `neon_box { header; const neon_witness* w;
+uint64_t type_tag; }` followed by the payload bytes inline, with `neon_value` a pointer to
+one. `is`/`as` on an erased value compare `type_tag`, which `TypeTable::type_tag` derives
+from the `Repr` by FNV-1a over a spelled name — the same hash both sides must go through
+(see `Op::IsVariant` below).
+
+**Everything else is backend-internal.** A record's field layout past the header, the
+calling convention for Neon-to-Neon calls, how control flow is emitted. The shared contract
+is deliberately *small*: the header plus retain/release, the runtime containers, the closure
+pair, the box, and the resource protocol. That is the entire price of reusing one C runtime
+from any backend.
 
 ## The IR itself
 
-**SSA, with basic-block arguments rather than φ-nodes.** Every value is defined once;
-where control flow joins, the merged value is a *block argument* — a block takes
-parameters, and each predecessor passes them when it branches. This is the same idea as
-φ-nodes but the cleaner encoding (Cranelift, MLIR and Swift SIL all use it): there is no
-φ-placement pass, a loop's carried state is just the loop header's arguments, and a
-backend maps a block to a label whose "parameters" are assigned before each jump.
+**SSA, with basic-block arguments rather than φ-nodes.** Every value is defined once; where
+control flow joins, the merged value is a *block parameter*, and each predecessor passes
+arguments on the edge. Same idea as φ-nodes, cleaner encoding (Cranelift, MLIR and Swift SIL
+all use it): no φ-placement pass, a loop's carried state is just the loop header's
+parameters, and a backend maps a block to a label whose parameters are assigned before each
+jump. Arguments living on the `Target` rather than at the top of the block is what lets a
+pass insert code on one incoming edge without disturbing the other — which is exactly what
+refcount insertion needs.
 
-SSA is worth it because the optimisations below want it, and because it is *cheap to
-build here*: Neon is immutable, so the only source of a second definition is local
-reassignment (`x = x + 1`), which becomes a fresh value, and the only joins are `if`,
-`match` and `loop`, which become block arguments. There is no dominance-frontier
-machinery to write.
+SSA is cheap to build here: Neon is immutable, so the only source of a second definition is
+local reassignment (`x = x + 1`), which becomes a fresh value, and the only joins are `if`,
+`match` and `loop`. There is no dominance-frontier machinery to write.
 
-Every value has a known `Repr`; every block ends in a terminator (`return`, `branch`,
-`switch`). Instructions are **semantic, not textual**:
+Every value carries **both** its `Repr` (for codegen) and its `TyId` (for provenance).
+Every block ends in exactly one terminator: `Ret`, `Throw`, `Jump`, `Branch`, `Switch`,
+`Unreachable`. Instructions are semantic, not textual, and deliberately close to what a C
+emitter prints in one line — there is no addressing and no allocation op. The full `Op` and
+`Term` enums are in `ir/ssa.rs` with a comment per variant; the shape is:
 
-```
-Instr =
-  | Const(value, Repr)
-  | Call(target, args)            // target: a resolved function or a native symbol
-  | CallClosure(closure, args)
-  | Switch(tag, arms)             // from Resolution::Switch, and from match
-  | GetField(v, index) | MakeAggregate(Repr, fields)
-  | GetTag(v) | MakeUnion(Repr, tag, payload)
-  | Alloc(Repr) | Retain(v) | Release(v)
-```
+- constants (`ConstI64`, `ConstF64` as a bit pattern so `Op` stays `Hash` for CSE,
+  `ConstBool`, `ConstStr`, `ConstNull`, `ConstUnit`, `ConstAtom`);
+- `Prim(PrimOp, args)` — arithmetic, comparison, logic and bitwise ops, with the operands'
+  `Repr` disambiguating `i64` from `f64` rather than separate `IAdd`/`FAdd`;
+- calls: `Call` (direct, by mangled name), `Native` (a runtime symbol), `CallClosure`
+  (indirect), `MakeClosure`;
+- aggregates and projections: `MakeRecord`/`Field`, `MakeTuple`/`Elem`, `MakeList`,
+  `Index`, `Cast`;
+- result and tag reads: `IsErr`, `UnwrapOk`, `UnwrapErr`, `IsNull`, `IsVariant`;
+- `Retain`/`Release`, which **only** the refcount pass adds.
+
+Two of these carry design worth stating.
+
+`Op::IsVariant { value, variant, tested }` gained `tested`. `variant` is the head name,
+which is all a *union* discriminant needs, since a union's arms are distinct types. It is
+not enough for an **erased** subject: a box's tag is derived from a `Repr`, and `List[i64]`
+and `List[str]` write the same head name, so every `is` on an erased generic answered yes
+and the `as` a person writes next reinterpreted the payload — an `i64` read as a `neon_str`
+header, which is a segfault, not a wrong answer. `tested` is the checker's resolved type, so
+both sides of `a is List[str]` go through `TypeTable::type_tag`. This is the collapsing-key
+class again; see below.
 
 Dispatch arrives already decided: `Resolution::Direct` becomes a `Call`,
-`Resolution::Switch` a `Switch` with a `Call` per arm, `Resolution::Bound` is discharged
-by monomorphisation (below) into a `Call` to the concrete instance. There is no vtable
-and no runtime method lookup — the checker settled all of it, which is the point of
-`dispatch.md`.
+`Resolution::Switch` a `Switch` with a `Call` per arm, `Resolution::Bound` is discharged by
+monomorphisation into a `Call` to the concrete instance. There is no vtable and no runtime
+method lookup — the checker settled all of it, which is the point of `dispatch.md`.
+
+### An invariant that is undefined, not merely unchecked
+
+`Builder::block_param` records it and `TODO.md` item 11 tracks it: predecessors pass
+arguments in parameter order, but nothing states what relation the argument **reprs** must
+satisfy. It is not equality — lowering routinely passes a `str` and a `Null` into a `str?`
+join and a bare `i64` into an `i64 | null` one, leaving the widen to the emitter, and a
+verifier asserting equality flags thousands of sites across the corpus, all of which run
+correctly. The real relation is "assignable", and it exists nowhere: not as a function, not
+as a doc. No verifier can be written until someone defines it. Recorded here rather than
+claimed as a check that does not exist.
+
+## Errors: the tagged result
+
+A throwing call returns a **tagged result** — `Union([ret, err])`, variant 0 the value and
+variant 1 the error — and the caller checks the tag. This is the calling convention of every
+throwing function, *including one reached through a closure*: `Repr::Closure` carries its
+`throws`, a throwing lambda's lifted function and a named throwing function's adapter thunk
+both return the tagged result, and a closure call unwraps it exactly like a direct call.
+
+`Func::result_repr` builds that union **raw**, deliberately bypassing the type system's
+`combine`/`normalize_union`. Those normalise — dedupe variants, reorder into canonical rank,
+collapse `T | null` to a nullable pointer — and every one of those is wrong here, because
+`IsErr`/`UnwrapOk`/`UnwrapErr` address the arms *by index*. `fn f() throws str -> str` must
+stay a two-arm `Union([Str, Str])`, and `fn f() throws E -> null` must not become a nullable
+`E`. It is a positional pair that happens to reuse the union layout and accessors.
+Relatedly, `Builder::set_throws` asserts the error repr is never `Never`: a `throws never`
+clause means the function does not throw, and tagging its result would make every caller
+read a value that is not there.
+
+In the emitter both `ret` and `throw` become C `return` statements differing only in which
+tag they inject into. A `throw` in a function that declares no `throws` has no union to
+return through, so it can only panic — that is an error escaping `main`, not an unhandled
+case, and it becomes `neon_panic`, which prints `neon: uncaught error: …` to **stderr**,
+flushes stdout first so the program's output up to the fault survives, and `_exit`s with
+101. `neon_trap` — a bad index, a division by zero — uses the same code and the same
+stdout-first discipline, and `abort()`s instead under `NEON_DEBUG` so a debugger catches
+SIGABRT at the fault.
 
 ## Monomorphisation
 
-Generics are specialised, not boxed. `fold[T,A]` called at `(List[i64], i64)` becomes a
-concrete `fold$List_i64$i64`; `Resolution::Bound { param, protocol }` is resolved by
-substituting the instance's concrete type and emitting a direct call to *its* impl. This
-is a pure IR→IR pass — it decides *which concrete functions and types exist*, not how
-they are laid out — so it runs once, before any backend. It is also where the "monomorphic
-escape hatch" the stdlib notes describe stops being an escape hatch: everything is
-monomorphic here, uniformly, by construction.
+Generics are specialised, not boxed, during lowering. `Resolution::Bound { param, protocol }`
+is resolved by substituting the instance's concrete type and emitting a direct call to *its*
+impl; `mangle_instance` names the instance from the base name and `repr_key` of each
+concrete argument, and `lower_module`'s `lowered` set dedups on that name. Recursion through
+a generic is already rejected by the checker's `TooDeep`, so this terminates; a generic never
+instantiated is never emitted. This is where the "monomorphic escape hatch" the stdlib notes
+describe stops being an escape hatch: everything is monomorphic here, uniformly.
 
-Two guards worth stating: recursion through a generic (`f[T]` calling `f[Box[T]]`) is
-already rejected by the checker's `TooDeep`, so monomorphisation terminates; and a
-generic never instantiated is simply never emitted.
+### The collapsing key, and the injectivity obligation
+
+`repr_key` is a mangled *name*, which makes it an **identity**, which makes it subject to an
+obligation that is easy to miss because nothing about the function looks dangerous: it is
+total, and every arm is a correct *description*. The defect is that its codomain was smaller
+than its domain.
+
+`Repr::Union(_) => "union"` and `Repr::Closure { .. } => "fn"` were constants. So every
+instantiation of a generic at any two union types mangled to one name, the `lowered` set
+dropped the second body, and one emitted instance — typed at whichever substitution was
+popped first — served call sites that had agreed with the compiler on a different layout.
+It is not reliably caught downstream: `fn ident[T](x: T)` at `i64 | str` and at `bool | f64`
+produced two C structs and the C compiler rejected the mismatch, but the same collision at
+`i64 | bool` and `i64 | f64` produced one struct and **compiled silently**, correct only by
+coincidence of layout. `type_tag_name` had the same defect three separate times.
+
+The rule this leaves behind, for anyone modifying `repr_key`, `type_tag_name`, `field_name`
+or any sibling: **a total function from a structured type to a string or integer used as a
+name, key or tag carries an injectivity obligation, and the obligation belongs in its doc
+comment backed by an assertion, not prose.** Both functions now say so. The separator in
+`repr_key` is `_`, which identifiers may also contain, so its injectivity is weaker than
+`ctype::key`'s bracketed scheme — a new arm should bracket rather than add another `_`.
+
+The class is not closed. `repr_from_typespec` still collapses — a turbofish `Box[i64]` and
+`Box[str]` produce the same repr, so `ident[Box[i64]]` and `ident[Box[str]]` are one
+instance, currently caught only by gcc's nominal struct typing, which is the same "correct by
+coincidence" footing the union collision had. That reproducer and the remaining known
+instances are in `TODO.md` item 12; the fix there is not a cleverer projection but to stop
+deriving a third spelling of a type from syntax at all.
 
 ## Refcount insertion
 
-A backend-independent pass inserts `Retain`/`Release` so every counted value's count is
-balanced. It is **last-use-driven (Perceus-style)**, not naive-insert-then-elide: the
-pass computes each value's last use and, where a value is *consumed* at its last use,
-**moves** it (hands over the existing reference) rather than emitting a retain/release
-pair.
+A backend-independent pass makes every counted value's count balanced. It is
+**last-use-driven (Perceus-style)**, not naive-insert-then-elide: where a value is *consumed*
+at its last use the pass **moves** it — hands over the existing reference — rather than
+emitting a retain/release pair.
 
-Placement follows from one split and one analysis. Every counted value is an **owner**
-(holds one reference from production: call results, aggregates, `Index` reads, block
-parameters) or a **view** (holds nothing: `Field`/`Elem`/`Cast`/`UnwrapOk`/`UnwrapErr`
-results alias what their operand owns). Liveness is computed **over roots** — a use of a
-view is a use of the owner at the bottom of its projection chain, and views never appear
-in a live set. Then: a consuming use of an owner still live afterwards is preceded by a
-retain, at its last use the reference moves; a consumed view is always preceded by a
-retain (it must materialise a reference); an owner is released right after its last use.
-Terminator bookkeeping sits **on the edge**: for each CFG edge, retain the views passed
-as block arguments, then release every owner live at the terminator that is neither
-moved along that edge nor live into the successor — in the block itself for a `jump`, in
-a fresh block on the edge for a `branch`/`switch` (so nothing fires on a path not
-taken), and before the terminator for `ret`/`throw` (where the root of a returned view
-dies). No other rule exists; in particular there is no separate block-boundary release —
-the edge rule *is* the boundary rule, derived from the same liveness as everything else. Two analyses ride on this. **Reuse (FBIP):** when a value has `rc == 1` at its last
-use and a new value of the same shape is being built, its memory is rewritten in place —
-which is what turns `list::set(xs, i, v)` into an O(1) write when `xs` is unshared,
-immutable semantics at mutable speed. **Escape analysis:** a value that never escapes its
-creating scope is stack-allocated, with no header and no count at all. What remains after
-those — genuinely shared values — gets ordinary counts, and **that is complete: no leaks,
-because the language is immutable.** A reference cycle needs mutation or a
-value-level fixpoint to close the loop, and Neon has neither, so every value is a finite
-DAG; the count always reaches zero. A recursive *type* (a `mu` list) does not change
-this: its *values* are still acyclic. `is_cycle_root` concerns the *representation* of a
-recursive type — where its layout needs a pointer at the back-edge to stay finite — not a
-runtime cycle. There is no collector to write, now or later. Getting the retain/release
-discipline right here, once, keeps every backend from reimplementing it, and immortal
-objects (string literals) short-circuit both operations via their header flag.
+The full placement rules are in the module doc of `compiler/src/ir/refcount.rs`, which is
+the authority and is more precise than any restatement here would be. The design in one
+paragraph: every counted value is an **owner** (holds one reference from production: call and
+native results, aggregates, `Index` reads, block parameters) or a **view** (holds nothing:
+`Field`, `Elem`, `Cast`, `UnwrapOk`, `UnwrapErr` alias what their operand owns). Liveness is
+computed **over roots** — a use of a view is a use of the owner at the bottom of its
+projection chain, and views never appear in a live set. That single collapse is what lets one
+analysis place every retain and release; the previous design tracked views and roots
+separately and needed a base-extension step that made "release the root once the last view
+dies" unreachable exactly when a view was consumed at a terminator. Terminator bookkeeping
+sits **on the edge**, with a fresh block spliced onto a `branch`/`switch` edge that needs
+code, so nothing fires on a path not taken. There is no separate block-boundary rule; the
+edge rule *is* the boundary rule, derived from the same liveness as everything else.
+
+Two exceptions carry their own reasoning. A lambda's environment parameter is **borrowed** —
+the closure owns it and may be called again — and `CallClosure` likewise borrows its callee,
+because calling a closure reads it rather than destroying it. And the one `Cast` that is not
+a projection is erasure into `any`: it *allocates* a box and the operand's reference moves
+into it, so it is an owner and a consuming use. Treating it as a view leaked the box and
+everything it transitively owned, invisibly for flat records and visibly for recursive ones.
+
+**This is complete, and there is no cycle collector — now or ever.** A reference cycle needs
+mutation or a value-level fixpoint to tie the knot, and Neon has neither, so every value is a
+finite DAG and the last release always runs. A recursive *type* does not change this: its
+*values* are still acyclic, and `Repr::Recursive`/`Repr::BoxedRec` concern where a *layout*
+needs an indirection to stay finite, not a runtime cycle. Getting this discipline right once,
+here, keeps every backend from reimplementing it.
+
+Not built: **FBIP reuse** (`rc == 1` at last use, rewrite the memory in place, turning
+`list::set(xs, i, v)` into an O(1) write when `xs` is unshared) and **escape analysis**
+(stack-allocate a value that never escapes, with no header and no count at all). Both are
+described in the deferred section, not here, because the pass does not do them. `neon_map_set`
+does implement the `rc > 1` check on the runtime side, which is the same idea applied by hand
+in one place.
 
 ## Optimisation
 
-SSA earns its keep here. The pipeline is a pass manager over the IR, run before backends
-so every target inherits the result. The passes that matter for this language, roughly in
-the order they help:
+The optimiser (`ir/opt.rs`) runs each function to its own fixpoint over four passes, with
+purity computed once over the unoptimised program:
 
-- **Inlining.** decisions.md already assumes it — "after monomorphisation and inlining a
-  primitive compare is a single instruction." Monomorphisation turns every protocol call
-  into a direct call to a small impl; inlining those, and the native-thin wrappers, is
-  what makes `a == b` an integer compare rather than a call.
-- **Constant folding and propagation.** decisions.md pins the arithmetic ("a folded
-  expression and the same expression evaluated at runtime agree"), so folding is a
-  correctness-preserving rewrite, not a guess.
-- **Dead-code and dead-block elimination**, and **simplify-CFG** (built): fold a constant
-  branch to a jump, thread empty forwarding blocks, and merge a block into its sole
-  predecessor -- blocks are renumbered contiguously on removal so ids stay indices.
-- **GVN / CSE.** Needs the effect analysis below to know a value is safe to reuse.
-- **Last-use / reuse (Perceus, FBIP)** — see the refcount section: this is not a
-  post-hoc cleanup but the *insertion strategy*, and it is the single largest win for a
-  refcounted immutable language.
-- **Escape analysis** — a value that never escapes its creating scope is stack-allocated,
-  with no header and no refcount traffic at all. With inline aggregates that is a large
-  class of values.
+- **constant folding** on `i64` and `bool` primitives, leaving overflow and division by zero
+  unfolded for the runtime to handle. `decisions.md` pins the arithmetic — a folded
+  expression and the same expression evaluated at runtime agree — so folding is a
+  correctness-preserving rewrite, not a guess;
+- **dead-code elimination**, guided by the effect analysis so an effectful instruction is
+  never dropped;
+- **simplify-CFG**: fold a constant branch to a jump, thread empty forwarding blocks, merge a
+  block into its sole predecessor;
+- **unreachable-block removal**, renumbering blocks contiguously so ids stay indices.
 
-First cut runs a minimal always-on set (fold, DCE, the obvious refcount-pair cancellation)
-and grows. The point now is that the *substrate* — SSA + a pass manager — is in place, so a
-pass is a self-contained addition rather than a rewrite.
+Per-function-to-fixpoint rather than per-pass-over-the-program because the passes feed one
+another: folding a branch condition orphans blocks, which makes a block single-predecessor,
+which exposes more constants. Reusing one purity map across the whole run is sound because
+these passes only remove work — a function that was pure cannot become effectful.
+
+**Not built, despite earlier drafts of this document describing them as design:** inlining,
+GVN/CSE, escape analysis, FBIP reuse, refcount-pair cancellation. They are listed under
+deferred. The claim in `decisions.md` that "after monomorphisation and inlining a primitive
+compare is a single instruction" is currently carried by the C compiler's inliner, not the
+IR's.
+
+Refcount insertion runs *after* the value-level optimiser on purpose: dead code is gone
+before its retains and releases would be written, so they never need to be optimised away.
 
 ## Effects, for the optimiser only
 
-CSE, DCE and reordering must know what is safe to move or drop, which means knowing which
-calls have effects. This is **not** purity in the type system — the decision to keep
-purity out of signatures stands. It is an invisible, IR-level analysis, and it is
-**pessimistic by design**: a call is **effectful** unless it can be *cheaply proven*
-pure. Being wrong in the safe direction — treating a pure call as effectful — only costs
-a missed optimisation; the reverse would miscompile. So there is nothing to prove about
-effectful code, and no full lattice to compute — just a promotion to `pure` where it is
-obvious, which is a short list:
+DCE must know what is safe to drop, which means knowing which calls have effects. This is
+**not** purity in the type system — keeping purity out of signatures stands. It is an
+invisible IR-level analysis, and it is **pessimistic by design**: effectful unless cheaply
+proven pure. Being wrong in the safe direction costs a missed optimisation; the reverse
+miscompiles. Two states suffice, since immutability means there is no
+read/write-of-mutable-memory category to model.
 
-- a primitive IR op (`i64` add, compare) — pure by construction;
-- a native tagged `pure` (riding `@native`; untagged means effectful);
-- a Neon fn whose calls are *all* (transitively) pure — a cheap monotonic fixpoint.
+A function is pure iff every instruction is pure and every callee is pure, computed as a
+monotonic fixpoint over the call graph. The fixpoint starts **optimistic** and only ever
+removes purity, which is what lets recursion terminate *and* be classified usefully — a
+recursive function stays pure while its own body is examined instead of demoting itself on
+first sight of its own call. A callee absent from the map is read as effectful, so a call to
+anything outside the lowered program stays un-eliminable.
 
-Anything else — an indirect closure call, an untagged native, a fn that reaches one —
-stays effectful, with no analysis at all. Two states suffice: `pure` vs `effectful`. The
-`io`-vs-`throw` distinction is not needed for correctness (lumping them is safe) and can
-be split out later only if a pass wants to move a throw past pure code; the checker
-already knows `throws` precisely, so that split is free when wanted.
+What is effectful, per `op_is_effectful`:
 
-DCE deletes a dead call only if `pure`; CSE shares only `pure` computations; an effectful
-call is never eliminated, duplicated, or reordered past another. (One policy call: a
-pure-but-possibly-non-terminating call is treated as terminating for DCE, as C does.) No
-surface syntax, no signature change, no monad — codegen simply knows what it may touch.
+- **a native, unless its declaration carried `@pure`.** A native's body is opaque, so this is
+  not an analysis — it reports what the declaration *claimed*. The polarity is the
+  load-bearing part: silence means effectful, so forgetting `@pure` costs an optimisation
+  while a wrong `@pure` licenses DCE to delete a call that mattered. The rule this replaced
+  inferred purity from the symbol's *spelling* and deleted a resource construction along with
+  the cleanup that construction existed to schedule;
+- **an indirect call** (`CallClosure`), which cannot be seen through;
+- **`Index`**, because it traps — out of bounds for a list, absent key for a map — and ending
+  the program is as observable as an effect gets. Deleting one because nobody reads the
+  element deletes the check: `xs[10]` as a statement ran clean past the end of a
+  three-element list;
+- **`i64` arithmetic** (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg`, decided by operand repr).
+  Precisely: only `Div` and `Rem` actually trap (zero divisor, and `INT64_MIN / -1`); the
+  rest **wrap**, which is what `-fwrapv` buys. They are listed anyway as a conservative
+  choice, costing missed deletions of dead wrapping arithmetic and nothing else. `f64`
+  follows IEEE, produces an infinity or a NaN rather than trapping, and stays pure — a
+  distinction worth the operand lookup, since calling all arithmetic effectful leaves DCE
+  nothing to remove while calling it all pure deleted `1 / 0`.
+
+Everything else — allocation, projection, comparison, `Retain`/`Release` — is a pure function
+of its operands.
+
+### An observable the abstraction could not express
+
+**Non-termination is an effect**, and this is the second design-relevant bug class this layer
+produced. If ending the program counts as observable, a program that never ends is observable
+by exactly the same argument. Without it, DCE deleted a call to a pure function that loops
+forever and a program that should have hung printed its next line and exited 0.
+
+The reason no amount of care in `op_is_effectful` could have caught it is structural: that
+function is a **per-instruction** two-state verdict, and non-termination is a property of a
+function's *shape*, not of any instruction in it. Every individual instruction in an infinite
+loop is pure and the verdict on each is correct. The fix therefore had to be a new analysis
+at the right granularity rather than a new arm: `may_diverge` seeds the fixpoint, and a
+function might not terminate if its own CFG has a **back edge** or if it sits on a **cycle in
+the call graph**. The call-graph half is exactly what the fixpoint's optimism cannot catch on
+its own — `fn a() { b() }` and `fn b() { a() }` reach a fixpoint at "both pure" while neither
+ever returns.
+
+The tell, for the next one: when a bug's fix does not fit as another arm of the function that
+decided wrong, the abstraction cannot express the observable, and the answer is a different
+analysis rather than a more careful one.
 
 ## Textual form
 
-The IR has a canonical text form — an SSA dump — printed behind `--emit-ir`. It exists for
-two reasons: reading it is how you debug a lowering or a pass, and diffing it is how passes
-are tested (dump the IR for a corpus program, hold it to a golden). A round-trip parser
-(text → IR, so a pass can be exercised on hand-written IR in isolation) is a natural
-follow-on and is added when the first pass wants a focused test, not before.
-
-## The Backend trait
-
-The seam. Roughly:
-
-```
-trait Backend {
-    fn declare_type(&mut self, id, &Repr);
-    fn declare_fn(&mut self, sig);
-    fn emit_fn(&mut self, sig, blocks: &[Block]);
-    fn finish(self) -> Artifact;   // C source now; an object file, LLVM module, ... later
-}
-```
-
-`emit_c` is the only implementation. It writes C to be compiled and linked against
-`runtime/` with `cc`. The trait is not speculative generality for its own sake — it is
-the line that keeps runtime-ABI knowledge and lowering on one side and target syntax on
-the other, and it is validated by one real backend rather than asserted by two half ones.
+A canonical SSA dump, printed by `neon ir [--stage lowered|opt|final]`, defaulting to
+`final`. **Printer only, never a parser** — a decision, not a deferral. The syntax is
+LLVM-ish but deliberately its own so it is never mistaken for LLVM. It exists to debug a
+lowering or a pass, and to be diffed against goldens. It shows code, not the type
+environment: the `recursive`/`boxed` side tables are not printed, and a function's signature
+shows its *declared* return rather than the tagged result a throwing function actually
+returns.
 
 ## What is deferred, on purpose
 
-The *substrate* — SSA, a pass manager, the effect analysis, the textual form — is part of
-the design from the start, because retrofitting SSA or effects later is a rewrite. What is
-deferred is **volume**, not architecture:
+The *substrate* — SSA, a pass pipeline, the effect analysis, the textual form — was built
+first, because retrofitting SSA or effects later is a rewrite. What is deferred is volume:
 
-- **A second backend.** The seam exists; building LLVM/Cranelift before C runs a program
-  end-to-end is speculative. The value delivered now is the *boundary*, not a choice of
-  targets.
-- **Optimisation passes beyond the always-on set**, and `rc == 1` in-place reuse. The
-  pass manager is there and runs aggressively; each further pass is an addition, not a
-  redesign.
-- **The text → IR parser.** The printer only, forever (a decision, not a deferral) — but
-  the *first* pass may still want a scratch parser for isolated tests; if so it is a test
-  aid, not a supported input.
+- **Optimisation passes beyond the four always-on ones**: inlining, GVN/CSE, refcount-pair
+  cancellation. Each is an addition to `optimize`'s loop, not a redesign.
+- **FBIP in-place reuse and escape analysis.** The two largest wins available to a refcounted
+  immutable language, and both are unbuilt in the IR. Reuse needs the `rc == 1`-at-last-use
+  query the refcount pass already computes liveness for; escape analysis needs a notion of a
+  stack-allocated value the emitter does not have yet.
+- **A second backend.** The seam is a module boundary today (see above) and becomes a trait
+  when there are two implementations to abstract over. Building LLVM or Cranelift before C
+  ran a program end to end would have been speculative.
+- **The text → IR parser.** Printer only, forever. A scratch parser for isolated pass tests
+  would be a test aid, not a supported input.
 - **A threading story.** Single-threaded v1 with non-atomic counts; a `shared` bit in the
-  header flags is the room left for atomic counts later without an ABI break.
+  header's `flags` is the room left for atomic counts later without an ABI break.
+- **Program-level teardown.** The C entry point is `int main(void) { neon_rt_init();
+  nl_main(); return 0; }`. There are no globals to release, `neon_rt_init` is an empty hook
+  for allocator setup, and there is no `atexit` teardown; `argc`/`argv` are not packed,
+  because `fn main()` takes none. Earlier drafts of this document described all four as
+  built. They are not.
 
 There is **no cycle collector, ever** — immutability makes it unnecessary, not deferred.
-
-The order of work: the representation map (`Repr`, with the no-gaps test) → the SSA IR and
-lowering for the scalar/first-order subset, with its printer → `emit_c` for that subset → a
-runtime with real `neon_*` bodies → widen to aggregates, closures, `Mappable`, then grow
-the optimiser. First a program that prints `42`, then the language, then speed.

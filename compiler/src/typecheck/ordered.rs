@@ -53,7 +53,7 @@ pub(super) fn is_ordered(env: &Env, ty: TyId, bound: &HashSet<String>) -> bool {
 /// Unlike ordering there is no bound to escape through, because equality takes none: a bare
 /// type variable is *allowed* and deferred. Equality is total by design, so requiring a
 /// marker would contradict the decision; the residual hole is the generic-instantiation one
-/// already recorded in finalpush.md.
+/// recorded in `TODO.md`.
 pub(super) fn is_equatable(env: &Env, ty: TyId) -> bool {
     equatable_rec(env, ty, &mut Vec::new())
 }
