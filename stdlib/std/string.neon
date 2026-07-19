@@ -28,6 +28,12 @@ fn char_at(s: str, i: i64) throws IndexError -> str {
     raw::char_at_unchecked(s, i)
 }
 
+// Thrown by `to_int`. Declared here rather than in the prelude: the module that throws an
+// error is the one that owns it, and a name in the prelude is a name no program can use.
+record ParseError { message: str }
+impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
+impl Error for ParseError { fn message(v: ParseError) -> str { v.message } }
+
 fn to_int(s: str) throws ParseError -> i64 {
     if !raw::is_int(s) {
         throw ParseError { message: "not an integer" };

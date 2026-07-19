@@ -18,6 +18,24 @@
 
 use std::string;
 
+// Thrown by everything here that can fail. Owned by this module rather than the prelude.
+record IoError { message: str }
+impl Display for IoError { fn to_string(v: IoError) -> str { v.message } }
+impl Error for IoError { fn message(v: IoError) -> str { v.message } }
+
+// Bytes that are not text. `str` already holds arbitrary bytes -- slicing it may split a
+// UTF-8 sequence and nothing validates -- so this is a *nominal* distinction rather than a
+// new representation: it costs nothing at run time, and it stops a PNG being typed as
+// something you would call `to_upper` on. Cross over with `as` in either direction, and
+// reach the whole `std::string` API by casting.
+newtype Bytes = str
+
+// What can be written in one go. A tree rather than a buffer: building it costs no copying
+// and no concatenation, and `write_all` turns the leaves into an `iovec` array for a single
+// `writev`. This is Erlang's iodata, and the reason immutable strings do not make output
+// quadratic.
+mu type IoList = str | Bytes | List[IoList]
+
 internal mod raw {
     @native("neon_io_open") fn open(path: str, mode: i64) -> i64
     @native("neon_file_new") fn wrap(fd: i64) -> File

@@ -1,3 +1,46 @@
+// Eager transformation over a one-parameter container `C[_]`. Every method returns a fresh
+// `C` (or, for `fold`, the accumulated value): the language is immutable, so there is
+// nothing lazy to thread and no iterator to allocate. A two-parameter type like
+// `Map[K, V]` is not a functor over one parameter, so it iterates through
+// `map::values`/`map::keys` first. See docs/design/stdlib.md.
+//
+// Declared here rather than in the prelude: nothing about it is syntax. The impl below is
+// not an orphan because this module owns the protocol, even though `List` does not live
+// here.
+protocol Mappable for C[_] {
+    fn map[T, U](c: C[T], f: (T) -> U) -> C[U]
+    fn filter[T](c: C[T], keep: (T) -> bool) -> C[T]
+    fn fold[T, A](c: C[T], init: A, step: (A, T) -> A) -> A
+}
+
+impl Mappable for List {
+    fn map[T, U](c: List[T], f: (T) -> U) -> List[U] {
+        let out: List[U] = [];
+        for x in c {
+            out = push(out, f(x));
+        };
+        out
+    }
+
+    fn filter[T](c: List[T], keep: (T) -> bool) -> List[T] {
+        let out: List[T] = [];
+        for x in c {
+            if keep(x) {
+                out = push(out, x);
+            };
+        };
+        out
+    }
+
+    fn fold[T, A](c: List[T], init: A, step: (A, T) -> A) -> A {
+        let acc = init;
+        for x in c {
+            acc = step(acc, x);
+        };
+        acc
+    }
+}
+
 // Immutable lists. Every operation returns a new list; these are values, which is
 // what makes their generic argument covariant. `rc == 1` reuse makes the copy free
 // when the input is uniquely owned.

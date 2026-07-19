@@ -13,13 +13,17 @@
 //
 // `Bytes` is a newtype over `str`: same representation, different type, so a PNG is not
 // something you would call `to_upper` on.
+//
+// Note the qualification: `IoList`, `IoError` and `Bytes` live in `std::fs`, not the
+// prelude. A name in the prelude is a name no program can declare, so only what syntax
+// actually needs is up there.
 
 use std::io;
 use std::string;
 use std::fs;
 use std::collections::list;
 
-fn write_via_handle(p: str, doc: IoList) throws IoError -> null {
+fn write_via_handle(p: str, doc: fs::IoList) throws fs::IoError -> null {
     let f = try fs::create(p);
     try fs::write_all(f, doc);
     try fs::write_all(f, ["more", ["and", "more"]]);
@@ -29,9 +33,9 @@ fn write_via_handle(p: str, doc: IoList) throws IoError -> null {
 
 fn main() {
     let p = "/tmp/neon-iolist.txt";
-    let head: IoList = "HEAD:";
-    let body: IoList = ["a", "b", "c"];
-    let doc: IoList = [head, body, "\n", ["nested", ["deep"]]];
+    let head: fs::IoList = "HEAD:";
+    let body: fs::IoList = ["a", "b", "c"];
+    let doc: fs::IoList = [head, body, "\n", ["nested", ["deep"]]];
 
     io::println("#{list::len(fs::flatten(doc))}");
     io::println(string::join(fs::flatten(doc), "|"));
@@ -42,8 +46,8 @@ fn main() {
     io::println(string::replace(back, "\n", "/"));
 
     // One-shot, and Bytes as a leaf.
-    let raw = try fs::read_bytes(p) catch (e) { "" as Bytes };
-    let doc2: IoList = ["<", raw, ">"];
+    let raw = try fs::read_bytes(p) catch (e) { "" as fs::Bytes };
+    let doc2: fs::IoList = ["<", raw, ">"];
     try fs::write(p, doc2) catch (e) { io::println("write failed") };
     io::println(string::replace(try fs::read(p) catch (e) { "?" }, "\n", "/"));
 
