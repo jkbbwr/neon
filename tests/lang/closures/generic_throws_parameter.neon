@@ -1,0 +1,52 @@
+// A generic function whose parameter arrow throws a type VARIABLE, not a concrete
+// error: `fn apply[T, E, R](f: (T) throws E -> R) throws E -> R`. This is the shape
+// `resource::new(payload, cleanup)` needs — cleanup is `(T) throws E -> ()`.
+//
+// Three separate substitution sites had to agree for this to work, and none of them
+// did. The callee monomorphises its `throws` through the instance substitution, so
+// `apply$IndexError` returns `Union([i64, IndexError])`; the *call site* built its
+// tagged result from the unsubstituted `Var("E")`, which erases to `neon_value` at the
+// C boundary, so the two disagreed about the layout of one call's result. The `try`
+// handler's error parameter erased the same way, which is subtler: it compiled and
+// caught, then read the message off the wrong layout and printed nothing.
+//
+// The goldens check the caught message, not just that a catch fired. The empty-message
+// version of this bug compiled clean and ran to completion.
+
+use std::io;
+use std::string;
+
+fn boom(n: i64) throws IndexError -> i64 {
+    if n < 0 {
+        throw IndexError { message: "negative" };
+    }
+    n * 2
+}
+
+fn apply[T, E, R](f: (T) throws E -> R, x: T) throws E -> R {
+    try f(x)
+}
+
+fn main() {
+    // A named throwing function through a generic throwing slot.
+    let ok = try apply(boom, 21) catch (e) { -1 };
+    io::println(to_string(ok));
+
+    let caught = try apply(boom, -1) catch (e) {
+        io::println(string::concat("caught: ", e.message));
+        -1
+    };
+    io::println(to_string(caught));
+
+    // A lambda in the same slot: it adopts the expected clause at creation.
+    let lam = try apply((n: i64) => {
+        if n < 0 {
+            throw IndexError { message: "from the lambda" };
+        }
+        n + 1
+    }, -1) catch (e) {
+        io::println(string::concat("caught: ", e.message));
+        -1
+    };
+    io::println(to_string(lam));
+}

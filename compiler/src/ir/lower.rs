@@ -710,6 +710,25 @@ impl Lower<'_> {
         }
     }
 
+    /// The error repr for a call into a generic instance. The callee's `throws` is read
+    /// off its *declared* signature, so where the clause is a type variable
+    /// (`fn apply[T, E, R](f: (T) throws E -> R) throws E -> R`) it must go through the
+    /// same substitution that monomorphised the callee — the one used to mangle its name.
+    ///
+    /// Skipping it is not a missed optimisation. The instance returns
+    /// `Union([ret, IndexError])`; an unsubstituted `Repr::Var("E")` reaches `c_type`'s
+    /// catch-all and erases to `neon_value`, so the *call site* builds
+    /// `Union([ret, neon_value])` and the two disagree about the layout of one call's
+    /// result. With `E = never` it is worse in kind: the instance returns its bare value
+    /// while the call site still tags it.
+    fn instance_throws_repr(
+        &self,
+        throws: TyId,
+        subst: &std::collections::HashMap<String, Repr>,
+    ) -> Repr {
+        substitute_repr(&self.repr_of_ty(throws), subst)
+    }
+
     /// The repr of a type, with this instance's type variables substituted away.
     fn repr_of_ty(&self, ty: TyId) -> Repr {
         let r = repr_of(&self.env.solver.t, ty);
@@ -1244,6 +1263,7 @@ impl Lower<'_> {
                         match_repr(&ret_template, &repr, &mut subst);
                     }
                     let mangled = mangle_instance(&mangle(&smodule, &sname), &subst);
+                    let err_repr = self.instance_throws_repr(throws, &subst);
                     self.instances.push(InstanceJob {
                         mangled: mangled.clone(),
                         module: smodule,
@@ -1252,7 +1272,7 @@ impl Lower<'_> {
                         impl_key: None,
                     });
                     let result = self.b.emit(Op::Call { func: mangled, args: arg_vs }, repr.clone(), ty);
-                    return self.wrap_throwing(result, throws, repr, ty);
+                    return self.wrap_throwing_repr(result, err_repr, throws, repr, ty);
                 }
 
                 let op = match native {
@@ -1321,6 +1341,9 @@ impl Lower<'_> {
                 let generics = m.generics.clone();
                 let mparams: Vec<TyId> = m.params.iter().map(|(_, t)| *t).collect();
                 let mret = m.ret;
+                // Set only on the generic-instance path, where the declared `throws` may
+                // still be a type variable. See `instance_throws_repr`.
+                let mut err_repr: Option<Repr> = None;
                 let op = match &m.native {
                     Some(sym) => Op::Native { symbol: sym.clone(), args },
                     None => {
@@ -1345,6 +1368,7 @@ impl Lower<'_> {
                             let ret_template = repr_of(&self.env.solver.t, mret);
                             match_repr(&ret_template, &repr, &mut subst);
                             let mangled = mangle_instance(&key, &subst);
+                            err_repr = Some(self.instance_throws_repr(throws, &subst));
                             self.instances.push(InstanceJob {
                                 mangled: mangled.clone(),
                                 module: impl_def.module.clone(),
@@ -1357,7 +1381,10 @@ impl Lower<'_> {
                     }
                 };
                 let result = self.b.emit(op, repr.clone(), ty);
-                self.wrap_throwing(result, throws, repr, ty)
+                match err_repr {
+                    Some(er) => self.wrap_throwing_repr(result, er, throws, repr, ty),
+                    None => self.wrap_throwing(result, throws, repr, ty),
+                }
             }
             Resolution::Switch(_) => self.unhandled_note("dispatch switch", repr, ty),
             Resolution::Bound { protocol, .. } => {
@@ -1505,7 +1532,11 @@ impl Lower<'_> {
         // The handler's error parameter takes the exact type the checker computed for what
         // this `try` can catch. Defaulting it to `any` would erase a type that is known.
         let err_ty = self.result.caught(id).unwrap_or(ty);
-        let err_repr = repr_of(&self.env.solver.t, err_ty);
+        // Through `repr_of_ty`, not `repr_of`: inside a generic instance whose clause is
+        // `throws E` this type *is* the variable, and an unsubstituted `Var` erases to
+        // `neon_value` at the C boundary — the handler would then read the error's fields
+        // off the wrong layout.
+        let err_repr = self.repr_of_ty(err_ty);
         let err_param = self.b.block_param(handler, err_repr, err_ty);
 
         self.handlers.push(handler);
@@ -1551,7 +1582,10 @@ impl Lower<'_> {
     /// Wrap a call whose target may throw: check the tagged result and, on error, jump
     /// to the enclosing handler with the error; on success continue with the ok value.
     fn wrap_throwing(&mut self, result: Value, throws_ty: TyId, ok_repr: Repr, ty: TyId) -> Value {
-        let err_repr = repr_of(&self.env.solver.t, throws_ty);
+        // `repr_of_ty` applies the *enclosing* instance's substitution. A call into a
+        // generic callee needs the callee's as well — those sites go through
+        // `instance_throws_repr` and `wrap_throwing_repr` directly.
+        let err_repr = self.repr_of_ty(throws_ty);
         self.wrap_throwing_repr(result, err_repr, throws_ty, ok_repr, ty)
     }
 

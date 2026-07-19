@@ -1,0 +1,27 @@
+// The same generic slot, instantiated with a function that throws nothing: `E` solves
+// to `never`, so the instance returns its bare value with no tag at all — and the call
+// site has to know that.
+//
+// This is the variant of the erasure bug that fails in kind rather than in layout. The
+// instance correctly returned `int64_t`; the call site, reading an unsubstituted
+// `Var("E")` that is not `Never`, still wrapped the result in a tagged union and read a
+// tag that was never written. `Resource[T, never]` — the infallible cleanup whose
+// `release` needs no `try` — is exactly this instantiation.
+//
+// Note there is no `try` here: `apply`'s clause resolves to `throws never`, so calling
+// it is not a throwing call.
+
+use std::io;
+
+fn apply[T, E, R](f: (T) throws E -> R, x: T) throws E -> R {
+    try f(x)
+}
+
+fn triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn main() {
+    io::println(to_string(apply(triple, 5)));
+    io::println(to_string(apply((n: i64) => n + 1, 41)));
+}
