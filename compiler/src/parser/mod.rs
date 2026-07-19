@@ -2,13 +2,21 @@
 //!
 //! Four decisions account for most of what looks unusual below.
 //!
-//! **The grammar is built once.** Every rule takes the sub-parsers it needs as
-//! arguments rather than calling the constructor for them, and `module` is the
-//! single place they are made. A rule that called `type_spec()` would get a
-//! private copy of that entire grammar: before this, the expression grammar was
-//! being constructed five times over and the type grammar fourteen. `.boxed()`
-//! is on nearly every rule for the same reason — without it the combinator
-//! types nest structurally and compile time grows superlinearly.
+//! **The grammar is built once — once per thread, for the life of the process.**
+//! Every rule takes the sub-parsers it needs as arguments rather than calling
+//! the constructor for them, and `module` is the single place they are made. A
+//! rule that called `type_spec()` would get a private copy of that entire
+//! grammar: before this, the expression grammar was being constructed five
+//! times over and the type grammar fourteen. `.boxed()` is on nearly every rule
+//! for the same reason — without it the combinator types nest structurally and
+//! compile time grows superlinearly.
+//!
+//! The finished graph is then cached in the `PARSER` thread-local and reused by
+//! every `parse`, which is not merely an optimisation: the graph *cannot be
+//! freed*. `Recursive::declare` hands out a strong `Rc` and the mutually
+//! recursive expression rules define themselves in terms of it, so the graph
+//! contains reference cycles. Building it per call leaked it per call — 25.4 kB
+//! a time, measured. See `PARSER`.
 //!
 //! **Precedence is not written here.** `binary_ops` iterates
 //! `crate::ops::BINARY_OPS`; the levels, the operators at each level and their
