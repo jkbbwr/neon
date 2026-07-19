@@ -1,0 +1,24 @@
+//@ compile-fail
+//@ error-contains: is a marker, so it cannot be implemented
+
+// A marker is satisfied by a rule the compiler applies to a type's structure — `Ord` holds
+// for a type whose parts are all ordered — so there is nothing for an impl to supply.
+//
+// Writing one used to be accepted in silence. A marker declares no methods, so the impl had
+// nothing to leave unimplemented and no arity to get wrong; it sat inert while reading, to
+// anyone scanning the file, as though it granted the bound. `satisfies_marker` answers from
+// the compiler's rule and never consults the impl table, so the impl could not have taken
+// effect even in principle.
+//
+// That is the shape worth rejecting: not a wrong answer, but a declaration that looks
+// load-bearing and is not. `decisions.md` recorded this as unwritable; it was writable.
+
+use std::io;
+
+record Pair { a: i64, b: i64 }
+
+impl Ord for Pair {}
+
+fn main() {
+    io::println("this must not compile");
+}

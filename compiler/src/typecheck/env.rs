@@ -54,6 +54,11 @@ pub struct TypeError {
 pub enum TypeErrorKind {
     Unknown(String),
     UnknownProtocol(String),
+    /// `impl Ord for X` — a marker is satisfied by a compiler rule, not by an impl.
+    /// Accepted silently before this existed: a marker declares no methods, so there is
+    /// nothing for the impl to leave unimplemented, and it sat inert while reading as
+    /// though it granted the bound.
+    ImplForMarker { marker: String },
     Duplicate(String),
     Arity { name: String, expected: usize, found: usize },
     DuplicateField(String),
@@ -169,6 +174,12 @@ impl fmt::Display for TypeError {
         match &self.kind {
             TypeErrorKind::Unknown(n) => write!(f, "unknown type `{n}`"),
             TypeErrorKind::UnknownProtocol(n) => write!(f, "unknown protocol `{n}`"),
+            TypeErrorKind::ImplForMarker { marker } => write!(
+                f,
+                "`{marker}` is a marker, so it cannot be implemented. A marker is satisfied \
+                 by a rule the compiler applies to the type's structure, not by an impl -- \
+                 writing one would look like it granted the bound while doing nothing"
+            ),
             TypeErrorKind::Duplicate(n) => write!(f, "`{n}` is already declared in this module"),
             TypeErrorKind::Arity { name, expected, found } => write!(
                 f,
@@ -1256,6 +1267,15 @@ impl Env {
             self.error(span.clone(), TypeErrorKind::UnknownProtocol(i.protocol.join("::")));
             return;
         };
+        // A marker has no methods, so an impl for one has nothing to fail on and was
+        // accepted in silence -- inert, while reading as though it granted the bound.
+        // `satisfies_marker` answers markers from the compiler's own rule and never
+        // consults the impl table, so the impl could not have had an effect either way.
+        if self.protocols[protocol.0].is_marker {
+            let marker = self.protocols[protocol.0].name.clone();
+            self.error(span.clone(), TypeErrorKind::ImplForMarker { marker });
+            return;
+        }
         let scope = Scope::new(module).with_rigid(self, &i.generics);
 
         // `impl Container for Box` names the constructor, not a type, so it has no
