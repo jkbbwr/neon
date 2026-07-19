@@ -222,6 +222,23 @@ forces `opacity_permits` to treat the root as a non-container — see the except
 
 ---
 
+## Later — not now
+
+### 18. Model-check the compiler with Kani
+
+The runtime has CBMC models (`runtime/models/`, rules in its README). The compiler is Rust
+and gets the same treatment through Kani, which is CBMC underneath.
+
+The shape of what is worth proving is already known from today: the classes that produced
+bugs are exactly the ones a model checker is good at. Injectivity of the keys in item 12 is
+a proof obligation, not a test — `repr_key(a) == repr_key(b) implies a == b` over
+bounded reprs. Same for the block-parameter relation in item 11 once someone defines it,
+and for `substitute`'s termination on recursive types.
+
+Owner's call on timing; recorded so it is not lost.
+
+---
+
 ## Unproven leads
 
 Marked as such because nobody built a repro. Worth a pass, not worth asserting.
