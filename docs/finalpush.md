@@ -84,29 +84,39 @@ corpus programs run leak-free under ASan.
   `record == record`, `record < record` and `tuple == tuple` emitted C comparing two
   structs (not valid C — the *C compiler* failed, not Neon), and `list == list` compiled
   and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
-- **`==` is not yet structural on four reprs.** The 2026-07-19 work made equality
-  structural for records, tuples, lists and unions; these four were *already* wrong before
-  it and are unchanged by it — each verified against `7fbd131`, which behaves identically.
-  The decision doc claims equality is total on every type, so this is the gap between the
-  claim and the code, and the checker offers no diagnostic for any of them because the
-  `==` arm never consults a shape check at all:
+- **`==` is not yet structural on three reprs.** All three are now *diagnostics* rather
+  than wrong answers (`is_equatable` in `typecheck/ordered.rs`), so nothing silently
+  compares addresses and nothing reaches the C compiler. Each is an opaque pointer today:
 
-  | expression | today | should be |
+  | expression | why | fix |
   | --- | --- | --- |
-  | `Map == Map` | `false` for equal contents (pointer compare) | structural |
-  | `(List[i64] \| null) == same` | `false` for equal contents (pointer compare) | structural |
-  | `closure == closure` | **gcc error**, `invalid operands to binary ==` | a diagnostic |
-  | `(P \| :none) == P` | **gcc error** on a record/tuple payload | structural |
+  | `Map == Map` | opaque container | same length, then every key's value |
+  | `(List[i64] \| null) == same` | pointer-backed `T \| null` lowers to a bare nullable pointer with no tag, so the structural routing never sees it | null-check, then the inner compare |
+  | self-referencing record `==` | `BoxedRec` is a pointer | walk the fields through the pointer |
 
-  The last is `union_compare` (`c.rs:955`) emitting a raw C `==` on the projected payload;
-  it needs to call `eq_expr` on the variant repr instead. `Nullable` also needs unwrapping
-  in `scalar_repr`, or its own arm in the aggregate routing. Closure equality has no
-  structural answer and should be refused by the checker, which means `==` needs an
-  `is_equatable` gate the way `<` now has `is_ordered`.
+  `closure == closure` is also rejected, and that one is permanent -- there is no structural
+  answer. `(List[i64] \| null)` is the one worth doing first: an optional list is a common
+  type, and the fix is a `Repr::Nullable` arm in `eq_expr` plus routing it in `prim`.
 
-  A related trap, since two operands that are *both* unions never reach `union_compare`:
-  `prim_operand` projects the first non-null variant of each and compares those, so
-  `(i64 | bool)` operands compare an `i64` against a `bool` — `1 == true` is `true`.
+  Fixed on the way, both pinned by `operators/union_vs_union_equality.neon`: two *union*
+  operands used to project each side to its first variant and compare those, so
+  `(i64 | bool)` compared an i64 against a bool and `1 == true` was true; and
+  `union_compare` compared a union against a bare variant with a raw C `==` on the payload,
+  which is not valid C once the variant is a record, a tuple or a `str`. Both now compare
+  tag first, then the payload through `eq_expr`.
+
+- **A `let` with a union annotation keeps the narrow repr.** Pre-existing, verified
+  identical on `7fbd131`, and not an equality bug -- it just surfaces through one:
+
+  ```neon
+  let none: P | :none = :none;
+  none == P { x: 1 }        // gcc: invalid operands to binary == ('uint64_t' and 'nr0')
+  ```
+
+  The annotation says `P | :none`, but the value is lowered at the repr of the variant it
+  was initialised with (`Tag`), so any later use expecting the union sees the wrong layout.
+  A parameter or a function return of the same type is fine, which is why the corpus test
+  goes through functions. The fix belongs with `let`'s lowering, not with comparison.
 
 - **A generic cannot call a generic.** Pre-existing and unrelated to comparison —
   verified identical on `7fbd131`. Passing an argument whose type is the caller's own

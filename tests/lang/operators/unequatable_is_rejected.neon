@@ -1,0 +1,21 @@
+//@ compile-fail
+//@ error-contains: cannot be compared with `==`
+//
+// Equality is meant to be structural on every type, and is on primitives, `str`,
+// records, tuples, lists and unions. Four shapes the backend cannot compare are
+// refused rather than answered wrongly — before this, `Map == Map` returned false
+// for equal maps (it compared two addresses) and a closure `==` reached the C
+// compiler, which rejected it with a message naming a generated temp file.
+//
+// A closure is permanent: there is no structural answer. `Map`, a self-referencing
+// record and a `List` behind `null` are gaps — each is an opaque pointer today. Note
+// `P | null`, `str | null` and `i64 | null` are fine, since they carry a tag.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    let a = map::set(map::new(), "k", 1);
+    let b = map::set(map::new(), "k", 1);
+    io::println("#{a == b}");
+}

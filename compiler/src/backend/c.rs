@@ -966,8 +966,14 @@ fn union_compare(f: &Func, op: PrimOp, args: &[Value]) -> Option<String> {
         _ => return None,
     };
     let i = variants.iter().position(|r| r == other_repr)?;
-    let eq =
-        format!("({}.tag == {i} && {}.u._{i} == {})", var(u), var(u), prim_operand(f, other));
+    // The payload compares *structurally*, like anything else: a raw C `==` here worked
+    // only while the variant was a scalar, and emitted `nr0 == nr0` -- which C rejects
+    // outright -- the moment the variant was a record, a tuple or a `str`.
+    let eq = format!(
+        "({}.tag == {i} && {})",
+        var(u),
+        eq_expr(other_repr, &format!("{}.u._{i}", var(u)), &prim_operand(f, other)),
+    );
     Some(match op {
         PrimOp::Ne => format!("(!{eq})"),
         _ => eq,
@@ -1199,6 +1205,20 @@ fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
     if matches!(op, PrimOp::Eq | PrimOp::Ne) {
         if let Some(s) = union_compare(f, op, args) {
             return s;
+        }
+        // Two unions: `union_compare` handles only union-against-a-bare-variant, and
+        // `prim_operand` below would project *both* sides to their first variant and
+        // compare those -- so `(i64 | bool)` operands compared an i64 against a bool and
+        // `1 == true` was true. Compare the tagged values whole instead.
+        if let (Some(&x), Some(&y)) = (args.first(), args.get(1)) {
+            let (rx, ry) = (f.value_repr(x), f.value_repr(y));
+            if matches!(rx, Repr::Union(_)) && rx == ry {
+                let eq = eq_expr(rx, &var(x), &var(y));
+                return match op {
+                    PrimOp::Ne => format!("(!{eq})"),
+                    _ => eq,
+                };
+            }
         }
     }
     let scalar = |v: Value| scalar_repr(f.value_repr(v));

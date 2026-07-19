@@ -88,6 +88,8 @@ pub enum TypeErrorKind {
     Incomparable { left: String, right: String },
     /// `a < b` where the operands do share a type, but that type has no order.
     Unordered { ty: String },
+    /// `a == b` on a type the backend cannot compare structurally.
+    Unequatable { ty: String },
     /// A required (non-nullable) field the record literal did not provide.
     MissingField(String),
     /// `for x in e` where `e` is not a collection.
@@ -227,6 +229,16 @@ impl fmt::Display for TypeError {
             TypeErrorKind::Incomparable { left, right } => write!(
                 f,
                 "`{left}` and `{right}` share no common type, so they cannot be compared"
+            ),
+            TypeErrorKind::Unequatable { ty } => write!(
+                f,
+                "`{ty}` cannot be compared with `==` yet. Equality is meant to be \
+                 structural on every type, and is on primitives, `str`, records, tuples, \
+                 lists and unions -- but a closure has no structural answer at all, and a \
+                 `Map`, a self-referencing record, or a `List` behind `null` is an opaque \
+                 pointer the compiler would otherwise compare by address. Comparing those \
+                 by hand -- field by field, or `map::len` plus the keys -- is the way round \
+                 it for now"
             ),
             TypeErrorKind::Unordered { ty } => write!(
                 f,

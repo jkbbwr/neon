@@ -1082,6 +1082,13 @@ impl Checker<'_> {
                     if self.env.solver.is_empty(meet) && !both_atoms {
                         let (a, b) = (self.show(l), self.show(r));
                         self.error(e.span.clone(), TypeErrorKind::Incomparable { left: a, right: b });
+                    } else if !super::ordered::is_equatable(self.env, l)
+                        || !super::ordered::is_equatable(self.env, r)
+                    {
+                        // Both sides, not the meet: `Map[str, i64] == Map[str, i64]` meets
+                        // itself, and it is the operands the backend has to compare.
+                        let ty = self.show(l);
+                        self.error(e.span.clone(), TypeErrorKind::Unequatable { ty });
                     }
                 }
                 self.env.solver.t.bool()
