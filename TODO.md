@@ -150,6 +150,28 @@ family as item 7 and wants the same variant-switch machinery.
 Reports ``L has no field `xs` `` for a field that is declared. Construction works; only the
 read fails.
 
+### 8b. `test` blocks are silently inert
+
+```neon
+test "arithmetic" { assert(1 + 1 == 3); }   // compiles; the program prints "main ran"
+```
+
+The block parses and type-checks. The failing assert does nothing, and there is no
+`neon test` verb in `cli/src/cmd/`. The language has testing syntax that runs nothing —
+`decisions.md` chose assert intrinsics over a library specifically for the reporting they
+would give, and that reporting does not exist.
+
+### 8c. `bsr` semantics are the C compiler's choice, not ours
+
+`-8 bsr 1` gives `-4` — an arithmetic shift — because `backend/c.rs` emits a bare
+`({a} >> ({b} & 63))` on `int64_t`, and gcc and clang happen to choose arithmetic. C11
+§6.5.7p5 makes a right shift of a negative signed value **implementation-defined**, which
+is precisely what `decisions.md` says codegen must guarantee against.
+
+Doubly vacuous as written: the rule is stated as type-driven (logical for unsigned,
+arithmetic for signed) and **there is no unsigned type in the language**. Either emit the
+shift explicitly, or write down that `bsr` is arithmetic and mean it.
+
 ---
 
 ## P1 — structural. These are why P0 items keep appearing.
