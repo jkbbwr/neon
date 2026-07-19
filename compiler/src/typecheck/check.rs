@@ -1438,11 +1438,15 @@ impl Checker<'_> {
 
     /// The visibility rule itself, shared by both entry points so they cannot drift.
     ///
-    /// `owner` is the module that declared the record. Access is allowed from that module
-    /// and from its immediate parent, and nowhere else — not from a sibling, and not from
-    /// a grandparent. The parent case is the one that carries weight: `std::fs`'s
-    /// `internal mod raw` declares the handle and the module above implements the public
-    /// API over it, which is only possible if the parent can see inside.
+    /// `owner` is the module that declared the record. Access is allowed from that module,
+    /// from anything **nested inside** it, and from its immediate parent — and nowhere
+    /// else, so not from a sibling and not from a grandparent. `opacity_permits` is where
+    /// the three cases are spelled out and justified; this doc previously named only two
+    /// of them, which is the drift that comment is there to prevent.
+    ///
+    /// Both directions carry weight, and `std::fs` needs each. Its `internal mod raw`
+    /// reaches *outward* to build the `File` its parent declares, and the module above
+    /// reaches *inward* to the descriptor `raw` wraps.
     ///
     /// An empty owner path is the prelude, which has no name to print.
     fn report_opacity(

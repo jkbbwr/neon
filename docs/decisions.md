@@ -3,6 +3,12 @@
 The corpus (`tests/lang/`) says **what** the language does. This says **why**, and what was
 rejected.
 
+Where a decision states an intention the compiler does not yet meet, it says so and points
+at `TODO.md`, which lists what is known-broken with a repro for each. A decision that
+quietly drifts ahead of the code is worse than no decision: this project has spent whole
+days chasing bugs whose shape was a comment asserting a property that had stopped being
+true, and a reader trusting it and stopping looking.
+
 ---
 
 ## Types
@@ -33,11 +39,19 @@ Well-formed iff all of:
    counting as a guard. Removed: it made `mu type Inner = Rng` well-formed, which it is
    not, and `opaque` no longer bears on contractivity at all.)*
 
+   *One widening the rule as written does not describe:* a **newtype** counts as a guard
+   during the contractivity walk, so the constructor can be reached through a name rather
+   than written in the body. It is coherent — a newtype is a data constructor, and it is
+   the one nominal sort the walk is not opaque to — but "written there" is not literally
+   what the code tests.
+
 2. Recursive references occur **only in covariant positions**. A function parameter is
-   contravariant and therefore excluded; a return is covariant and allowed.
+   contravariant and therefore excluded; a return is covariant and allowed. A `throws`
+   clause guards covariantly too, like a return.
 3. **No recursion beneath negation or difference.**
 4. The alias expands **equi-recursively — no runtime wrapper.** `mu type A = :ok | List[A]`
    and its one-step unfolding are the same type: no fold/unfold, no tag, no allocation.
+   The backend carries the cycle as a layout back-edge, not as an operation.
 
 Self-recursion only for v1; mutual recursion is a clear "not yet supported" error.
 
@@ -47,13 +61,18 @@ there is none, either the binder is wrong or the type is.
 *Against implicit recursion through plain `type`:* the restrictions above are unusual
 enough to be worth a visible keyword, and a typo that creates accidental recursion should
 be a plain error rather than a silently recursive type. A plain `type` alias that turns out
-recursive is an error.
+recursive is an error, and its message names `mu type`.
 
 **`mu newtype` is banned, and a `newtype` may not be recursive.** `newtype T = List[T]` is
 an error. Recursion is `mu type`'s job; a `newtype` is a nominal wrapper and nothing else.
 A recursive *nominal* type is what `record` is for. Without an explicit ban, `newtype`
 would acquire recursion by accident through the same lazy name-reference mechanism its
 definitions table uses — a feature nobody designed, with none of the checks above.
+
+*Where the code is thinner than this reads:* the recursion ban is a real diagnostic
+(`RecursiveNewtype`). `mu newtype` is banned only by **absence** — the grammar has no such
+production, so it is a generic parse error rather than a message saying the combination is
+deliberately refused. The ban holds; the diagnostic does not explain itself.
 
 **A nominal recursive record satisfies a structural μ-type — structurally.**
 `record Node { next: Node | null }` satisfies `mu type T = { next: T | null }`. It costs
@@ -75,7 +94,8 @@ is a union.
 *Against widening to an `atom` supertype* (mirroring `let x = 1` widening to `i64`): that
 would discard the singleton precision that makes `:ok | :err` unions and exhaustiveness
 work, which is the entire reason atoms are types. An annotation is required exactly where
-you intend to rebind, which is where one earns its keep.
+you intend to rebind, which is where one earns its keep. There is no `atom` primitive in
+the type language, so there is nothing to widen *to*.
 
 ### Generic arguments are covariant
 
@@ -85,6 +105,10 @@ Sound **because collections are values**. Covariance is only unsound for *mutabl
 containers — that is why Java's arrays are broken and why Rust needs variance
 annotations. An immutable `List[i64]` genuinely is a `List[i64 | str]`: there is no
 operation that could write a `str` into it and be observed through the first type.
+
+It is also not a rule the checker enforces separately: a generic argument is stored in a
+reserved record field, and record subtyping is fieldwise, so covariance falls out of the
+representation rather than being bolted on.
 
 *Against invariance* (`List[i64]` and `List[i32]` unrelated, which a prior implementation
 required): it contradicts μ-types. The rule that a recursive reference must occur in a
@@ -117,7 +141,9 @@ diagnostic when it appears as a declaration, because people will type it.
 
 *Accepted costs:*
 - **Variant namespacing.** Two sum types cannot each own a `Red`; record names are global,
-  so a sum type puts N names at the top level.
+  so a sum type puts N names at the top level. This is worse than it reads: a record's
+  nominal identity is currently its **bare name**, with the declaring module dropped, so
+  the collision is not merely stylistic — see `any` below and `TODO.md` item 1.
 - **Binding patterns.** `Shape::Circle(r) => ...` has no equivalent; you re-destructure
   (`is Circle => { let c = s as Circle; ... }`). This is the real day-to-day cost —
   destructuring and record patterns are the compensating work, not optional extras.
@@ -168,7 +194,9 @@ Specificity resolves **per value, not per static type**:
 
 One value, one impl, regardless of what the checker happened to know. Nested-only overlap
 is what makes "most specific" well defined: for any value the applicable impls form a
-chain, so a unique minimum always exists.
+chain, so a unique minimum always exists. Where the receiver is not a subtype of a single
+target, dispatch emits a runtime discrimination over the intersections rather than picking
+statically.
 
 *Against disjoint-only:* a library writing `impl Display for any` would lock every other
 module out of `Display` permanently — the first wide impl wins and nobody else can ever
@@ -177,6 +205,13 @@ participate. Not a trade-off, a defect.
 *Against no orphan rule:* adding a dependency could silently change which impl your values
 take, and two libraries could impl the same pair with no principled winner.
 
+**What is enforced today, and what is not.** The orphan rules are real: `orphan` in a
+library is rejected, an orphan that is not disjoint from the existing impls is rejected,
+and unnested overlap is rejected at declaration. The **ownership rule for plain impls is
+not checked at all**, and cannot be yet — `use` does not load a dependency, so every
+declaration the checker can see is local and the question has only one answer. Asking it
+now would be theatre. It belongs here when dependency loading lands.
+
 ### `any` is ⊤, and there is no such thing as an erased type
 
 `any` is the type inhabited by every value — the top type. It is **not** a marker for "the
@@ -184,7 +219,9 @@ checker could not work it out", and the type language cannot express that idea a
 
 This is structural rather than a rule to remember: the checker's type representation has no
 erased variant, so there is nothing to fall back *to*. Where a type cannot be determined,
-the checker emits a diagnostic; it does not return a type, because no type means "unknown".
+the checker emits a diagnostic and poisons that expression; it does not return a type,
+because no type means "unknown". Every remaining mention of `Erased` in the tree is prose
+about the fallback that was removed.
 
 Erasure is a **lowering** concern. A value of type ⊤ needs a uniform runtime
 representation — that is a consequence of ⊤, not its meaning, and it is decided in codegen.
@@ -195,6 +232,12 @@ becomes `any`, and nothing distinguishes a deliberate `any` from a failure. In t
 implementation roughly 70 of ~108 erased types were fallbacks rather than decisions, and
 the consequences ran all the way to a stack-buffer-overflow on every `list::new()`.
 
+**Protocols are bounds, never types.** `fn log(e: Error)` and `List[Error]` do not
+typecheck: protocols live in their own table and a type position never consults it. The
+rejection is real but the message is generic — "unknown type `Error`" — which reads as a
+missing import rather than a category error. That line is deliberate; see "`main` does not
+throw `any`" for what depends on it.
+
 ---
 
 ## Errors
@@ -202,8 +245,9 @@ the consequences ran all the way to a stack-buffer-overflow on every `list::new(
 ### Checked `throws`, with the try / try? / try! triad
 
 `try` propagates, `try?` softens to `T | null`, `try!` asserts. A single `catch` binds the
-error union and matches inside it; there are no multi-catch clauses. A bare call to a
-throwing function is a compile error.
+error union and matches inside it; there are no multi-catch clauses — the grammar admits
+exactly one optional catch arm, so multi-catch is not merely unimplemented but unsayable.
+A bare call to a throwing function is a compile error.
 
 ### `try` accepts a block
 
@@ -218,7 +262,10 @@ Every throwing call inside is covered.
     fn main() throws IoError { ... }            // error: main's throws clause is fixed
 
 `main` returns `()`; the runtime wraps it to exit 0. Both halves of its signature are
-fixed. It carries an implicit `throws Error`, never written and never changed — and since
+fixed, and fixed means *written at all*: an explicit `-> ()` is an error, and so is
+restating the implicit `throws Error`. There is one spelling of `main`.
+
+It carries an implicit `throws Error`, never written and never changed — and since
 every error record implements `Error`, any error propagates to `main`, so a bare
 `try foo()` there always compiles without declaring anything. "Requires a compatible
 enclosing `throws`" is therefore only a real constraint in *non*-`main` functions.
@@ -247,7 +294,8 @@ infecting the caller's signature, and the ambiguity reappears only where the pro
 opts into it by writing `try?` — which is a request to collapse the distinction.
 
 `[]` traps rather than throws because a bounds violation is a bug, not a recoverable
-condition, and a checked throw would force `try xs[i]` on every element access.
+condition, and a checked throw would force `try xs[i]` on every element access. A negative
+index traps on the same check, not by wrapping — see "Indices are `i64`".
 
 ### Abnormal termination exits 101, on stderr
 
@@ -263,7 +311,8 @@ that *chose* to fail from one that *died*.
 
 ### Rebindable `let`; no `mut`
 
-Bindings rebind. Closures capture **by value, sealed**. Shadowing is allowed.
+Bindings rebind. Closures capture **by value, sealed** — a captured name cannot be rebound
+through the closure. Shadowing is allowed.
 
 ### `and` binds tighter than `or`; `|>` binds tighter than comparison
 
@@ -317,10 +366,10 @@ A prior implementation returned `Erased` from every protocol call except `eq` �
 including every `to_string` — so `Display` did not work and interpolation could not. The
 corpus routed around it and fossilised the workaround. `string::int_to_str` was a codegen
 bug wearing a stdlib API's costume, which is the third time that shape has turned up
-here after invariance and `T | null`.
+here after invariance and `T | null`. The converters are gone from the stdlib entirely.
 
-`string::to_int` stays: parsing is not stringifying, and it throws. The pair is
-asymmetric on purpose — `to_string` is total, `to_int` is partial.
+`string::to_int` stays: parsing is not stringifying, and it throws `ParseError`. The pair
+is asymmetric on purpose — `to_string` is total, `to_int` is partial.
 
 ### Generic inference is strict: no silent widening
 
@@ -336,12 +385,18 @@ to no fallback to `any` and no erased type.
 
 So widening is explicit. A turbofish (`push[i64|str](xs, "s")`) or the expected type
 (`-> List[i64|str] { push(xs, "s") }`) sets `T` first, and the arguments then conform to
-it. Inference is top-down before bottom-up for exactly this reason.
+it. Inference is top-down before bottom-up for exactly this reason: the expected type is
+applied before any argument is inspected, and a turbofish short-circuits inference outright.
 
 The cost, stated plainly: it is mildly order-dependent — the first argument mentioning a
 variable anchors it — and it rejects a few programs sound in theory, like `pair(1, "s")`,
 which needs `pair[i64|str](1, "s")`. Every such rejection is a place the wide type was
 probably unintended, and the escape hatch is one turbofish away.
+
+*Where it still bites:* inference is first-wins and returns what it managed, without
+checking that every variable was pinned. A call that leaves one unsolved reaches codegen as
+an internal error rather than a diagnostic (`TODO.md` item 5). The decision is right; the
+failure mode is not yet a message.
 
 ### Comparison is structural, and ordering is total within a type
 
@@ -349,10 +404,11 @@ probably unintended, and the escape hatch is one turbofish away.
 at the end for what moved and why.)*
 
 `==` and `!=` compare *structure*, always, on every type: primitives by value, `str` by
-bytes, records fieldwise, tuples elementwise, lists elementwise and by length, unions by
-tag and then payload. No impl is required and none can override it. `<`, `<=`, `>`, `>=`
-order the same way — lexicographically, records by field in declaration order — so every
-type is ordered and `sort(xs)` works on any list without a comparator.
+bytes, records fieldwise, tuples elementwise, lists elementwise and by length, maps by
+content, unions by tag and then payload. No impl is required and none can override it.
+`<`, `<=`, `>`, `>=` order the same way — lexicographically, records by field in
+declaration order — so ordering is a property a type *has* by construction, and `sort(xs)`
+needs no comparator.
 
 There is no `Eq` protocol and no `Ord` protocol. A comparison is a primitive that the
 backend expands per type, the same machinery that already builds map-key witnesses.
@@ -376,10 +432,32 @@ honest answer is "you did not say" is the thing this language does not do (see t
 rule, the required `else`, and record literals rejecting excess fields).
 
 So the operands must overlap. `1 < "s"` and `P < Q` are diagnostics, as they already were.
+The overlap test has one deliberate relaxation for equality: one operand being a *subtype*
+of the other counts as comparable even when the meet is empty, because `xs == []` compares
+`List[i64]` against `List[never]`, and `List[never]` has no inhabitants to intersect with —
+the overlap test alone rejected the natural way to ask "is this empty".
+
 Ordering a *union* is a diagnostic too: `(i64 | :none) < (i64 | :none)` typechecks under
 the overlap rule but has no answer that is not an invented rank between the arms, and
 inventing one would be the cross-type order sneaking back in through a side door. Union
-*equality* is fine and stays total — compare tags, then payloads when they match.
+*equality* is fine — compare tags, then payloads when they match.
+
+**"Every type" is not literally every type**, and the exceptions are diagnostics rather
+than wrong answers. Ordering recurses, so a type is ordered only when every part of it is:
+an **atom** is a name rather than a magnitude, a **union** has no honest rank between its
+arms, `null` has nothing to compare, and `Map`, a **closure** and a **self-referencing
+record** are opaque pointers with nothing to walk. `List[T]` is ordered exactly when `T`
+is, and a record when every field is. Equality is wider but not total either: a **closure**
+is refused permanently, and so is a **union of two different records**, because the
+field-reading path handles a single record atom and `A | B` normalises to two BDD paths of
+which the second carries a negative. Relaxing that to walk every path was tried on
+2026-07-19 and is not sufficient; it is tracked as lead L8 in `TODO.md`. Note that
+`P | null`, `str | null`, `i64 | :none` and a union against a bare variant all compare
+fine — they carry a tag and at most one record atom.
+
+The checker and the backend answer this question from one module, and the backend panics
+rather than emitting a comparison it cannot make, so a disagreement between them is a
+compiler crash and not a bad answer.
 
 *Consequences, stated because they bite:*
 
@@ -389,15 +467,31 @@ does semver with prerelease tags, nor `Money { amount, currency }`. The escape h
 `sort_by(xs, key)` beside `sort(xs)` — one obvious function instead of a protocol, a
 dispatch path, and seven natives.
 
-Ordering recurses, so a type is ordered only when every part of it is. `Map` has no order
-(opaque, pointer-backed), `List[T]` is ordered exactly when `T` is, and a record that
-reaches itself is a pointer with nothing to walk. All three read as one ordered shape at
-the top level, and all three are diagnostics.
+`f64` makes "total" a slight lie at the leaf. NaN compares false against everything
+including itself, so `NaN == NaN` is false, `{x: NaN} == {x: NaN}` is false — a record
+that is not equal to itself — and **`sort` on a list containing NaN returns an unspecified
+permutation**, not merely NaN in an odd position. IEEE-754 defines a `totalOrder` that
+would fix sorting, and it was declined: it makes `0.0 == -0.0` false and `NaN == NaN` true,
+trading a rare surprise for a common one. The operators do what the hardware does, which
+is what every other language has taught people to expect. `sort` is where it shows.
 
-### Cleanup is a value, not a keyword
+*What moved:* the implementation never did dispatch — `check.rs` did an overlap test and
+lowering emitted a primitive compare, while the prelude's `Eq`/`Ord` impls named seven
+runtime symbols that do not exist and would not have linked. The doc lost. Four bugs fell
+out of the gap and are fixed with this: `record == record`, `record < record` and
+`tuple == tuple` each emitted C comparing two structs, which is not valid C; and
+`list == list` compiled and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
 
-*(Decided 2026-07-19. Designed, not yet implemented — `docs/design/resources.md` is the
-spec.)*
+Three further gaps this section once listed as open have since been closed by giving the
+backend the comparison it was missing — `Map`, a self-referencing record, and a `List`
+behind `null`. Two unions compared against each other once projected both sides to their
+first variant, so `1 == true` was true at type `i64 | bool`; that is fixed and is now
+tag-then-payload.
+
+### Resources: cleanup is a value, not a keyword
+
+*(Decided 2026-07-19. Implemented: `std::resource` and `std::fs::File` exist and the
+`tests/lang/resources/` corpus passes. `docs/design/resources.md` is the spec.)*
 
     opaque record File { r: Resource[i64, IoError] }
 
@@ -444,13 +538,26 @@ all.
 **A trap skips cleanup entirely** -- `neon_trap` calls `_exit` with no unwinding, by design,
 so buffered writes are lost on the way out.
 
+**The guard rests on `opaque`, which does not yet hold.** `opaque record File` is what stops
+a caller reaching `f.r` and releasing the descriptor behind the module's back. Field access
+*is* checked — but a record's nominal identity is its bare name with the declaring module
+dropped, so a second module declaring `record File` declares the *same type* and can forge
+one. That is `TODO.md` item 1, and until it is fixed the encapsulation this design assumes
+is a convention rather than a guarantee.
+
 ### The compiler learns a type's representation from an annotation, not a name
 
 `record_repr` matched the literal strings `"List"` and `"Map"` to give them runtime
 representations, and adding `File` to that table was what made file handles magic.
 `@runtime("neon_list")` on the declaration replaces it: the marker travels with the type,
-so nothing is hardcoded, `File` becomes an ordinary record holding a `Resource`, and the
-special-case count goes from three to zero.
+so a new runtime-backed type is a stdlib declaration rather than a compiler edit, and
+`File` becomes an ordinary record holding a `Resource`.
+
+*Not finished.* The special-case count went from three to **two**, not to zero. `List` and
+`Map` are still matched by literal name in `record_repr`, because their element types drive
+witness emission and the codegen-assisted natives, so they move separately; they are also
+matched by name in `typecheck/ordered.rs`. Moving them out is `TODO.md` item 17, and the
+bare-name matching is leads L1/L2 there.
 
 Stdlib-only, like markers. It names a C type the backend must already know, and pointing it
 at one that does not match the expected ABI is the same hazard `@native` carries.
@@ -476,9 +583,18 @@ against the bound, and each call site is checked against the type actually suppl
 A marker is not a protocol wearing a hat. A protocol is a *choice* a type makes about how to
 answer something — that is why `Display` is one. A marker is a *fact* about a type that the
 type does not get a say in: `Ord` follows from structure, and letting a type claim it while
-holding a `Map` would be a lie the backend cannot honour. So `impl Ord for X` is not merely
-unnecessary, it is unwritable, and markers are prelude-only — only the compiler can supply
-a rule, so a marker it does not recognise is a diagnostic at the declaration.
+holding a `Map` would be a lie the backend cannot honour. Markers are prelude-only — only
+the compiler can supply a rule, so a marker it does not recognise is a diagnostic at the
+declaration, and `Ord` is the only rule that exists.
+
+*One claim this section used to make that the code does not:* `impl Ord for X` is described
+here as *unwritable*. It is not. Nothing in the impl path checks whether the protocol is a
+marker, and a marker has no methods to leave unimplemented, so `impl Ord for X {}` is
+accepted silently and has no effect — satisfaction short-circuits to the compiler rule
+regardless. Only the bound-failure message claims otherwise ("cannot be made to"). The
+decision stands and the impl is inert, but "unwritable" describes the intent, not the
+compiler. Relatedly, the marker rule is keyed on the bare name `"Ord"`, so a user
+`marker Ord` in another module may inherit the built-in rule — lead L1 in `TODO.md`.
 
 **Order is infectious, and the bound threads through the recursion.** A record is ordered
 when every field is, `List[T]` when `T` is. That means a *bound* variable must count as
@@ -494,153 +610,9 @@ over the call graph to propagate. For a type whose meaningful order is not its s
 one, nothing here is a dead end: `max_by`/`sort_by` take the comparison as an argument and
 need no bound at all, which is also why `Ordering` stayed in the prelude.
 
-`f64` makes "total" a slight lie at the leaf. NaN compares false against everything
-including itself, so `NaN == NaN` is false, `{x: NaN} == {x: NaN}` is false — a record
-that is not equal to itself — and **`sort` on a list containing NaN returns an unspecified
-permutation**, not merely NaN in an odd position. IEEE-754 defines a `totalOrder` that
-would fix sorting, and it was declined: it makes `0.0 == -0.0` false and `NaN == NaN` true,
-trading a rare surprise for a common one. The operators do what the hardware does, which
-is what every other language has taught people to expect. `sort` is where it shows.
-
-*What moved:* the implementation never did dispatch — `check.rs` did an overlap test and
-lowering emitted a primitive compare, while the prelude's `Eq`/`Ord` impls named seven
-runtime symbols that do not exist and would not have linked. The doc lost. Four bugs fell
-out of the gap and are fixed with this: `record == record`, `record < record` and
-`tuple == tuple` each emitted C comparing two structs, which is not valid C; and
-`list == list` compiled and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
-
-*One exception, and it is permanent:* a **closure** cannot be compared. There is no
-structural answer to whether two functions are equal, so `f == g` is a diagnostic rather
-than a guess. Everything else compares by content -- primitives, `str`, records, tuples,
-lists, unions, maps, and self-referencing records, which walk through their pointer.
-
-### Markers: a bound with no methods
-
-*(Decided 2026-07-19, alongside structural comparison.)*
-
-    marker Ord
-
-    fn max[T](a: T, b: T) -> T where T: Ord { if a < b { b } else { a } }
-
-A **marker** is a bound carrying no methods, satisfied by a rule the compiler knows rather
-than by an impl. `where T: Ord` says "this parameter can be ordered"; the compiler answers
-it from `T`'s structure. There is nothing to write and no way to override it.
-
-This exists because a generic body is checked *once*, with `T` abstract. There is no
-concrete type there to test, so `a < b` on a bare `T` has no answer — and the old compiler,
-which allowed it, monomorphised `max(map, map)` into a comparison of two addresses. The
-bound supplies the missing information at the boundary where it exists: the body is checked
-against the bound, and each call site is checked against the type actually supplied.
-
-A marker is not a protocol wearing a hat. A protocol is a *choice* a type makes about how to
-answer something — that is why `Display` is one. A marker is a *fact* about a type that the
-type does not get a say in: `Ord` follows from structure, and letting a type claim it while
-holding a `Map` would be a lie the backend cannot honour. So `impl Ord for X` is not merely
-unnecessary, it is unwritable, and markers are prelude-only — only the compiler can supply
-a rule, so a marker it does not recognise is a diagnostic at the declaration.
-
-**Order is infectious, and the bound threads through the recursion.** A record is ordered
-when every field is, `List[T]` when `T` is. That means a *bound* variable must count as
-ordered inside a container too, or the marker would be useless past the first one:
-`Box[T]` under `where T: Ord` is ordered precisely because `T` is bound there. Ask the same
-question without that context and the answer is no.
-
-The ceremony is real and was weighed: nearly every type is ordered, so the bound excludes
-few types while appearing on many signatures. It buys a general mechanism rather than a tax
-on one operator — `Send` and friends land here later — and the alternative, inferring the
-requirement, makes a function body silently change its public contract and needs a fixpoint
-over the call graph to propagate. For a type whose meaningful order is not its structural
-one, nothing here is a dead end: `max_by`/`sort_by` take the comparison as an argument and
-need no bound at all, which is also why `Ordering` stayed in the prelude.
-
-`f64` makes "total" a slight lie at the leaf. NaN compares false against everything
-including itself, so `NaN == NaN` is false, `{x: NaN} == {x: NaN}` is false — a record
-that is not equal to itself — and **`sort` on a list containing NaN returns an unspecified
-permutation**, not merely NaN in an odd position. IEEE-754 defines a `totalOrder` that
-would fix sorting, and it was declined: it makes `0.0 == -0.0` false and `NaN == NaN` true,
-trading a rare surprise for a common one. The operators do what the hardware does, which
-is what every other language has taught people to expect. `sort` is where it shows.
-
-*What moved:* the implementation never did dispatch — `check.rs` did an overlap test and
-lowering emitted a primitive compare, while the prelude's `Eq`/`Ord` impls named seven
-runtime symbols that do not exist and would not have linked. The doc lost. Four bugs fell
-out of the gap and are fixed with this: `record == record`, `record < record` and
-`tuple == tuple` each emitted C comparing two structs, which is not valid C; and
-`list == list` compiled and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
-
-*Where the code has not caught up yet, stated so this section does not drift ahead of it a
-second time:* `==` is structural on primitives, `str`, records, tuples, lists and unions —
-including two union operands, which compare by tag and then by payload. Four shapes it
-cannot do are **diagnostics**, not wrong answers: a closure (no structural answer exists,
-and that one is permanent), a `Map`, a self-referencing record, and a `List` behind `null`
-— the last three being opaque pointers the compiler would otherwise compare by address.
-Note `P | null`, `str | null` and `i64 | null` are fine; they carry a tag. Closing the three
-gaps is ordinary work, tracked in `docs/finalpush.md`.
-
-Unlike ordering, equality takes no bound: it is total by design, so there is no `Eq` marker
-and a generic `a == b` on an abstract `T` is allowed.
-
-### Markers: a bound with no methods
-
-*(Decided 2026-07-19, alongside structural comparison.)*
-
-    marker Ord
-
-    fn max[T](a: T, b: T) -> T where T: Ord { if a < b { b } else { a } }
-
-A **marker** is a bound carrying no methods, satisfied by a rule the compiler knows rather
-than by an impl. `where T: Ord` says "this parameter can be ordered"; the compiler answers
-it from `T`'s structure. There is nothing to write and no way to override it.
-
-This exists because a generic body is checked *once*, with `T` abstract. There is no
-concrete type there to test, so `a < b` on a bare `T` has no answer — and the old compiler,
-which allowed it, monomorphised `max(map, map)` into a comparison of two addresses. The
-bound supplies the missing information at the boundary where it exists: the body is checked
-against the bound, and each call site is checked against the type actually supplied.
-
-A marker is not a protocol wearing a hat. A protocol is a *choice* a type makes about how to
-answer something — that is why `Display` is one. A marker is a *fact* about a type that the
-type does not get a say in: `Ord` follows from structure, and letting a type claim it while
-holding a `Map` would be a lie the backend cannot honour. So `impl Ord for X` is not merely
-unnecessary, it is unwritable, and markers are prelude-only — only the compiler can supply
-a rule, so a marker it does not recognise is a diagnostic at the declaration.
-
-**Order is infectious, and the bound threads through the recursion.** A record is ordered
-when every field is, `List[T]` when `T` is. That means a *bound* variable must count as
-ordered inside a container too, or the marker would be useless past the first one:
-`Box[T]` under `where T: Ord` is ordered precisely because `T` is bound there. Ask the same
-question without that context and the answer is no.
-
-The ceremony is real and was weighed: nearly every type is ordered, so the bound excludes
-few types while appearing on many signatures. It buys a general mechanism rather than a tax
-on one operator — `Send` and friends land here later — and the alternative, inferring the
-requirement, makes a function body silently change its public contract and needs a fixpoint
-over the call graph to propagate. For a type whose meaningful order is not its structural
-one, nothing here is a dead end: `max_by`/`sort_by` take the comparison as an argument and
-need no bound at all, which is also why `Ordering` stayed in the prelude.
-
-`f64` makes "total" a slight lie at the leaf. NaN compares false against everything
-including itself, so `NaN == NaN` is false, `{x: NaN} == {x: NaN}` is false — a record
-that is not equal to itself — and **`sort` on a list containing NaN returns an unspecified
-permutation**, not merely NaN in an odd position. IEEE-754 defines a `totalOrder` that
-would fix sorting, and it was declined: it makes `0.0 == -0.0` false and `NaN == NaN` true,
-trading a rare surprise for a common one. The operators do what the hardware does, which
-is what every other language has taught people to expect. `sort` is where it shows.
-
-*What moved:* the implementation never did dispatch — `check.rs` did an overlap test and
-lowering emitted a primitive compare, while the prelude's `Eq`/`Ord` impls named seven
-runtime symbols that do not exist and would not have linked. The doc lost. Four bugs fell
-out of the gap and are fixed with this: `record == record`, `record < record` and
-`tuple == tuple` each emitted C comparing two structs, which is not valid C; and
-`list == list` compiled and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
-
-*Where the code has not caught up yet, stated so this section does not drift ahead of it a
-second time:* `==` is structural today on primitives, `str`, records, tuples, lists and
-unions. It is **not** yet on `Map`, on a nullable pointer, or on a closure, and a union
-compared against another union projects both to their first variant instead of switching on
-the tag. Those four predate this decision and are unchanged by it — none is a new
-regression — but until they are fixed "total on every type" describes the decision, not the
-compiler. `docs/finalpush.md` has the table and the mechanism for each.
+Unlike ordering, **equality takes no bound**: it is total by design, so there is no `Eq`
+marker, and a generic `a == b` on an abstract `T` is allowed and deferred. Requiring a
+marker there would contradict the decision.
 
 ### Names count what they say
 
@@ -651,16 +623,31 @@ mean.
 
 ### There is a prelude, and it holds only what syntax needs
 
-`Display` and `Error`, plus the `Ord` marker. Nothing else.
+Interpolation is syntax and desugars to a protocol call, so without a prelude every file
+containing a string hole needs an import before a language feature works. The rule: **if
+you can write it without naming it, it is in the prelude.** `io::println` still needs
+`use std::io` — it is a function, not syntax.
 
 `Eq` and `Ord` were *protocols* here while `==` and `<` were meant to dispatch. Comparison
 is structural now, so `Eq` is gone entirely and `Ord` survives only as a marker — a bound a
 generic writes, with no methods and nothing to implement.
 
-Interpolation is syntax and desugars to a protocol call, so without a prelude every file
-containing a string hole needs an import before a language feature works. The rule: **if
-you can write it without naming it, it is in the prelude.** `io::println` still needs
-`use std::io` — it is a function, not syntax.
+What is actually there, and the reason each one clears the bar:
+
+- **`Display`, `Error`** — the two protocols. `#{x}` desugars to `to_string(x)`; `main`'s
+  implicit channel demands that whatever escapes implements `Error`.
+- **`Ord`** — the marker the `where T: Ord` bound names.
+- **`List`, `Map`** — declared here because `record_repr` matches these two names literally
+  and they must be unambiguous. This one is *not* "syntax needs it", and it is the reason
+  the root has to be excluded from opacity nesting; moving them out is `TODO.md` item 17.
+- **`range`** — `for i in range(a, b)` is the counted-loop idiom, and an import in front of
+  every loop is worse than a prelude name.
+- **`IndexError`, `Ordering`** — each is shared by two stdlib modules with no single owner
+  to move it to. A `std::error` module would be `IndexError`'s home if one existed.
+
+So the earlier line here — "`Display` and `Error`, plus the `Ord` marker. Nothing else." —
+was never true of the code. Three of the seven names are there for reasons other than
+syntax, and two of those are load-bearing accidents rather than decisions.
 
 ### String interpolation is `#{expr}`
 
@@ -679,6 +666,10 @@ special, and `\#{` escapes it.
 **There are no format specs.** A colon cannot mark one: `#{:ok}` is an atom, so the colon
 appears in leading position, and `#{m[:key]}` puts one mid-expression. Reserving `:` would
 mean deciding where the expression ends before the lexer knows.
+
+*Broken today:* interpolating a call that resolves through a protocol miscompiles — the
+hole's `to_string` resolution is written to the hole expression's own id and overwrites the
+call's. `TODO.md` item 2 has the repro.
 
 ### Annotations are `@name` or `@name("string")`
 
@@ -721,6 +712,12 @@ functions: the compiler knows them, so a failure can report the actual values an
 source span. An ordinary function cannot see its argument's source text. `test` and `bench`
 blocks are stripped from normal builds.
 
+*Designed, not yet working end to end.* The keywords, the AST node and the typechecking are
+real, and test blocks genuinely never reach IR. But an `assert` expression has **no
+lowering** — it falls through to a `<todo: assert>` placeholder — and there is no
+`neon test` command, so nothing runs a test block or reports a failure. The reason the
+intrinsic form was chosen still holds; the reporting it was chosen for does not exist yet.
+
 ---
 
 ## Values
@@ -743,7 +740,7 @@ different identifiers that render identically, which is a way to smuggle a secon
 definition past a reader.
 
 *Open:* confusable and mixed-script detection. NFC does not catch Cyrillic `а` posing as
-Latin `a`.
+Latin `a`, and nothing in the compiler looks for it.
 
 ### Indices are `i64`, and there is no negative indexing
 
@@ -765,18 +762,30 @@ a **silent wrong answer** — reading the last element instead of failing. It al
 
 The runtime targets **C11**.
 
-- `+ - *` and unary `-` **wrap** on overflow.
+- `+ - *` and unary `-` **wrap** on overflow, implemented as an unsigned round-trip so the
+  wrap is defined rather than inherited from signed-overflow UB.
 - `/` truncates toward zero; `%` takes the dividend's sign: `-7 / 2 == -3`, `-7 % 2 == -1`.
 - `/` and `%` **trap** on divisor 0 and on `INT64_MIN / -1`, never raising SIGFPE.
   `INT64_MIN % -1` traps too, even though the answer is mathematically 0 — one rule, one
   check, and `/` and `%` never disagree about when they trap.
 - `bsl`/`bsr` **mask** the shift amount to the operand's width: `1 bsl 200 == 1 bsl 8 == 256`.
-- `bsr` is **type-driven**: arithmetic on signed, logical on unsigned. The type already
-  knows which you meant. Codegen must guarantee this rather than inherit it — C11 §6.5.7p5
-  makes `>>` on a negative signed value implementation-defined.
 
-Constant folding follows exactly these rules, so a folded expression and the same
-expression computed at runtime always agree.
+**A folded expression and the same expression computed at runtime always agree** — but by
+*declining*, not by mirroring. The folder is strictly more conservative than the runtime:
+`Add`/`Sub`/`Mul` use checked arithmetic and simply do not fold on overflow, where the
+runtime would wrap (a missed fold, nothing observable); `Div`/`Rem` decline on both
+trapping inputs, which is load-bearing, since folding would replace a trap with a value or
+abort the *compiler* over code that never runs; and shifts are not folded at all. Only
+`Neg` folds with the same wrapping the runtime uses. The guarantee holds; "follows exactly
+these rules" describes the intent rather than the mechanism.
+
+*`bsr` was specified as type-driven* — arithmetic on signed, logical on unsigned, because
+the type already knows which you meant, with codegen obliged to *guarantee* it rather than
+inherit it, since C11 §6.5.7p5 makes `>>` on a negative signed value implementation-defined.
+Neither half is met. The language has no unsigned integer type at all, so "logical on
+unsigned" is vacuous; and codegen emits a bare C `>>` on `int64_t`, which is precisely the
+implementation-defined behaviour the rule exists to avoid. It works on gcc and clang by
+their choice, not by the compiler's. This is an undischarged intention, not a shipped rule.
 
 *Against floor division (Python):* nicer for modular arithmetic, but costs an emitted
 correction on every division.
@@ -784,7 +793,8 @@ correction on every division.
 ### `orelse` tests a nullable union's tag
 
 Never "if truthy". If the left type cannot contain `null` — a bare `i64` — then
-`A orelse B` is always `A`, **including when A is `0`**.
+`A orelse B` is always `A`, **including when A is `0`**. Lowering branches on a tag test,
+not on a comparison against zero, which is the bug this replaced.
 
 ### Combinator pipelines interleave effects, element by element
 
@@ -804,11 +814,12 @@ tracked. (A dynamic `Mappable` value the compiler cannot see through falls back 
 eager per-stage; same result, more passes.)
 
 This is reserved now and unused now. v1 lowers eagerly, per stage — Elixir's `Enum`,
-which is fine because the passes are cheap. The stdlib signatures do not depend on the
-choice, so fusion can arrive later against an IR with zero change to any program. What
-could *not* arrive later is the permission: code that relied on "every `f`, then every
-`p`" would break under fusion, so the ordering is fixed here before anyone can write
-that code.
+which is fine because the passes are cheap. `impl Mappable for List` allocates a fresh
+list and pushes in a `for` loop, and there is no fusion pass. The stdlib signatures do not
+depend on the choice, so fusion can arrive later against an IR with zero change to any
+program. What could *not* arrive later is the permission: code that relied on "every `f`,
+then every `p`" would break under fusion, so the ordering is fixed here before anyone can
+write that code.
 
 If you need one stage's effects fully sequenced before the next, that is a `for` loop,
 not a pipeline. Pipelines are for transforming values, not for ordering effects.
@@ -835,6 +846,9 @@ overflows before the parser can fold the sign. The token carries a `u64` magnitu
 
 Speed is irrelevant — lexing is never a compiler's bottleneck.
 
+*(Whether block comments should exist at all is still open — they nest, which is correct,
+and nesting is the only reason the tree-sitter external scanner exists. `TODO.md` item 16.)*
+
 ### The compiler library never touches the filesystem
 
 Source arrives as an in-memory map of module path to text. The CLI and LSP read files; the
@@ -859,6 +873,10 @@ exists, and it costs nothing, because `Env::declare` already takes a module pref
 how nested `mod` blocks work). The loader walks `stdlib/`, turns `std/io.neon` into the
 prefix `std::io`, and declares each file's decls under it before the user's module.
 
+*One thing this does not yet buy:* a diagnostic in a stdlib file renders against the
+*user's* file at a fabricated location, because errors from every module are sorted into
+one renderer holding one file. `TypeError` needs a file id. `TODO.md` item 13.
+
 ### `Error` owns `message`; `Display` is a separate concern
 
 `protocol Error for T where T: Display {}` welded two unrelated jobs together. `Display`
@@ -879,6 +897,9 @@ value cannot know. Those belong to the throw, not the type, and a default method
 cannot supply them: a default can compute from fields the type already has, but it cannot
 create storage.
 
+*(Default method bodies are, separately, never typechecked at all — the protocol's subject
+is unbound when they are checked. `TODO.md` item 6.)*
+
 ### `throws` is unconstrained; `Error` is required only at the top
 
 `throws T` accepts any type: `throws any`, `throws :ok`, `throws Person`, `throws bool`.
@@ -891,6 +912,10 @@ point where the language must render something it did not author, so it is the o
 that may demand an interface. A non-`Error` reaching it is a compile error telling you to
 catch it or implement `Error`.
 
+*(The unconstrained half is true by construction — the `throws` clause is resolved with no
+bound check anywhere — but nothing in the corpus writes `throws :ok` or `throws bool`, so
+it is unexercised.)*
+
 ### `main` does not throw `any`
 
 `main`'s implicit `throws Error` needed a type, and `Error` is a protocol -- a bound, not a
@@ -901,7 +926,8 @@ error at all, so `throw 42` from `main` compiled.
 `main`'s error channel is therefore **not a type**. It is a rule, checked per throw site.
 No existential is needed to enforce it: at every escape point the concrete type is
 statically known (or is a concrete union), so `message` is a direct call and a union is a
-tag switch. There is no vtable, no box, and nothing named `Report`.
+tag switch. There is no vtable, no box, and nothing named `Report`. `throw 42` from `main`
+is now rejected, because resolving `message` for `i64` fails.
 
 This holds precisely as long as **protocols stay bounds and never become types**. The day
 `List[Error]` or `fn log(e: Error)` is expressible, a value of unknown type must be carried
@@ -918,3 +944,13 @@ error type and discarded it.
 
 `Repr::Any` must only ever arise from a source type that genuinely is ⊤, never from a
 fallback -- guarded the way `Repr::Var` already is.
+
+*Not yet true.* On the layout path it holds: `Repr::Any` is produced only under a genuine
+top test, and the places that would otherwise guess — a list literal at an unresolved repr,
+an `is` on an erased value with no resolved tag — ICE rather than invent. But
+`repr_from_typespec`, which serves the turbofish path, has a bare `_ => Repr::Any` arm
+covering every tuple and arrow typespec, and a closure parameter with no repr falls back the
+same way. That function feeds monomorphisation *identity*, so the fallback collapses
+distinct instances into one symbol; it is documented in place as a known defect and tracked
+as `TODO.md` item 12, alongside the wider class of lossy projections used as identities.
+Until those arms are gone, this section states the rule, not the state.

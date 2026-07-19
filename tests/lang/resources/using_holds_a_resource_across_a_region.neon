@@ -1,0 +1,50 @@
+// `using` holds a resource for exactly the region of its body, then releases it.
+//
+// Under last-use ARC a resource dies at its last *use*, which for a lock guard would be
+// the `lock` call itself — released before the section it exists to protect. `using` fixes
+// that with no language feature: because `r` is touched *after* `body(...)` returns, the
+// refcount pass must keep it alive across the whole call. That is the entire trick, and
+// the ordering below is what proves it: "released" appears after the body's output, not
+// before it.
+//
+// It shipped without a corpus file. It type-checked, so nothing was obviously wrong, but
+// the property it exists for is an *ordering* — precisely the thing type-checking cannot
+// see. Found by rewriting `docs/design/resources.md` against the code.
+//
+// The failure path is covered too. If the body throws, `release` is never reached
+// explicitly, but ARC releases `r` on the throwing edge and cleanup still runs — so the
+// normal path observes the cleanup's error and the throwing path cleans up silently.
+
+use std::io;
+use std::resource;
+use std::string;
+
+fn held(n: i64) -> i64 {
+    let r = resource::new(n, (v: i64) => {
+        io::println(string::concat("released ", to_string(v)));
+        null
+    });
+    try resource::using(r, (v: i64) => {
+        io::println(string::concat("inside the region with ", to_string(v)));
+        v * 2
+    }) catch (e) { -1 }
+}
+
+fn body_throws() -> i64 {
+    let r = resource::new(7, (v: i64) => {
+        io::println("released after a throw");
+        null
+    });
+    // `get` is fallible, so `using`'s clause is `E | ReleasedError`; a body that throws
+    // leaves through the same edge, and cleanup rides ARC rather than the explicit call.
+    try resource::using(r, (v: i64) => {
+        io::println("about to leave the region");
+        v
+    }) catch (e) { -1 }
+}
+
+fn main() {
+    io::println(to_string(held(21)));
+    io::println(to_string(body_throws()));
+    io::println("done");
+}

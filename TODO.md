@@ -36,6 +36,34 @@ see lead L4, which may mean qualified-path impls never match at all.
 Recorded as `tests/lang/types/a_nominal_name_is_not_a_module_identity.neon`, deliberately
 unlisted: unlisted+failing is how this ratchet records an open bug.
 
+### 1b. `opaque` is also bypassed structurally — and this one is a design collision
+
+You do not need to collide a name. You do not need to forge a module path. You describe the
+shape:
+
+```neon
+internal mod vault { opaque record Secret { code: i64 } }
+
+fn peek(s: {code: i64}) -> i64 { s.code }   // never names Secret. Prints 7.
+```
+
+`opaque` is an **access check on a name**, in `check.rs`. The type system is **structural** —
+a nominal record is an ordinary record carrying a `#nominal` field, and a structural
+parameter matches it on width. So the check guards the name while the type system routes
+around it.
+
+This is not the same as item 1 and will not be fixed by qualifying nominal identity. It
+needs a decision:
+
+- an opaque record does not satisfy a structural type outside its module (makes `opaque`
+  real, and costs the structural-width subtyping that `structural_param_accepts_nominal.neon`
+  currently pins);
+- or `opaque` is advisory, and `std::fs`'s guard is documentation rather than enforcement —
+  in which case say so, because the resources design leans on it.
+
+Verified today. Both holes together mean the opacity enforcement added this morning stops
+an honest mistake and stops nothing deliberate.
+
 ### 2. Interpolating a dispatched call miscompiles
 
 ```neon
@@ -97,6 +125,25 @@ fn show[T](v: T) -> str { "#{v}" }    // at T = A | B
 Compiles clean, exits 0, prints `<todo: bound: abstract receiver>`. `repr_head` returns
 `None` for a union. Needs the variant-switch machinery — a feature, not a fix, and the same
 gap as `Resolution::Switch`.
+
+### 7b. Generic impls never apply
+
+```neon
+impl[T] Tag for Pair[T] { ... }
+Tag::tag(p)                      // no impl of `Tag` for `Pair[i64]`
+```
+
+The target's `T` is rigid, so the emptiness query that decides applicability is always
+empty. `ImplDef.generics` is stored and **consumed by nothing**. A whole feature that
+parses, type-checks its own body, and never matches.
+
+Bounded impls do not parse at all: `ast::ImplDecl` has no `wheres` and `parser::impl_decl`
+has no `where`. `dispatch.md` describes both as design rather than as built.
+
+### 7c. `Resolution::Switch` prints a compiler marker as program output
+
+A two-impl union receiver compiles, exits 0, and prints `<todo: dispatch switch>`. Same
+family as item 7 and wants the same variant-switch machinery.
 
 ### 8. Reading a field off a record whose recursion runs through `List`
 
