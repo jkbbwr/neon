@@ -16,7 +16,9 @@
 
 use super::repr::{normalize_union, repr_of, Repr};
 use super::ssa::{Builder, BlockId, Func, Op, PrimOp, Program, Target, Term, Value};
-use crate::ast::{self, BinOp, Block, Decl, DeclKind, Expr, ExprKind, Stmt, StmtKind, UnOp};
+use crate::ast::{
+    self, BinOp, Block, Decl, DeclKind, Expr, ExprId, ExprKind, Stmt, StmtKind, UnOp,
+};
 use crate::typecheck::env::Env;
 use crate::typecheck::result::TypecheckResult;
 use crate::typecheck::types::TyId;
@@ -52,6 +54,24 @@ struct InstanceJob {
 
 /// Replace every type variable in a repr with its concrete binding. After this a
 /// monomorphic instance has no `Var` left.
+/// Whether a repr still mentions an unsubstituted type variable. A back-edge is not
+/// walked: it names a type rather than describing one, and following it would not
+/// terminate.
+fn contains_var(r: &Repr) -> bool {
+    match r {
+        Repr::Var(_) => true,
+        Repr::Record { fields, .. } => fields.iter().any(|(_, f)| contains_var(f)),
+        Repr::Tuple(es) | Repr::Union(es) => es.iter().any(contains_var),
+        Repr::List(e) | Repr::Nullable(e) => contains_var(e),
+        Repr::Map(k, v) => contains_var(k) || contains_var(v),
+        Repr::Runtime { args, .. } => args.iter().any(contains_var),
+        Repr::Closure { params, throws, ret } => {
+            params.iter().any(contains_var) || contains_var(throws) || contains_var(ret)
+        }
+        _ => false,
+    }
+}
+
 fn substitute_repr(r: &Repr, subst: &std::collections::HashMap<String, Repr>) -> Repr {
     match r {
         Repr::Var(n) => subst.get(n).cloned().unwrap_or_else(|| r.clone()),
@@ -995,7 +1015,7 @@ impl Lower<'_> {
             }
             ExprKind::Is { lhs, ty: spec } => {
                 let v = self.lower_expr(lhs);
-                self.type_test(v, spec)
+                self.type_test(v, spec, e.id)
             }
             ExprKind::As { lhs, .. } => {
                 let v = self.lower_expr(lhs);
@@ -1851,12 +1871,17 @@ impl Lower<'_> {
     fn pattern_test(&mut self, subj: Value, pat: &ast::Pattern) -> Option<Value> {
         match &pat.kind {
             ast::PatternKind::Wildcard | ast::PatternKind::Bind(_) => None,
-            ast::PatternKind::Is(spec) => Some(self.type_test(subj, spec)),
+            ast::PatternKind::Is(spec) => Some(self.type_test(subj, spec, pat.id)),
             ast::PatternKind::Literal(lit) => Some(self.literal_test(subj, lit)),
             ast::PatternKind::Record { path, fields, .. } => {
+                let tested = self.tested_repr(pat.id);
                 let mut test = path.as_ref().and_then(|p| p.last()).map(|n| {
                     self.b.emit(
-                        Op::IsVariant { value: subj, variant: n.clone() },
+                        Op::IsVariant {
+                            value: subj,
+                            variant: n.clone(),
+                            tested: tested.clone(),
+                        },
                         Repr::Bool,
                         subj_ty(&self.b, subj),
                     )
@@ -1892,15 +1917,30 @@ impl Lower<'_> {
         }
     }
 
+    /// The repr of the type an `is` names, as the checker resolved it.
+    ///
+    /// `None` where the checker recorded nothing — a test under an already-reported error,
+    /// or a pattern form that resolves no path. Not a licence to guess: the backend needs
+    /// this for an erased subject and refuses without it. A `Var` is filtered out for the
+    /// same reason `type_tag_name` ices on one; inside a generic body `self.subst` has
+    /// already replaced every variable the instance pinned, so what survives is genuinely
+    /// unpinned and must not be turned into a tag.
+    fn tested_repr(&self, id: ExprId) -> Option<Repr> {
+        let r = self.result.tested(id).map(|t| self.repr_of_ty(t))?;
+        (!contains_var(&r)).then_some(r)
+    }
+
     /// `x is T` as a runtime test: null becomes a null check, anything else a
-    /// discriminant compare against the type's head name.
-    fn type_test(&mut self, subj: Value, spec: &ast::TypeSpec) -> Value {
+    /// discriminant compare — by head name against a union's arms, and by the checker's
+    /// resolved type against an erased value's box tag.
+    fn type_test(&mut self, subj: Value, spec: &ast::TypeSpec, id: ExprId) -> Value {
         let bty = subj_ty(&self.b, subj);
         match &spec.kind {
             ast::TypeSpecKind::Null => self.b.emit(Op::IsNull(subj), Repr::Bool, bty),
             ast::TypeSpecKind::Named { path, .. } => {
                 let variant = path.last().cloned().unwrap_or_default();
-                self.b.emit(Op::IsVariant { value: subj, variant }, Repr::Bool, bty)
+                let tested = self.tested_repr(id);
+                self.b.emit(Op::IsVariant { value: subj, variant, tested }, Repr::Bool, bty)
             }
             ast::TypeSpecKind::Atom(a) => {
                 let lit = self.b.emit(Op::ConstAtom(a.clone()), Repr::Tag, bty);

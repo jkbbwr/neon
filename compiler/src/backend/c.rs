@@ -1319,20 +1319,40 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
         Op::UnwrapOk(v) => format!("{}.u._0", var(*v)),
         Op::UnwrapErr(v) => format!("{}.u._1", var(*v)),
         Op::IsNull(v) => is_null(f, *v),
-        Op::IsVariant { value, variant } => match f.value_repr(*value) {
+        Op::IsVariant { value, variant, tested } => match f.value_repr(*value) {
             // A type the union does not contain is one the value cannot be, so the answer
             // is `false` — not `tag == 0`. That fallback made `x is C` on an `A | B` come
             // back *true* for every `A`, because variant 0 is `A` and `tag == 0` is the
             // test for holding it. The checker allows the test (it is a legitimate question
             // with a known answer), so this is reachable from ordinary source.
             Repr::Union(variants) => {
-                match variants.iter().position(|v| names_variant(types, v, variant)) {
+                match variants
+                    .iter()
+                    .position(|v| names_variant(types, v, variant, tested.as_ref()))
+                {
                     Some(i) => format!("({}.tag == {i})", var(*value)),
                     None => "false".into(),
                 }
             }
-            // An erased value carries its concrete type as a tag in its box.
-            Repr::Any => format!("(neon_box_tag({}) == {}ULL)", var(*value), fnv1a(variant)),
+            // An erased value carries its concrete type as a tag in its box. The tag is a
+            // function of the *repr*, and the only way this comparison can be sound is for
+            // it to call the very function that stamped the box — `type_tag`, via the type
+            // the checker resolved the test to. Hashing `variant`, the head name the source
+            // wrote, is what this used to do: `List[i64] is List[str]` was true, and the
+            // `as` that a person writes after such a guard then read an i64 as a `neon_str`.
+            //
+            // Ices rather than falling back to the name. Without a resolved type there is
+            // no honest answer here, and the dishonest one is a segfault in user code.
+            Repr::Any => match tested {
+                Some(t) => {
+                    format!("(neon_box_tag({}) == {}ULL)", var(*value), types.type_tag(t))
+                }
+                None => panic!(
+                    "internal error: codegen reached `is {variant}` on an erased value with \
+                     no resolved type; the checker must record one (see \
+                     TypecheckResult::tested)"
+                ),
+            },
             // A nullable is a two-variant union whose discriminant is the pointer itself,
             // so `x is T` is a *runtime* null test, not a static answer. Falling through to
             // the concrete arm below folded it to `true`, because `type_tag_name` names a
@@ -1341,7 +1361,7 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             Repr::Nullable(inner) => {
                 if variant == "null" {
                     is_null(f, *value)
-                } else if names_variant(types, inner, variant) {
+                } else if names_variant(types, inner, variant, tested.as_ref()) {
                     format!("(!{})", is_null(f, *value))
                 } else {
                     "false".into()
@@ -1349,7 +1369,7 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             }
             // A value of one concrete type is that variant only if it *is* that type —
             // `r is Green` where `r` is a `Red` is false, not vacuously true.
-            other => names_variant(types, other, variant).to_string(),
+            other => names_variant(types, other, variant, tested.as_ref()).to_string(),
         },
         Op::Cast(v) => {
             // CORRECT DEFAULT: a cast whose result is discarded has no target to move the
@@ -1500,12 +1520,42 @@ fn prim_operand(f: &Func, v: Value) -> String {
 /// `record Node { next: Node | null }`'s `x is Node` with the *key* of a boxed repr, which
 /// never equals `Node`: every `is` against a recursive record was silently false, and the
 /// union arm's positional search fell back to variant 0.
-fn names_variant(types: &TypeTable, r: &Repr, variant: &str) -> bool {
+///
+/// `tested` — the type the checker resolved the test to — is the answer whenever it is
+/// available, and then the comparison is between two *tag names*: one derivation, applied
+/// to both sides, the same one `type_tag` hashes into a box. This is what lets a union
+/// distinguish `List[i64]` from `List[str]`, which a head-name comparison cannot, and what
+/// keeps the union arm agreeing with the erased arm about what `is` means.
+///
+/// The `variant` fallback is for the tests the checker records no type for — a record
+/// pattern under an error. It compares head names, which is what this did for everything
+/// before, and is sound only because a union's arms are distinct *nominal* types.
+fn names_variant(types: &TypeTable, r: &Repr, variant: &str, tested: Option<&Repr>) -> bool {
+    if let Some(t) = tested {
+        return match (variant_tag(types, r), variant_tag(types, t)) {
+            (Some(a), Some(b)) => a == b,
+            // `never` and `any` name no single runtime type, and a `Var` has no tag at
+            // all; none of them can be the variant a value holds.
+            _ => false,
+        };
+    }
     let r = types.resolve(r);
     if let Some((_, pointee)) = types.boxed_shape(r) {
         return variant_name(types, pointee).as_deref() == Some(variant);
     }
     variant_name(types, r).as_deref() == Some(variant)
+}
+
+/// A repr's tag name for comparison purposes, with back-edges and boxes resolved so the
+/// two sides of an `is` are spelled from the same shape. `None` where there is no single
+/// type to name.
+fn variant_tag(types: &TypeTable, r: &Repr) -> Option<String> {
+    let r = types.resolve(r);
+    let r = types.boxed_shape(r).map_or(r, |(_, pointee)| pointee);
+    match r {
+        Repr::Var(_) | Repr::Never | Repr::Any => None,
+        other => Some(types.type_tag_name(other)),
+    }
 }
 
 fn variant_name(types: &TypeTable, r: &Repr) -> Option<String> {

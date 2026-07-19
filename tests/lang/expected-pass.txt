@@ -236,6 +236,9 @@ types/atom_union_mixed_with_other_types.neon
 types/erased_recursive_record_is_released.neon
 types/erased_recursive_record_keeps_its_name.neon
 types/erased_recursive_record_shares_its_payload.neon
+types/erased_generic_is_checks_arguments.neon
+types/erased_generic_map_is_checks_arguments.neon
+types/erased_nested_generic_is_checks_arguments.neon
 types/erased_runtime_type_keeps_its_name.neon
 types/generic_record_covariant.neon
 types/generics_are_covariant.neon
@@ -250,6 +253,9 @@ types/missing_field_non_nullable_rejected.neon
 types/missing_field_satisfies_nullable_field.neon
 types/mu_type_in_arrow_parameter.neon
 types/mu_type_in_arrow_throws_parameter.neon
+types/never_has_no_values.neon
+types/never_is_writable.neon
+types/unknown_type_in_a_body_is_reported.neon
 types/let_annotation_widens.neon
 types/mu_type_json.neon
 types/mu_type_mutual_recursion_unsupported.neon

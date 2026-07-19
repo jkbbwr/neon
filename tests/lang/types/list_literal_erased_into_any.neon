@@ -11,10 +11,10 @@
 // The binding must be *used*. `MakeList` is pure, so an unused one is removed by DCE and
 // the bug disappears with it.
 //
-// `is` names a head type only: it cannot ask a question about a type argument, so
-// `is List[str]` is also true here. That is the existing rule for every generic type (see
-// erased_runtime_type_keeps_its_name.neon), not something this file introduces. The `is
-// str` case is what shows the answer distinguishes rather than being blanket-true.
+// `is List[i64]` is true because the type argument is part of the answer: a box's tag
+// spells the whole repr, not its head. `is List[str]` on this value is false, which is
+// what erased_generic_is_checks_arguments.neon exists to pin down. The `is str` case here
+// shows the answer distinguishes rather than being blanket-true.
 
 use std::io;
 

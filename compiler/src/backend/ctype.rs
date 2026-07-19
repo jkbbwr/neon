@@ -367,8 +367,19 @@ impl TypeTable {
     }
 
     /// The name a boxed value's type tag is derived from. It has to agree with what an
-    /// `is Name` test asks for, so a nominal record uses its own name and a primitive its
-    /// spelling in the language.
+    /// `is` test asks for, so a nominal record uses its own name and a primitive its
+    /// spelling in the language — and a generic type its *arguments*, spelled by this same
+    /// function. `is` and the box tag are two readings of one string: `Op::IsVariant` calls
+    /// this on the type the checker resolved the test to, and `coerce_expr` calls it on the
+    /// repr being boxed. Deriving them separately is what made `List[i64] is List[str]`
+    /// true, and `as` trusts `is`.
+    ///
+    /// The structural key (`key_with`) already distinguishes all of this and already cuts
+    /// recursion, and it is deliberately *not* reused as the tag: it keys interning, so it
+    /// spells a runtime type's C symbol (`N{nominal}@{c_type}`), which is an implementation
+    /// detail an `is` must not be able to observe, and it separates `Nullable(T)` from `T`,
+    /// where a tag deliberately names a nullable after its payload. Its back-edge form is
+    /// borrowed for the cycle cut below, which is the part worth sharing.
     ///
     /// A method rather than a free function because a *recursive* record is a
     /// `BoxedRec(atom)` — an atom id and nothing else — and only the type table can turn
@@ -376,6 +387,45 @@ impl TypeTable {
     /// answered with the structural key `P3`: `let a: any = Node { .. }; a is Node` was
     /// silently `false` for every self-referencing record while a flat one answered `true`.
     pub fn type_tag_name(&self, r: &Repr) -> String {
+        self.tag_name(r, &mut Vec::new())
+    }
+
+    /// `type_tag_name`, carrying the chain of aggregates currently being spelled.
+    ///
+    /// `open` holds the structural key of every repr on the path from the root. A type
+    /// graph is cyclic — `record Node { next: Node | null }` — so a name that walks into
+    /// arguments and fields has to cut somewhere, and the cut is a back-edge spelled with
+    /// `key_with`'s `Z`/`P` form: stable, and already the identity the type table interns
+    /// on. This mirrors `key_with`'s own back-edge handling rather than inventing a second
+    /// scheme; without it, spelling `Node` recursed until the stack ran out.
+    fn tag_name(&self, r: &Repr, open: &mut Vec<String>) -> String {
+        // Aggregates are the only reprs that can lead back to themselves, and the only
+        // ones whose spelling descends, so the cycle check is theirs alone.
+        let recurses = matches!(
+            r,
+            Repr::Record { .. }
+                | Repr::BoxedRec(_)
+                | Repr::Recursive(_)
+                | Repr::List(_)
+                | Repr::Map(_, _)
+                | Repr::Runtime { .. }
+                | Repr::Nullable(_)
+        );
+        if recurses {
+            let k = key_with(r, &self.recursive);
+            if open.contains(&k) {
+                return format!("^{k}");
+            }
+            open.push(k);
+            let out = self.tag_name_inner(r, open);
+            open.pop();
+            return out;
+        }
+        self.tag_name_inner(r, open)
+    }
+
+    fn tag_name_inner(&self, r: &Repr, open: &mut Vec<String>) -> String {
+        let arg = |x: &Repr, open: &mut Vec<String>| self.tag_name(x, open);
         match r {
             Repr::I64 => "i64".into(),
             Repr::F64 => "f64".into(),
@@ -384,11 +434,26 @@ impl TypeTable {
             Repr::Null => "null".into(),
             Repr::Unit => "unit".into(),
             Repr::Tag => "atom".into(),
-            Repr::List(_) => "List".into(),
-            Repr::Map(_, _) => "Map".into(),
+            // The arguments are part of the name, and that is the whole fix. A tag of
+            // `List` was shared by `List[i64]` and `List[str]`, so `is` — the guard a
+            // person writes *before* `as` — could not tell them apart and the cast that
+            // followed reinterpreted the payload. Nesting is by recursion, so
+            // `List[List[i64]]` and `List[List[str]]` differ too: the name is the type's
+            // whole shape, not its first level.
+            Repr::List(e) => format!("List[{}]", arg(e, open)),
+            Repr::Map(k, v) => format!("Map[{},{}]", arg(k, open), arg(v, open)),
             Repr::Closure { .. } => "fn".into(),
+            // A generic record carries its arguments in its *fields* — `Box[i64]` and
+            // `Box[str]` are both `Record { name: Some("Box"), .. }` — so the fields are
+            // what distinguishes them. Spelled with names, since a record's identity
+            // includes them.
+            Repr::Record { name: Some(n), fields } if !fields.is_empty() => {
+                let body: Vec<String> =
+                    fields.iter().map(|(f, t)| format!("{f}={}", arg(t, open))).collect();
+                format!("{n}[{}]", body.join(","))
+            }
             Repr::Record { name: Some(n), .. } => n.clone(),
-            Repr::Nullable(inner) => self.type_tag_name(inner),
+            Repr::Nullable(inner) => arg(inner, open),
             // A back-edge names a type without describing it; tag the type it names, so a
             // `mu` type and its unfolding agree on one tag.
             Repr::Recursive(_) => {
@@ -396,28 +461,47 @@ impl TypeTable {
                 if matches!(resolved, Repr::Recursive(_)) {
                     key(r)
                 } else {
-                    self.type_tag_name(resolved)
+                    // Cloned out first: `resolve` borrows `self`, and the recursive call
+                    // needs it again. The `open` entry pushed for this back-edge is what
+                    // stops the unfolding walking back into it.
+                    let resolved = resolved.clone();
+                    self.tag_name(&resolved, open)
                 }
             }
             // A self-referencing record: the pointer carries no name, the table does.
+            // Its fields go into the name for the same reason a flat record's do — a
+            // recursive record can be generic — and the back-edge through `next` is cut by
+            // `open`, which already holds this `P{atom}` key.
             Repr::BoxedRec(atom) => match self.boxed.get(atom) {
-                Some(Repr::Record { name: Some(n), .. }) => n.clone(),
+                Some(shape @ Repr::Record { name: Some(_), .. }) => {
+                    let shape = shape.clone();
+                    self.tag_name_inner(&shape, open)
+                }
                 _ => key(r),
             },
-            // The Neon name, exactly as the `Record` arm above uses its own. `is` against
-            // an erased value compares this tag with `fnv1a` of the name the source wrote
-            // (`Op::IsVariant`'s `Any` arm in c.rs), so anything but the nominal makes
-            // `a is Resource` false for every `Resource`. The generic arguments are
-            // deliberately *not* in the tag: `is` names a head type, and the source cannot
-            // write `a is Resource[i64, E]` to be tested against.
-            Repr::Runtime { nominal, .. } => nominal.clone(),
+            // The Neon name plus its arguments, exactly as the `Record` arm above. The
+            // arguments used to be left out on the grounds that `is` names a head type;
+            // that was the bug. The source *can* write `a is Resource[i64, str]`, and
+            // `Op::IsVariant` now compares the type the checker resolved that to, through
+            // this same function, rather than a hash of the last path segment.
+            Repr::Runtime { nominal, args, .. } if args.is_empty() => nominal.clone(),
+            Repr::Runtime { nominal, args, .. } => {
+                format!(
+                    "{nominal}[{}]",
+                    args.iter().map(|a| arg(a, open)).collect::<Vec<_>>().join(",")
+                )
+            }
             // Anonymous shapes have no name to test against; their structure is the
             // identity, and `variant_name` in c.rs asks the same question the same way, so
             // the two sides of an `is` still agree.
             Repr::Record { name: None, .. } | Repr::Tuple(_) | Repr::Union(_) => key(r),
-            // Unreachable rather than merely unused: `coerce_expr` tags the *source* of a
-            // box, which is always a concrete value, and `variant_name` filters these out
-            // before asking. Naming them anyway keeps the match exhaustive.
+            // Never at the root — `coerce_expr` tags the *source* of a box, which is
+            // always a concrete value, and `variant_tag` in c.rs filters these out before
+            // asking — but reachable as an *argument*, and spelled rather than elided
+            // there. `List[never]` (the type of an empty literal that met no expectation)
+            // and `List[any]` are distinct types and are distinct answers: `is` reports
+            // the type the value actually has, and a `List[never]` is not a `List[i64]`,
+            // however convenient it would be to say it was.
             Repr::Any => "any".into(),
             Repr::Never => "never".into(),
             Repr::Var(_) => ice(r, "a type variable being given a type tag"),

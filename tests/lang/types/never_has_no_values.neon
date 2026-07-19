@@ -1,0 +1,14 @@
+//@ compile-fail
+//@ error-contains: expected `never`, found `i64`
+
+// `never` is writable (see `never_is_writable.neon`) but empty: it is the type with
+// no values. Writing it in a value position is therefore not an error in itself --
+// it is a promise nothing can keep, and the mismatch is reported at the assignment.
+//
+// This is what makes it safe to expose the name. `never` is only useful as a type
+// argument (`Resource[T, never]`) or as a throws clause; anywhere a value is
+// required it rejects every value there is.
+
+fn main() {
+    let x: never = 1;
+}

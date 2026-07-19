@@ -1,0 +1,60 @@
+// `is` on an erased generic must compare type *arguments*, because `as` trusts it.
+//
+// This is the memory-safety half of the type-tag fix. `is` compared only the head type
+// name -- the last segment of the written path, FNV-hashed -- and a box's tag was built
+// from the head of its repr, so every instantiation of `List` shared one tag. `is` is the
+// guard a person writes immediately before `as`, and `as` is an unchecked
+// reinterpretation, so a lying `is` is not a wrong answer, it is a wrong *cast*:
+//
+//     let a: any = [1, 2, 3];
+//     if a is List[str] {           // was true, for a List[i64]
+//         let bad = a as List[str];
+//         io::println("#{bad[0]}"); // read `1` as a neon_str header
+//     }
+//
+// which under ASan was
+//
+//     member access within misaligned address 0x000000000003 for type
+//     'struct neon_header', which requires 8 byte alignment
+//     SEGV on unknown address 0x0b in neon_retain (runtime/src/lifecycle.c:12)
+//
+// The `else` branch below is the assertion: taking it means `is` refused, and the `as`
+// that would have crashed is never reached.
+//
+// The tag is now the whole shape of the type rather than its head, derived by one function
+// (`TypeTable::type_tag_name`) called from both sides -- the box's tag and the `is`. The
+// `is` side goes through the type the *checker* resolved, recorded on the expression,
+// because the written path carries only a head name and `List[i64]` and `List[str]` write
+// the same one.
+
+use std::io;
+
+fn main() {
+    let a: any = [1, 2, 3];
+
+    // The safety case. `bad[0]` is unreachable, and must stay that way.
+    if a is List[str] {
+        let bad = a as List[str];
+        io::println("reached the unsound cast: #{bad[0]}");
+    } else {
+        io::println("not a List[str]");
+    }
+
+    // Not blanket-false: the true instantiation still answers true, and the value is
+    // usable through the cast that follows the guard.
+    if a is List[i64] {
+        let good = a as List[i64];
+        io::println("#{good[0]}");
+    } else {
+        io::println("lost track of its own type");
+    }
+
+    // The same pair as plain tests, so the answers are visible next to each other.
+    let b: any = ["x", "y"];
+    io::println("#{b is List[str]}");
+    io::println("#{b is List[i64]}");
+
+    // And a non-generic type is still distinguished, which is what shows the tag did not
+    // simply become unique-per-value.
+    io::println("#{b is str}");
+}

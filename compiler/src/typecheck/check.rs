@@ -435,6 +435,11 @@ impl Checker<'_> {
                 // Destructuring is a field read that looks like a binding. The name comes
                 // from the pattern's own path when it has one, and otherwise from the type
                 // being matched.
+                if let Some(q) = path {
+                    if self.result.tested(p.id).is_none() {
+                        self.record_tested_path(module, p, q);
+                    }
+                }
                 match path {
                     Some(q) => self.check_opaque_path(
                         module, p.span.clone(), q, "it can be destructured"),
@@ -453,9 +458,32 @@ impl Checker<'_> {
                     }
                 }
             }
-            ast::PatternKind::Is(_) => {}
+            // Binds nothing, but it does *test*, and the test needs a resolved type — the
+            // same reason `ExprKind::Is` records one. This runs for nested patterns too
+            // (`Outer { inner: is List[str] }`), which `arm_test` never sees.
+            ast::PatternKind::Is(spec) => {
+                // Guarded: `arm_test` already resolved (and already reported) a top-level
+                // arm pattern, and `resolve` is not idempotent in its diagnostics — a
+                // second call on `case is Nope` would report the unknown name twice.
+                if self.result.tested(p.id).is_none() {
+                    let scope = self.type_scope(module);
+                    let tested = self.env.resolve(&scope, spec);
+                    self.result.set_tested(p.id, tested);
+                }
+            }
             ast::PatternKind::Literal(_) | ast::PatternKind::Error => {}
         }
+    }
+
+    /// Record the type a named record pattern tests for, keyed on the pattern.
+    fn record_tested_path(&mut self, module: &[String], p: &ast::Pattern, path: &[String]) {
+        let scope = self.type_scope(module);
+        let spec = ast::TypeSpec {
+            kind: ast::TypeSpecKind::Named { path: path.to_vec(), args: vec![] },
+            span: p.span.clone(),
+        };
+        let tested = self.env.resolve(&scope, &spec);
+        self.result.set_tested(p.id, tested);
     }
 
     /// A projection's type, or a diagnostic. `Absent` carries no type on purpose:
@@ -624,7 +652,10 @@ impl Checker<'_> {
             ExprKind::Is { lhs, ty } => {
                 self.expr(module, lhs, None);
                 let scope = self.type_scope(module);
-                self.env.resolve(&scope, ty);
+                let tested = self.env.resolve(&scope, ty);
+                // The resolution is the answer lowering needs and cannot compute: the
+                // written path is a head name, and `List[i64]` and `List[str]` share one.
+                self.result.set_tested(e.id, tested);
                 self.env.solver.t.bool()
             }
 
@@ -1672,6 +1703,7 @@ impl Checker<'_> {
             }
             ast::PatternKind::Is(spec) => {
                 let t = self.env.resolve(&scope, spec);
+                self.result.set_tested(arm.pat.id, t);
                 Some(narrow::Test::exact(t))
             }
             ast::PatternKind::Literal(lit) => {
@@ -1693,6 +1725,7 @@ impl Checker<'_> {
                     span: arm.pat.span.clone(),
                 };
                 let t = self.env.resolve(&scope, &spec);
+                self.result.set_tested(arm.pat.id, t);
                 let exact = fields.iter().all(Self::field_irrefutable);
                 Some(if exact { narrow::Test::exact(t) } else { narrow::Test::inexact(t) })
             }

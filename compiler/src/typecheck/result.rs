@@ -49,6 +49,16 @@ pub struct TypecheckResult {
     /// the *variant's* repr: `let n: P | :none = :none` became a bare tag, and any later
     /// use expecting the union read the wrong layout.
     declared_types: HashMap<ExprId, TyId>,
+    /// The type an `is` asks about, resolved. Keyed by the `is` *expression*, or by the
+    /// `Pattern` for `case is T` / `case Circle { .. }`.
+    ///
+    /// Recorded because the alternative is lowering reading the written path — and a path
+    /// is a head name. `a is List[str]` and `a is List[i64]` write the same head, so the
+    /// runtime test compiled to the same comparison for both, `List[i64] is List[str]` was
+    /// true, and the `as` that follows such a guard reinterpreted i64s as string headers.
+    /// The resolved type carries the arguments the path only spells, which lets the
+    /// backend derive the tag with the *same* function that stamped it into the box.
+    tested_types: HashMap<ExprId, TyId>,
 }
 
 impl TypecheckResult {
@@ -99,6 +109,16 @@ impl TypecheckResult {
     /// the sole caller is `check.rs`.
     pub fn set_declared(&mut self, e: ExprId, t: TyId) {
         self.declared_types.insert(e, t);
+    }
+
+    /// The type an `is` test names, resolved. See `tested_types`.
+    pub fn tested(&self, e: ExprId) -> Option<TyId> {
+        self.tested_types.get(&e).copied()
+    }
+
+    /// Records the type an `is` test (expression or pattern) resolved its path to.
+    pub(super) fn set_tested(&mut self, e: ExprId, t: TyId) {
+        self.tested_types.insert(e, t);
     }
 
     /// The error type a `try` expression's handler receives.

@@ -90,6 +90,10 @@ impl Numberer {
     }
 
     fn pattern(&mut self, p: &mut Pattern) {
+        // Patterns share the expression counter. They are keys into the same
+        // `TypecheckResult`, so the two spaces must not collide.
+        p.id = ExprId(self.next);
+        self.next += 1;
         match &mut p.kind {
             PatternKind::Literal(e) => self.expr(e),
             PatternKind::Record { fields, .. } => {

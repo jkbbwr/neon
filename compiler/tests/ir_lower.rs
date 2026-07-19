@@ -65,7 +65,13 @@ fn lowered_corpus() -> Vec<(String, neon_compiler::ir::ssa::Program, neon_compil
             continue;
         }
         let (result, errs) = check_module(&mut env, &module);
-        if !errs.is_empty() {
+        // Both error channels, not just the returned one. Resolving a type annotation
+        // raises through `Env::error`, so an unknown type written inside a body lands in
+        // `env.errors()` and nowhere else — and a program carrying one has a poison type
+        // in it, which lowers to a repr these guards would then report as a compiler bug.
+        // Reading only `errs` is the same omission that let the CLI compile such a program
+        // and reach codegen with it.
+        if !errs.is_empty() || !env.errors().is_empty() {
             continue;
         }
         let program = lower_module(&env, &result, &module, &[]);

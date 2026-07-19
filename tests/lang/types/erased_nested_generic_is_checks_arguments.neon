@@ -1,0 +1,31 @@
+// Nesting: `List[List[i64]]` is not `List[List[str]]`.
+//
+// A tag that spelled only the outermost argument would answer this wrongly, and the
+// wrongness is the same unsound-cast shape as the flat case -- one indirection further
+// down, where the inner list's element witness is what gets misread.
+//
+// The name is therefore recursive: an argument is spelled by the same function that
+// spells the whole type, so depth costs nothing and every level is compared. Recursion in
+// a *type* is cut by a back-edge (the structural key the type table already interns on),
+// so a self-referencing type still has a finite name.
+
+use std::io;
+
+fn main() {
+    // Bound at its own type first: a list literal adopts the expected type wholesale, so
+    // `let a: any = [[1, 2], [3]]` erases each *inner* list and builds a `List[any]`.
+    let nested: List[List[i64]] = [[1, 2], [3]];
+    let a: any = nested;
+
+    io::println("#{a is List[List[i64]]}");
+    io::println("#{a is List[List[str]]}");
+    // The outer head matches and the argument differs at the first level, not the second.
+    io::println("#{a is List[i64]}");
+
+    if a is List[List[i64]] {
+        let good = a as List[List[i64]];
+        io::println("#{good[1][0]}");
+    } else {
+        io::println("lost track of its own type");
+    }
+}

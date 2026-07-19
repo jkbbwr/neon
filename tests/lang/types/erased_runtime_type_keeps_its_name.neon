@@ -1,4 +1,5 @@
-// A `@runtime` type erased into `any` still answers `is` by its own Neon name.
+// A `@runtime` type erased into `any` still answers `is` by its own Neon name -- and now
+// by its type *arguments* as well.
 //
 // `@runtime("neon_resource") opaque record Resource[T, E]` has two names: the Neon
 // name `Resource` and the C symbol `neon_resource`. `Repr::Runtime` carried only the
@@ -11,14 +12,18 @@
 // merely returning `true`: a `Resource` is not a `Flat`, and a `Flat` is not a
 // `Resource`.
 //
-// The type arguments on the `is` are written because the checker requires a generic
-// type to be applied, but they are NOT part of the answer: a type tag names a head
-// type, and `Op::IsVariant` carries only the last path segment (`Resource`). Both a
-// `Resource[i64, never]` and a `Resource[str, never]` therefore match
-// `is Resource[i64, i64]`, and the arguments here are arbitrary for that reason. This
-// is the existing rule, not something this file introduces -- `is` has never been able
-// to ask a question about a type argument, for a record or for anything else -- and the
-// two instantiations are erased side by side precisely to pin it down.
+// This file used to assert the opposite of what it asserts now. The old rule was that a
+// type tag names a *head* type: `Op::IsVariant` carried the last segment of the written
+// path, so both a `Resource[i64, never]` and a `Resource[str, never]` matched
+// `is Resource[i64, i64]` and the arguments were documented as arbitrary. That rule was
+// not a simplification, it was unsoundness -- `is` is the guard a person writes *before*
+// `as`, and an `is` that ignores arguments hands `as` a value of the wrong type. See
+// erased_generic_is_checks_arguments.neon for the segfault it produced.
+//
+// So the arguments are now part of the answer, and this file pins that down with the same
+// two instantiations it always erased side by side: `Resource[i64, never]` is not
+// `Resource[str, never]`. `never` is the error type because these cleanups cannot fail;
+// it is written out rather than inferred so the reader can see both arguments matter.
 //
 // The erased values are passed as arguments rather than bound, matching
 // erased_recursive_record_keeps_its_name.neon: `let x: any = ...` currently leaks its
@@ -29,20 +34,25 @@ use std::resource;
 
 record Flat { v: i64 }
 
-fn is_resource(a: any) -> bool { a is resource::Resource[i64, i64] }
+fn is_int_resource(a: any) -> bool { a is resource::Resource[i64, never] }
+fn is_str_resource(a: any) -> bool { a is resource::Resource[str, never] }
 fn is_flat(a: any) -> bool { a is Flat }
 
 fn main() {
     let r = resource::new(1, (n: i64) => { null });
     let s = resource::new("payload", (n: str) => { null });
 
-    // The bug: both of these were `false`.
-    io::println("#{is_resource(r)}");
-    io::println("#{is_resource(s)}");
+    // The original bug: both of these were `false` for every `Resource`.
+    io::println("#{is_int_resource(r)}");
+    io::println("#{is_str_resource(s)}");
+
+    // The arguments are part of the type, so these are the wrong instantiations.
+    io::println("#{is_str_resource(r)}");
+    io::println("#{is_int_resource(s)}");
 
     // Distinguishing, not blanket-true.
     io::println("#{is_flat(r)}");
-    io::println("#{is_resource(Flat { v: 2 })}");
+    io::println("#{is_int_resource(Flat { v: 2 })}");
     io::println("#{is_flat(Flat { v: 2 })}");
 
     try resource::release(r) catch (e) { null };

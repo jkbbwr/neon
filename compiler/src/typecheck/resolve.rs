@@ -229,12 +229,21 @@ fn named(
 ///
 /// `null`, `any` and the error type are absent because they have their own `TypeSpecKind`
 /// — they are syntax, not names, and so cannot be shadowed by a type variable either.
+/// `never` is a name and so *is* shadowable, on the same rule as `i64`: a signature means
+/// what its own generic parameters say.
 fn primitive(env: &mut Env, name: &str) -> Option<TyId> {
     match name {
         "i64" => Some(env.solver.t.i64()),
         "f64" => Some(env.solver.t.f64()),
         "str" => Some(env.solver.t.str()),
         "bool" => Some(env.solver.t.bool()),
+        // The empty type. Writable because it is inferable: an absent `throws` clause
+        // already means `never`, and the printer already renders it, so a program that
+        // has to *annotate* what it just inferred -- `Resource[T, never]`, whose
+        // `release` needs no `try` (decisions.md, "Resources") -- would otherwise be
+        // saying a type it cannot spell. Nothing inhabits it, so a value position
+        // annotated `never` is simply unsatisfiable rather than unsound.
+        "never" => Some(env.solver.t.never()),
         _ => None,
     }
 }

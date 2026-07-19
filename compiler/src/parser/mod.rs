@@ -1062,7 +1062,7 @@ where
         let bind = ident().map(PatternKind::Bind);
 
         choice((wildcard, is_pat, record_pat, tuple_pat, literal, bind))
-            .map_with(|kind, e| Pattern { kind, span: e.span() })
+            .map_with(|kind, e| Pattern { kind, span: e.span(), id: ExprId::UNSET })
             .labelled("a pattern")
             .boxed()
     })

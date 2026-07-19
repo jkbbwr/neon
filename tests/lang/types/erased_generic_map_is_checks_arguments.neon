@@ -1,0 +1,27 @@
+// A `Map`'s key and value types are both part of its identity for `is`.
+//
+// The companion to erased_generic_is_checks_arguments.neon: `List` has one argument and
+// could in principle have been fixed by special-casing it, so `Map` pins down that the tag
+// is built from the whole repr. Every argument is compared, and differing in either
+// position is enough to make the answer false.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    let m: any = map::set(map::new[str, i64](), "a", 1);
+
+    io::println("#{m is Map[str, i64]}");
+    io::println("#{m is Map[str, str]}");
+    io::println("#{m is Map[i64, i64]}");
+    io::println("#{m is List[i64]}");
+
+    // The positive direction survives the cast, so the tag is not merely stricter -- it
+    // still identifies the type it was written for.
+    if m is Map[str, i64] {
+        let good = m as Map[str, i64];
+        io::println("#{map::len(good)}");
+    } else {
+        io::println("lost track of its own type");
+    }
+}

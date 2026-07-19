@@ -1,0 +1,43 @@
+// `never` is the empty type, and it is writable in source.
+//
+// The compiler already *infers* it -- an absent `throws` clause is `throws never`
+// (see `arrow_type_throws.neon`) -- and the printer already renders it. A type the
+// compiler infers and prints but the user cannot spell is a hole: any annotation
+// that has to name what was inferred becomes inexpressible.
+//
+// The case that motivates it is `Resource[T, never]`, in decisions.md under
+// "Resources": encoding the cleanup's error on its arrow means infallible cleanup
+// is `Resource[T, never]`, whose `release` throws `never` and so needs no `try`.
+// This file writes that annotation, and calls `release` bare to prove it.
+//
+// Nothing inhabits `never`, so it is only ever useful as a type *argument* or as a
+// throws clause -- a value position annotated `never` is simply unsatisfiable.
+
+use std::io;
+use std::resource;
+
+// Writable as a throws clause. Identical to omitting the clause, which is the point.
+fn pure(x: i64) throws never -> i64 { x + 1 }
+
+// Writable inside an arrow type.
+type Pure = (i64) throws never -> i64
+
+fn main() {
+    io::println(to_string(pure(41)));
+
+    let p: Pure = (n: i64) => { n * 2 };
+    io::println(to_string(p(21)));
+
+    // The motivating case. The cleanup throws nothing, so `E` is `never`, and the
+    // annotation says so out loud rather than leaving it to inference.
+    let r: resource::Resource[i64, never] =
+        resource::new(7, (n: i64) => { io::println("cleanup ran"); null });
+
+    io::println(to_string(resource::is_live(r)));
+
+    // No `try`. `release` throws `E`, `E` is `never`, so there is nothing to handle.
+    resource::release(r);
+
+    io::println(to_string(resource::is_live(r)));
+    io::println("done");
+}

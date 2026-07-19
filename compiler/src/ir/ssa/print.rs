@@ -94,7 +94,7 @@ fn op(o: &Op) -> String {
         Op::UnwrapOk(v) => format!("unwrap_ok {}", val(*v)),
         Op::UnwrapErr(v) => format!("unwrap_err {}", val(*v)),
         Op::IsNull(v) => format!("is_null {}", val(*v)),
-        Op::IsVariant { value, variant } => format!("is_variant {} {variant}", val(*value)),
+        Op::IsVariant { value, variant, .. } => format!("is_variant {} {variant}", val(*value)),
         Op::MakeList(vs) => format!("list [{}]", vals(vs)),
         Op::Index { base, index } => format!("index {}[{}]", val(*base), val(*index)),
         Op::Retain(v) => format!("retain {}", val(*v)),

@@ -1,0 +1,27 @@
+//@ compile-fail
+//@ error-contains: unknown type
+//@ error-contains: CompletelyMadeUpType
+
+// An unknown type name written *inside a function body* has to be reported.
+//
+// Checking raises errors through two channels. The checker's own come back from
+// `check_all`; resolving a type annotation raises through `Env::error` and lands in
+// `env.errors()` instead. The CLI read `env.errors()` only *before* checking — which
+// catches a bad annotation on a declaration, since those resolve during `Env::build_with`
+// — and afterwards printed only the returned list. Annotations inside bodies resolve
+// during checking, so their errors were discarded.
+//
+// The program then compiled "successfully" with a poison type in it, and the backend's
+// guard against an unsubstituted type variable fired, so the user saw an internal compiler
+// error rather than the diagnostic the compiler had already produced and thrown away. That
+// applied to every unknown type name in a body, not only the one that exposed it.
+//
+// The corpus harness always read both lists, which is why this file passes here and why
+// the two front ends appeared to disagree about which programs were valid.
+
+use std::io;
+
+fn main() {
+    let x: CompletelyMadeUpType = 5;
+    io::println("this must not compile");
+}

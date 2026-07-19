@@ -162,7 +162,17 @@ pub enum Op {
     IsNull(Value),
     /// Whether a value is the named variant of a union (a nominal member, or a
     /// primitive kind by name). Codegen: a discriminant compare.
-    IsVariant { value: Value, variant: String },
+    ///
+    /// `variant` is the head name, which is all a *union* discriminant needs: a union's
+    /// arms are distinct types, so naming one picks it out. `tested` is the checker's
+    /// resolved type for the same test, and it is what an **erased** subject needs — a
+    /// box's tag is derived from a `Repr`, so the only way for the two sides of
+    /// `a is List[str]` to agree is for both to go through `TypeTable::type_tag`. The head
+    /// name cannot: `List[i64]` and `List[str]` write the same one, so every `is` on an
+    /// erased generic answered yes, and the `as` a person writes next reinterpreted the
+    /// payload — an i64 read as a `neon_str` header, which is a segfault, not a wrong
+    /// answer.
+    IsVariant { value: Value, variant: String, tested: Option<Repr> },
     /// Build a list from its elements, in order.
     MakeList(Vec<Value>),
     /// Index a list — `xs[i]`, which traps on a bad index rather than throwing.

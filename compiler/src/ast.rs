@@ -400,6 +400,13 @@ pub struct MatchArm {
 pub struct Pattern {
     pub kind: PatternKind,
     pub span: Span,
+    /// Identity, from the same counter as [`Expr::id`] (see [`ids`]). A pattern is not an
+    /// expression, but it *asks a type question* — `is List[str]`, `Circle { r }` — and the
+    /// checker is the only thing that can answer it. Without a key of its own there was
+    /// nowhere to record that answer, and lowering fell back to the pattern's syntax: the
+    /// head name of the written path, which is exactly the information that makes
+    /// `List[i64] is List[str]` come back true.
+    pub id: ExprId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
