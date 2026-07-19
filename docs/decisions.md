@@ -343,24 +343,88 @@ variable anchors it — and it rejects a few programs sound in theory, like `pai
 which needs `pair[i64|str](1, "s")`. Every such rejection is a place the wide type was
 probably unintended, and the escape hatch is one turbofish away.
 
-### Comparison operators are protocol calls
+### Comparison is structural, and ordering is total within a type
 
-`==` and `!=` desugar to `Eq::eq`; `<`, `<=`, `>`, `>=` desugar to `Ord::cmp` (which
-returns `Ordering`, an atom union). There is no primitive `==` beside a protocol `eq` —
-that is the `int_to_str` shape, and this is the one operator family where it would
-otherwise creep back in.
+*(Decided 2026-07-19, replacing "comparison operators are protocol calls" — see the note
+at the end for what moved and why.)*
 
-So `1 == 2` is a dispatch, and the prelude ships `impl Eq` and `impl Ord` for every
-primitive, whose methods bottom out in `@native` intrinsics — the leaf cannot be `a == b`
-without regress. After monomorphisation and inlining a primitive compare is a single
-instruction again; only the checker routes through dispatch.
+`==` and `!=` compare *structure*, always, on every type: primitives by value, `str` by
+bytes, records fieldwise, tuples elementwise, lists elementwise and by length, unions by
+tag and then payload. No impl is required and none can override it. `<`, `<=`, `>`, `>=`
+order the same way — lexicographically, records by field in declaration order — so every
+type is ordered and `sort(xs)` works on any list without a comparator.
 
-*Consequence, stated because it bites:* `==` requires `Eq` in scope, so it does not work
-without the prelude, and a record with no `impl Eq` cannot use `==` — that is a
-diagnostic, not a structural fallback. Equality *has* a canonical fieldwise meaning, so a
-structural default was on the table; it was declined to keep one mechanism, matching
-`to_string`, whose parallel `impl`-or-error this mirrors. `Ord` is not optional either way
-— a record has no canonical order — so requiring `Eq` too keeps the two consistent.
+There is no `Eq` protocol and no `Ord` protocol. A comparison is a primitive that the
+backend expands per type, the same machinery that already builds map-key witnesses.
+
+The reason is that equality and order are not choices. Two records with equal fields are
+equal; there is no second defensible answer, and a protocol exists to let a type answer a
+question its own way. `to_string` is a protocol because *formatting* genuinely varies —
+that is a presentation choice. Equality does not vary, so the parallel that once justified
+`Eq` does not hold. Pattern matching settles it: `case 1 =>` compiles to a structural
+compare and could never dispatch to a user impl, so a dispatching `==` would have meant
+two equality mechanisms that can disagree — the exact outcome the protocol rule was
+written to prevent.
+
+Ordering is the weaker half of the claim, and it is total by deliberate choice rather than
+because a record has a natural order. Erlang and Elixir take this further and order
+*across* types, so `1 < :atom` is true; that is the part to decline. Cross-type comparison
+is almost always a mistake, and a total cross-type order makes it a silent one — Elixir
+had to add compiler warnings for structural comparison of structs precisely because
+`~D[2019-01-01] < ~D[2018-01-01]` returns a confident wrong answer. Answering where the
+honest answer is "you did not say" is the thing this language does not do (see the `any`
+rule, the required `else`, and record literals rejecting excess fields).
+
+So the operands must overlap. `1 < "s"` and `P < Q` are diagnostics, as they already were.
+Ordering a *union* is a diagnostic too: `(i64 | :none) < (i64 | :none)` typechecks under
+the overlap rule but has no answer that is not an invented rank between the arms, and
+inventing one would be the cross-type order sneaking back in through a side door. Union
+*equality* is fine and stays total — compare tags, then payloads when they match.
+
+*Consequences, stated because they bite:*
+
+A type whose meaningful order differs from its structural order sorts wrong, and silently.
+`{major, minor, patch}` happens to work; a date stored `{day, month, year}` does not, nor
+does semver with prerelease tags, nor `Money { amount, currency }`. The escape hatch is
+`sort_by(xs, key)` beside `sort(xs)` — one obvious function instead of a protocol, a
+dispatch path, and seven natives.
+
+Ordering recurses, so a type is ordered only when every part of it is. `Map` has no order
+(opaque, pointer-backed), `List[T]` is ordered exactly when `T` is, and a record that
+reaches itself is a pointer with nothing to walk. All three read as one ordered shape at
+the top level, and all three are diagnostics.
+
+*Generic ordering is not expressible yet.* `fn max[T](a: T, b: T) -> T { if a < b ... }` is
+refused, because a generic body is checked once with `T` abstract and nothing re-checks the
+instantiation — so `max(map, map)` would reach the backend as a comparison of two
+addresses. Structurally it ought to work; saying so needs the ordered check to run per
+instantiation at monomorphisation, where there is no diagnostic channel today. This is the
+open question `sort` will force: with no `Ord` protocol there is no bound to write, so
+either `sort` is a native that reads the element's compare off its value-witness (and the
+call is checked at the call site), or monomorphisation grows diagnostics.
+
+`f64` makes "total" a slight lie at the leaf. NaN compares false against everything
+including itself, so `NaN == NaN` is false, `{x: NaN} == {x: NaN}` is false — a record
+that is not equal to itself — and **`sort` on a list containing NaN returns an unspecified
+permutation**, not merely NaN in an odd position. IEEE-754 defines a `totalOrder` that
+would fix sorting, and it was declined: it makes `0.0 == -0.0` false and `NaN == NaN` true,
+trading a rare surprise for a common one. The operators do what the hardware does, which
+is what every other language has taught people to expect. `sort` is where it shows.
+
+*What moved:* the implementation never did dispatch — `check.rs` did an overlap test and
+lowering emitted a primitive compare, while the prelude's `Eq`/`Ord` impls named seven
+runtime symbols that do not exist and would not have linked. The doc lost. Four bugs fell
+out of the gap and are fixed with this: `record == record`, `record < record` and
+`tuple == tuple` each emitted C comparing two structs, which is not valid C; and
+`list == list` compiled and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
+
+*Where the code has not caught up yet, stated so this section does not drift ahead of it a
+second time:* `==` is structural today on primitives, `str`, records, tuples, lists and
+unions. It is **not** yet on `Map`, on a nullable pointer, or on a closure, and a union
+compared against another union projects both to their first variant instead of switching on
+the tag. Those four predate this decision and are unchanged by it — none is a new
+regression — but until they are fixed "total on every type" describes the decision, not the
+compiler. `docs/finalpush.md` has the table and the mechanism for each.
 
 ### Names count what they say
 
@@ -371,7 +435,10 @@ mean.
 
 ### There is a prelude, and it holds only what syntax needs
 
-`Display`, `Eq`, `Ord`, `Error`. Nothing else.
+`Display` and `Error`. Nothing else.
+
+`Eq` and `Ord` were here while `==` and `<` were meant to dispatch. Comparison is
+structural now, so nothing in the language names them and they are gone.
 
 Interpolation is syntax and desugars to a protocol call, so without a prelude every file
 containing a string hole needs an import before a language feature works. The rule: **if

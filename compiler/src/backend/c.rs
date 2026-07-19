@@ -510,8 +510,83 @@ fn hash_expr(r: &Repr, e: &str) -> String {
             .map(|(i, er)| hash_expr(er, &format!("{e}._{i}")))
             .reduce(|a, b| format!("neon_hash_mix({a}, {b})"))
             .unwrap_or_else(|| "0".into()),
+        // By length, not by address: `eq_expr` compares lists elementwise, and equal keys
+        // must hash equal. Hashing the elements too would need a loop, so a per-element
+        // hash on the value-witness -- the pointer the layering deliberately keeps off it.
+        // Length alone is a correct hash, just a weak one: `Map[List[T], V]` keyed on
+        // same-length lists degrades toward a linear probe, and buying more than that
+        // means giving every element type a hash function.
+        Repr::List(_) => format!("neon_hash_bytes(&{e}->len, sizeof {e}->len)"),
         _ => format!("neon_hash_bytes(&{e}, sizeof {e})"),
     }
+}
+
+/// Structural order, as an `int` expression that is negative, zero or positive — the
+/// `memcmp` convention. Aggregates compare lexicographically: a record by field in
+/// declaration order, a tuple by position, so the first field that differs decides.
+///
+/// This is a nested expression rather than a generated function because both operands are
+/// already plain lvalues (`prim_operand` hands back a variable or a literal), so repeating
+/// one costs nothing and evaluates nothing twice.
+///
+/// `f64` is compared with `<`/`>` and so is *not* a total order: NaN is neither, and both
+/// arms fall through to `0`, reporting NaN equal to everything. That is the documented
+/// consequence of using IEEE semantics at the leaf — see "Comparison is structural" in
+/// docs/decisions.md — and it is why `sort` on a list holding NaN has no defined result.
+/// Whether `cmp_expr` can order this repr — the backend's half of the checker's
+/// `is_ordered`. A union has no order (ranking its arms would be an invention), and a
+/// closure, map or boxed recursive record has none either; an aggregate is ordered exactly
+/// when every part of it is.
+fn has_order(r: &Repr) -> bool {
+    match r {
+        Repr::I64 | Repr::F64 | Repr::Bool | Repr::Tag | Repr::Str | Repr::Unit | Repr::Null => true,
+        Repr::Record { fields, .. } => fields.iter().all(|(_, fr)| has_order(fr)),
+        Repr::Tuple(elems) => elems.iter().all(has_order),
+        Repr::List(e) => has_order(e),
+        _ => false,
+    }
+}
+
+fn cmp_expr(r: &Repr, a: &str, b: &str) -> String {
+    match r {
+        Repr::Str => format!("neon_str_cmp({a}, {b})"),
+        Repr::Record { fields, .. } => fields
+            .iter()
+            .map(|(n, fr)| {
+                let f = field_name(n);
+                (fr, format!("{a}.{f}"), format!("{b}.{f}"))
+            })
+            .rev()
+            .fold("0".to_string(), |rest, (fr, fa, fb)| lex_then(fr, &fa, &fb, &rest)),
+        Repr::Tuple(elems) => elems
+            .iter()
+            .enumerate()
+            .map(|(i, er)| (er, format!("{a}._{i}"), format!("{b}._{i}")))
+            .rev()
+            .fold("0".to_string(), |rest, (er, ea, eb)| lex_then(er, &ea, &eb, &rest)),
+        // A list walks its elements through its witness, so one runtime function covers
+        // every element type.
+        Repr::List(_) => format!("neon_list_cmp({a}, {b})"),
+        // One inhabitant, so two of them are always equal. They are `neon_unit` structs in
+        // C, which `<` would reject anyway.
+        Repr::Unit | Repr::Null => "0".to_string(),
+        // Scalars: the standard branchless three-way compare.
+        Repr::I64 | Repr::F64 | Repr::Bool | Repr::Tag => format!("(({a} > {b}) - ({a} < {b}))"),
+        // Anything else has no structural order, and the checker rejects ordering it
+        // (`is_ordered` in typecheck/check.rs). Reaching here means the two disagree.
+        other => unreachable!("codegen: no structural order for repr `{other:?}`"),
+    }
+}
+
+/// Lexicographic chaining: if this position is equal, the answer is `rest`; otherwise it
+/// is this position's compare.
+///
+/// Chaining on *equality* rather than on `cmp(..) != 0` is what keeps the output linear.
+/// The obvious form, `(c = cmp(x)) != 0 ? c : rest`, cannot bind `c` inside a C
+/// expression, so it has to repeat `cmp(x)` — and a record nested `d` deep would then
+/// emit `2^d` copies of its innermost compare.
+fn lex_then(r: &Repr, a: &str, b: &str, rest: &str) -> String {
+    format!("({} ? {rest} : {})", eq_expr(r, a, b), cmp_expr(r, a, b))
 }
 
 /// Content equality, matching `hash_expr`: equal keys must hash equal.
@@ -533,6 +608,24 @@ fn eq_expr(r: &Repr, a: &str, b: &str) -> String {
             .reduce(|x, y| format!("({x} && {y})"))
             .unwrap_or_else(|| "true".into()),
         Repr::F64 | Repr::I64 | Repr::Bool | Repr::Tag => format!("({a} == {b})"),
+        // Elementwise, not by address: `[1,2,3] == [1,2,3]` is true, and a list used as a
+        // map key finds its entry.
+        Repr::List(_) => format!("neon_list_eq({a}, {b})"),
+        // One inhabitant: two of them are equal without reading anything. Reading would in
+        // fact be wrong -- a `neon_unit` in a union payload is never written, so `memcmp`
+        // would decide on uninitialised bytes.
+        Repr::Unit | Repr::Null => "true".to_string(),
+        // Same tag, then the payload that tag selects. The `memcmp` fallback below is
+        // *wrong* here and was reachable as soon as records compared fieldwise: a union's
+        // payload is a C `union`, so the bytes past the live variant are never written, and
+        // `Q { tag: :nil } == Q { tag: :nil }` came back false off uninitialised padding.
+        Repr::Union(variants) => {
+            let arms = variants.iter().enumerate().rev().fold("true".to_string(), |rest, (i, v)| {
+                let (pa, pb) = (format!("{a}.u._{i}"), format!("{b}.u._{i}"));
+                format!("({a}.tag == {i} ? {} : {rest})", eq_expr(v, &pa, &pb))
+            });
+            format!("({a}.tag == {b}.tag && {arms})")
+        }
         _ => format!("(memcmp(&{a}, &{b}, sizeof {a}) == 0)"),
     }
 }
@@ -543,7 +636,28 @@ fn emit_witnesses(out: &mut String, types: &TypeTable) {
         let ty = types.c_type(repr);
         let retain = emit_witness_fn(out, types, name, repr, "retain", "neon_retain");
         let release = emit_witness_fn(out, types, name, repr, "release", "neon_release");
-        let _ = writeln!(out, "static const neon_witness {name} = {{ sizeof({ty}), {retain}, {release} }};");
+        // Structural comparison, so `==` and `<` on a list can walk its elements. `eq`
+        // always exists; `cmp` only for an element that has an order.
+        let cast = format!("const {ty}* a = (const {ty}*)pa; const {ty}* b = (const {ty}*)pb;");
+        let _ = writeln!(
+            out,
+            "static bool {name}_eq(const void* pa, const void* pb) {{ {cast} return {}; }}",
+            eq_expr(repr, "(*a)", "(*b)"),
+        );
+        let cmp = if has_order(repr) {
+            let _ = writeln!(
+                out,
+                "static int {name}_cmp(const void* pa, const void* pb) {{ {cast} return {}; }}",
+                cmp_expr(repr, "(*a)", "(*b)"),
+            );
+            format!("{name}_cmp")
+        } else {
+            "0".to_string()
+        };
+        let _ = writeln!(
+            out,
+            "static const neon_witness {name} = {{ sizeof({ty}), {retain}, {release}, {name}_eq, {cmp} }};"
+        );
     }
     if !types.witnesses().is_empty() {
         out.push('\n');
@@ -1067,6 +1181,18 @@ fn rc_parts_rec(
     }
 }
 
+/// The C relational operator for an ordering primop, for comparing a three-way result
+/// against zero.
+fn rel_op(op: PrimOp) -> &'static str {
+    match op {
+        PrimOp::Lt => "<",
+        PrimOp::Le => "<=",
+        PrimOp::Gt => ">",
+        PrimOp::Ge => ">=",
+        _ => unreachable!("rel_op on a non-ordering primop"),
+    }
+}
+
 fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
     // Comparing a union against one of its variants must check the tag: a `null` value has
     // a zero-initialised payload, so a bare `payload == 0` would wrongly match `0`.
@@ -1080,6 +1206,26 @@ fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
     let is_str = args.first().is_some_and(|&v| matches!(scalar(v), Repr::Str));
     let a = args.first().map(|&v| prim_operand(f, v)).unwrap_or_default();
     let b = args.get(1).map(|&v| prim_operand(f, v)).unwrap_or_default();
+
+    // Comparison is structural on every type (docs/decisions.md). C has no `==` for a
+    // struct, so an aggregate expands fieldwise, and `str` ordering needs the runtime's
+    // bytewise compare. Scalars fall through to the plain operators below.
+    if matches!(op, PrimOp::Eq | PrimOp::Ne | PrimOp::Lt | PrimOp::Le | PrimOp::Gt | PrimOp::Ge) {
+        let r = args.first().map(|&v| scalar(v));
+        let aggregate = matches!(r, Some(Repr::Record { .. } | Repr::Tuple(_) | Repr::List(_)));
+        if let Some(r) = r {
+            if aggregate {
+                return match op {
+                    PrimOp::Eq => eq_expr(r, &a, &b),
+                    PrimOp::Ne => format!("(!{})", eq_expr(r, &a, &b)),
+                    _ => format!("({} {} 0)", cmp_expr(r, &a, &b), rel_op(op)),
+                };
+            }
+            if matches!(r, Repr::Str) && !matches!(op, PrimOp::Eq | PrimOp::Ne) {
+                return format!("(neon_str_cmp({a}, {b}) {} 0)", rel_op(op));
+            }
+        }
+    }
     match op {
         // i64 arithmetic traps on overflow; f64 is plain; str `+` is a borrowing concat.
         PrimOp::Add if is_str => format!("neon_str_add({a}, {b})"),

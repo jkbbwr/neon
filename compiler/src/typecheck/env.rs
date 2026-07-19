@@ -86,6 +86,8 @@ pub enum TypeErrorKind {
     LambdaParamNeedsType(String),
     /// `a == b` / `a < b` where the operands share no common type.
     Incomparable { left: String, right: String },
+    /// `a < b` where the operands do share a type, but that type has no order.
+    Unordered { ty: String },
     /// A required (non-nullable) field the record literal did not provide.
     MissingField(String),
     /// `for x in e` where `e` is not a collection.
@@ -218,6 +220,14 @@ impl fmt::Display for TypeError {
             TypeErrorKind::Incomparable { left, right } => write!(
                 f,
                 "`{left}` and `{right}` share no common type, so they cannot be compared"
+            ),
+            TypeErrorKind::Unordered { ty } => write!(
+                f,
+                "`{ty}` has no order, so `<`, `<=`, `>` and `>=` do not apply to it \
+                 (`==` still does, and works structurally). Ordering is total within a \
+                 type but never invented across one: a union would need a rank between \
+                 its arms, an atom is a name rather than a magnitude, and a `Map` or a \
+                 self-referencing record is a pointer with nothing to compare"
             ),
             TypeErrorKind::MainSignatureFixed => write!(
                 f,

@@ -135,6 +135,7 @@ operators/comparison.neon
 operators/float_arith.neon
 operators/float_special_values.neon
 operators/int_arith.neon
+operators/nan_propagates_through_structure.neon
 operators/orelse_chain.neon
 operators/orelse_union.neon
 operators/orelse_zero_is_not_null.neon
@@ -145,6 +146,11 @@ operators/precedence_arith.neon
 operators/precedence_ladder.neon
 operators/shift.neon
 operators/short_circuit.neon
+operators/structural_equality.neon
+operators/structural_ordering.neon
+operators/union_field_equality.neon
+operators/unordered_shapes_are_rejected.neon
+operators/unordered_union_is_rejected.neon
 protocols/ambiguity_resolved_by_qualification.neon
 protocols/ambiguous_call.neon
 protocols/declare_and_impl.neon

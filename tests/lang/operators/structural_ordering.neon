@@ -1,0 +1,40 @@
+// `<` orders structurally and lexicographically: a record by field in declaration
+// order, a tuple by position, a list elementwise with the shorter sorting first
+// when it is a prefix. `str` orders by bytes.
+//
+// The order is total within a type, which is what lets `sort` work on any list
+// without a comparator. It is *not* total across types: see
+// unordered_union_is_rejected.neon.
+
+use std::io;
+
+record Point { x: i64, y: i64 }
+
+fn main() {
+    // str is bytewise; a prefix sorts before what extends it.
+    io::println("#{"abc" < "abd"}");
+    io::println("#{"abc" < "ab"}");
+    io::println("#{"ab" < "abc"}");
+    io::println("#{"abc" <= "abc"}");
+    io::println("#{"b" > "abc"}");
+
+    // Records compare field by field, in declaration order: `x` decides before `y`
+    // is looked at.
+    let a = Point { x: 1, y: 2 };
+    let b = Point { x: 1, y: 3 };
+    let c = Point { x: 2, y: 0 };
+    io::println("#{a < b}");
+    io::println("#{a < c}");
+    io::println("#{c < b}");
+    io::println("#{a >= a}");
+
+    // Tuples compare by position.
+    io::println("#{(1, "b") < (1, "c")}");
+    io::println("#{(1, "z") < (2, "a")}");
+
+    // Lists: the first differing element decides, so a longer list can sort first.
+    io::println("#{[1, 2] < [1, 2, 3]}");
+    io::println("#{[1, 2, 3] < [1, 3]}");
+    io::println("#{[1, 2, 3] <= [1, 2, 3]}");
+    io::println("#{["a", "b"] < ["a", "c"]}");
+}

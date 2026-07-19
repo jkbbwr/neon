@@ -36,10 +36,22 @@ typedef void* neon_value;
 // retain/release one in place (NULL when the element holds nothing counted, e.g. a scalar).
 // Only bulk operations (grow, clone, drop-all) use it; element access is emitted inline by
 // codegen, which knows the type statically.
+// `eq` and `cmp` compare two elements structurally: `eq` for `==`, `cmp` three-way for
+// `<` (the `memcmp` convention). They live here rather than in a layered witness of their
+// own -- the way hashing does -- because the argument that kept `hash` out does not apply:
+// only a *map key* is hashed, so most element types would carry a hash pointer forever,
+// whereas any list can be compared and so any element type may need these.
+//
+// `eq` is always present: equality is total on every type. `cmp` is NULL when the element
+// has no structural order (a union -- ordering one would need an invented rank between its
+// arms); the checker rejects ordering such a list, so a non-NULL `cmp` is the caller's
+// precondition, not something to test at run time.
 typedef struct neon_witness {
     size_t size;
     void (*retain)(void* elem);
     void (*release)(void* elem);
+    bool (*eq)(const void* a, const void* b);
+    int (*cmp)(const void* a, const void* b);
 } neon_witness;
 
 // What a *hashed* container additionally needs of its key type. Layered rather than folded
@@ -135,6 +147,7 @@ int64_t neon_i64_neg(int64_t a);
 // ---- str ----
 neon_str neon_str_lit(const char* data, size_t len); // owner == NULL, static
 bool neon_str_eq(neon_str a, neon_str b);             // borrows both
+int neon_str_cmp(neon_str a, neon_str b);             // borrows both; -1/0/1, bytewise
 neon_str neon_str_concat(neon_str a, neon_str b);     // consumes both
 neon_str neon_str_add(neon_str a, neon_str b);        // borrows both (the `+` operator)
 
@@ -167,6 +180,8 @@ void* neon_list_at(neon_list* l, int64_t i); // borrows l; slot pointer, traps O
 neon_list* neon_list_push(neon_list* l, const void* elem);  // consumes l, moves *elem in
 neon_list* neon_list_set(neon_list* l, int64_t i, const void* elem); // consumes l, traps OOB
 neon_list* neon_list_concat(neon_list* a, neon_list* b);    // consumes both
+int neon_list_cmp(const neon_list* a, const neon_list* b);  // borrows both; -1/0/1
+bool neon_list_eq(const neon_list* a, const neon_list* b);  // borrows both
 neon_str neon_str_join(neon_list* parts, neon_str sep);     // consumes both; List[str] -> str
 
 // ---- map ----

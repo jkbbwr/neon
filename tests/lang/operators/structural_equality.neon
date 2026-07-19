@@ -1,0 +1,56 @@
+// `==` compares structure, on every type, with no impl required and none possible:
+// records fieldwise, tuples elementwise, lists elementwise and by length, and
+// nested combinations all the way down. See "Comparison is structural" in
+// docs/decisions.md.
+//
+// The list cases are the ones that used to be silently wrong: a list compared by
+// address, so `[1, 2, 3] == [1, 2, 3]` was false.
+
+use std::io;
+
+record Point { x: i64, y: i64 }
+record Segment { from: Point, to: Point }
+record Tagged { name: str, at: Point }
+
+fn main() {
+    // Records: equal fields, equal record. Distinct allocations, same value.
+    let p1 = Point { x: 1, y: 2 };
+    let p2 = Point { x: 1, y: 2 };
+    let p3 = Point { x: 1, y: 9 };
+    io::println("#{p1 == p2}");
+    io::println("#{p1 == p3}");
+    io::println("#{p1 != p3}");
+
+    // Nested records recurse.
+    let s1 = Segment { from: p1, to: p3 };
+    let s2 = Segment { from: p2, to: p3 };
+    io::println("#{s1 == s2}");
+
+    // A str field compares by bytes, not by address.
+    let t1 = Tagged { name: "origin", at: p1 };
+    let t2 = Tagged { name: "origin", at: p2 };
+    let t3 = Tagged { name: "other", at: p2 };
+    io::println("#{t1 == t2}");
+    io::println("#{t1 == t3}");
+
+    // Tuples, including a mixed one.
+    io::println("#{(1, "x") == (1, "x")}");
+    io::println("#{(1, "x") == (1, "y")}");
+
+    // Lists: elementwise and by length.
+    io::println("#{[1, 2, 3] == [1, 2, 3]}");
+    io::println("#{[1, 2, 3] == [1, 2, 4]}");
+    io::println("#{[1, 2] == [1, 2, 3]}");
+    io::println("#{["a", "b"] == ["a", "b"]}");
+
+    // Lists of lists, and lists of records, reach their elements' compare.
+    io::println("#{[[1], [2, 3]] == [[1], [2, 3]]}");
+    io::println("#{[[1], [2, 3]] == [[1], [2, 4]]}");
+    io::println("#{[p1, p3] == [p2, p3]}");
+
+    // The empty list equals another empty one, and nothing longer.
+    let empty: List[i64] = [];
+    let also_empty: List[i64] = [];
+    io::println("#{empty == also_empty}");
+    io::println("#{empty == [1]}");
+}

@@ -1,0 +1,38 @@
+// A union compares by tag first, then by the payload that tag selects.
+//
+// This is load-bearing for structural equality rather than a corner: the moment
+// records compare fieldwise, a union-typed *field* reaches the comparison, and a
+// union's payload is a C `union` whose bytes past the live variant are never
+// written. Comparing the raw bytes therefore decides on uninitialised memory —
+// `Q { tag: :nil } == Q { tag: :nil }` came back false, and not reliably so.
+//
+// Two different tags are unequal without either payload being read at all, which
+// is also what keeps `:nil` from matching a numeric payload that happens to be 0.
+
+use std::io;
+
+record Q { v: i64, tag: i64 | :nil }
+
+fn main() {
+    let nil1 = Q { v: 1, tag: :nil };
+    let nil2 = Q { v: 1, tag: :nil };
+    let five1 = Q { v: 1, tag: 5 };
+    let five2 = Q { v: 1, tag: 5 };
+    let seven = Q { v: 1, tag: 7 };
+    let zero = Q { v: 1, tag: 0 };
+
+    // Same tag, same payload.
+    io::println("#{nil1 == nil2}");
+    io::println("#{five1 == five2}");
+
+    // Different tag: unequal, and the payload is never consulted.
+    io::println("#{nil1 == five1}");
+    io::println("#{nil1 == zero}");
+
+    // Same tag, different payload.
+    io::println("#{five1 == seven}");
+
+    // And it reaches through a list, via the element witness.
+    io::println("#{[nil1] == [nil2]}");
+    io::println("#{[nil1] == [five1]}");
+}

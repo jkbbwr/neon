@@ -1,0 +1,20 @@
+//@ compile-fail
+//@ error-contains: has no order
+//
+// Ordering is total *within* a type, not across types. A union has more than one
+// shape, so `<` on it would need an invented rank between the arms — the
+// cross-type order that Erlang and Elixir define and this language declines,
+// because it turns a comparison mistake into a silent answer.
+//
+// This typechecks under the overlap rule — it is the same type on both sides —
+// so it takes its own check. `==` on the same value is fine and stays total.
+
+use std::io;
+
+fn worse(v: i64 | :none) -> bool {
+    v < v
+}
+
+fn main() {
+    io::println("#{worse(1)}");
+}

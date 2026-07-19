@@ -146,6 +146,19 @@ bool neon_str_eq(neon_str a, neon_str b) {
     return a.len == b.len && memcmp(a.data, b.data, a.len) == 0;
 }
 
+// Byte-lexicographic order: the shared prefix decides, and if one string is a prefix of
+// the other the shorter sorts first. `memcmp`'s sign is only guaranteed meaningful over
+// the common length, hence comparing lengths separately rather than over the longer one.
+// This is bytes, not codepoints and not collation -- `byte_len`'s naming rule applies.
+int neon_str_cmp(neon_str a, neon_str b) {
+    size_t n = a.len < b.len ? a.len : b.len;
+    int c = n ? memcmp(a.data, b.data, n) : 0;
+    if (c != 0) {
+        return c < 0 ? -1 : 1;
+    }
+    return a.len < b.len ? -1 : (a.len > b.len ? 1 : 0);
+}
+
 neon_str neon_str_concat(neon_str a, neon_str b) {
     neon_header* h = neon_alloc(a.len + b.len, neon_str_drop);
     char* data = (char*)(h + 1);
@@ -433,6 +446,39 @@ neon_list* neon_list_concat(neon_list* a, neon_list* b) {
     neon_release((neon_header*)a);
     neon_release((neon_header*)b);
     return r;
+}
+
+// Lexicographic over elements: the first differing element decides, and if one list is a
+// prefix of the other the shorter sorts first. Both lists are borrowed -- comparison reads.
+//
+// The element compare comes from the witness, so this one function serves every element
+// type, including nested lists: an inner list's elements are reached through *its* witness
+// on the recursive call.
+int neon_list_cmp(const neon_list* a, const neon_list* b) {
+    size_t sz = a->w->size;
+    size_t n = a->len < b->len ? a->len : b->len;
+    for (size_t i = 0; i < n; i++) {
+        int c = a->w->cmp(a->data + i * sz, b->data + i * sz);
+        if (c != 0) {
+            return c;
+        }
+    }
+    return a->len < b->len ? -1 : (a->len > b->len ? 1 : 0);
+}
+
+// Equality could be `neon_list_cmp(a, b) == 0`, but a length check rejects most unequal
+// pairs without touching an element, and it is the answer `==` asks for.
+bool neon_list_eq(const neon_list* a, const neon_list* b) {
+    if (a->len != b->len) {
+        return false;
+    }
+    size_t sz = a->w->size;
+    for (size_t i = 0; i < a->len; i++) {
+        if (!a->w->eq(a->data + i * sz, b->data + i * sz)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 neon_str neon_str_join(neon_list* parts, neon_str sep) {

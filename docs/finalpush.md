@@ -76,14 +76,61 @@ corpus programs run leak-free under ASan.
 
 ## Also outstanding, unrelated
 
-- **`==` ignores `Eq` impls.** `docs/decisions.md:348` says `==`/`!=` desugar to
-  `Eq::eq` and the comparisons to `Ord::cmp`. They do not: `check.rs` does a structural
-  overlap test returning `bool`, and lowering emits `PrimOp::Eq`. A user who writes
-  `impl Eq for MyType` gets a callable `eq(a, b)` that `a == b` ignores. Either the doc
-  or the implementation has to move — "`==` is always structural equality" is defensible,
-  just not what is written down.
+- ~~**`==` ignores `Eq` impls.**~~ **Settled 2026-07-19: the doc moved.** Comparison is
+  structural on every type and there is no `Eq`/`Ord` protocol; ordering is total *within*
+  a type, and ordering a union is a diagnostic. See "Comparison is structural" in
+  `docs/decisions.md` for the reasoning, including why the Elixir-style cross-type total
+  order was declined and what NaN costs. Four bugs were hiding in the doc/code gap:
+  `record == record`, `record < record` and `tuple == tuple` emitted C comparing two
+  structs (not valid C — the *C compiler* failed, not Neon), and `list == list` compiled
+  and returned pointer equality, so `[1,2,3] == [1,2,3]` was false.
+- **`==` is not yet structural on four reprs.** The 2026-07-19 work made equality
+  structural for records, tuples, lists and unions; these four were *already* wrong before
+  it and are unchanged by it — each verified against `7fbd131`, which behaves identically.
+  The decision doc claims equality is total on every type, so this is the gap between the
+  claim and the code, and the checker offers no diagnostic for any of them because the
+  `==` arm never consults a shape check at all:
+
+  | expression | today | should be |
+  | --- | --- | --- |
+  | `Map == Map` | `false` for equal contents (pointer compare) | structural |
+  | `(List[i64] \| null) == same` | `false` for equal contents (pointer compare) | structural |
+  | `closure == closure` | **gcc error**, `invalid operands to binary ==` | a diagnostic |
+  | `(P \| :none) == P` | **gcc error** on a record/tuple payload | structural |
+
+  The last is `union_compare` (`c.rs:955`) emitting a raw C `==` on the projected payload;
+  it needs to call `eq_expr` on the variant repr instead. `Nullable` also needs unwrapping
+  in `scalar_repr`, or its own arm in the aggregate routing. Closure equality has no
+  structural answer and should be refused by the checker, which means `==` needs an
+  `is_equatable` gate the way `<` now has `is_ordered`.
+
+  A related trap, since two operands that are *both* unions never reach `union_compare`:
+  `prim_operand` projects the first non-null variant of each and compares those, so
+  `(i64 | bool)` operands compare an `i64` against a `bool` — `1 == true` is `true`.
+
+- **A list used as a map key leaks.** Pre-existing, and unrelated to comparison — it
+  reproduces identically on `7fbd131`, before that work. One list object plus its data
+  buffer (72 bytes for `[1, 2]`) is never released:
+
+  ```neon
+  let m = map::set(map::new(), [1, 2], "found");   // 72 bytes leaked at exit
+  ```
+
+  A `str` key does not leak, and a plain `list::push` does not leak, so it is specific to
+  the key path — most likely the map's own drop never releases keys through their witness.
+  Worth fixing next to the map ABI; until then `Map[List[T], V]` cannot be a corpus test,
+  because the corpus runs under ASan with leak detection on.
+
+  (Its *lookup* now works: hashing a list by address while comparing it structurally would
+  have broken the "equal keys hash equal" invariant, so `hash_expr` hashes the length. That
+  fixed a second pre-existing bug — `map::contains(m, [1, 2])` used to return false for a
+  key that was there — at the cost of a weak hash. See the comment on `hash_expr`.)
 - Return overloading **does** work: `dispatch.rs` falls back to the expected type when no
   parameter mentions the subject, so `fn make() -> T` resolves from context.
 - Stdlib breadth: 48 functions across 5 modules. No sort, no real file I/O, no math.
+  `sort` is now unblocked — every type has a structural order — and `sort_by(xs, key)` is
+  the documented escape hatch for a type whose meaningful order is not its structural one.
+  Pick a sort that stays memory-safe under an inconsistent comparator: NaN makes the
+  comparison lie, and an introsort-style implementation can read out of bounds when it does.
 - Stacktrace is still unbuilt, and `opt-release` passes `-fomit-frame-pointer`, which
   fights it.

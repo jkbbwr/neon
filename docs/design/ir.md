@@ -28,9 +28,10 @@ swappable runtime shim (`neon_alloc`/`neon_free`), selected by the existing
 
 **Representations.** **Inline aggregates** — records, tuples and containers store
 elements *by value*, not boxed (`List[Point]` has `Point`-sized slots). Generic
-containers carry a per-element **value-witness** — `{ size, retain, release, drop }`
-generated for each monomorphic element type — so they can copy and drop elements whose
-shape they cannot see. Unions are inline `{tag, payload}` when they fit; nullable-of-
+containers carry a per-element **value-witness** — `{ size, retain, release, eq, cmp }`
+generated for each monomorphic element type — so they can copy, drop and compare elements
+whose shape they cannot see. `cmp` is null when the element has no structural order (a
+union); the checker rejects ordering such a container, so callers need not test it. Unions are inline `{tag, payload}` when they fit; nullable-of-
 pointer is a null pointer, no tag. `bool` is one byte. Atoms are tagged by a **64-bit
 hash of the name**, globally consistent with no intern table (collisions astronomically
 unlikely, checkable within a program). Closures are `{ fn_ptr, env }` with a **null env**
@@ -187,8 +188,9 @@ and write them directly, so they are ABI. `str` is a flat refcounted byte buffer
 slices as `{buf, offset, len}` views sharing it; a **string literal is an immortal
 `.rodata` object** whose header flag makes retain/release no-ops and needs no copy.
 `List` stores elements **inline** and carries the element's **value-witness** (`{ size,
-retain, release, drop }`), so grow/clone/drop-all work over elements the runtime cannot
-see the shape of, while codegen reads and writes slots directly by their known `Repr`.
+retain, release, eq, cmp }`), so grow/clone/drop-all and the structural `==`/`<` work over
+elements the runtime cannot see the shape of, while codegen reads and writes slots directly
+by their known `Repr`.
 `Map` is a **flat Swiss-table hash map**, copy-on-write: mutated in place when unshared
 (FBIP), copied only when shared — the persistent-sharing job a HAMT would do is already
 covered by reuse for the common case, and the flat layout is far kinder to the cache.

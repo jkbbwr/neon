@@ -1,0 +1,37 @@
+//@ compile-fail
+//@ error-contains: has no order
+//
+// Ordering recurses: a type is ordered only when every part of it is. Each of these
+// reads as a single shape at the top level and would have slipped through a
+// one-level check — and each did, with a real consequence:
+//
+//   List[i64 | str]  the element witness has no `cmp`, so the emitted
+//                    `neon_list_cmp` called a null pointer: a segfault.
+//   Map[K, V]        opaque and pointer-backed; `<` compiled to a comparison of
+//                    two `neon_map*` *addresses*, a silent meaningless answer.
+//   a self-referencing record   pointer-backed for the same reason, same silent answer.
+//
+// `==` is fine on all three: equality is total. Only ordering is refused.
+
+use std::io;
+use std::collections::map;
+
+record Node { v: i64, next: Node | null }
+
+fn union_elements(a: List[i64 | str], b: List[i64 | str]) -> bool {
+    a < b
+}
+
+fn maps(a: Map[str, i64], b: Map[str, i64]) -> bool {
+    a < b
+}
+
+fn cyclic(a: Node, b: Node) -> bool {
+    a < b
+}
+
+fn main() {
+    io::println("#{union_elements([1], [2])}");
+    io::println("#{maps(map::new(), map::new())}");
+    io::println("#{cyclic(Node { v: 1, next: null }, Node { v: 2, next: null })}");
+}

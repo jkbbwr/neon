@@ -622,6 +622,45 @@ fn ordering_needs_a_common_ordered_type() {
 }
 
 #[test]
+fn ordering_needs_one_shape_even_when_the_types_match() {
+    // Sharing a type is not enough: ordering a union would need a rank between its
+    // arms, which is the cross-type order docs/decisions.md declines. `==` is still
+    // fine on every one of these -- equality is total.
+    for src in [
+        "fn f(v: i64 | :none) -> bool { v < v }",
+        "fn f(v: i64 | str) -> bool { v < v }",
+        "fn f(v: i64 | null) -> bool { v < v }",
+        "fn f(v: :lt | :gt) -> bool { v < v }",
+    ] {
+        let e = check(src);
+        assert!(e.iter().any(|k| matches!(k, TypeErrorKind::Unordered { .. })), "{src}: {e:?}");
+        clean(&src.replace(" < ", " == "));
+    }
+    // A single shape is ordered, aggregates included. (`List`/`Map` need the prelude,
+    // which these fixtures do not load — operators/structural_ordering.neon and
+    // operators/unordered_shapes_are_rejected.neon cover them.)
+    clean("record P { x: i64, y: str } fn f(a: P, b: P) -> bool { a < b }");
+    clean("fn f(a: (i64, str), b: (i64, str)) -> bool { a < b }");
+
+    // Ordering recurses into parts: one unordered field or element is enough. A
+    // one-level check passed all of these, and the backend then either emitted a
+    // pointer comparison or called a null `cmp`.
+    for src in [
+        "record P { x: i64 | str } fn f(a: P, b: P) -> bool { a < b }",
+        "record P { x: :ok | :err } fn f(a: P, b: P) -> bool { a < b }",
+        "fn f(a: (i64, i64 | str), b: (i64, i64 | str)) -> bool { a < b }",
+        // A record that reaches itself is a pointer, not a structure to walk.
+        "record N { v: i64, next: N | null } fn f(a: N, b: N) -> bool { a < b }",
+        // A bare type variable: nothing re-checks the instantiation, so it is refused
+        // rather than deferred. See the note on `ordered_rec`.
+        "fn smaller[T](a: T, b: T) -> bool { a < b }",
+    ] {
+        let e = check(src);
+        assert!(e.iter().any(|k| matches!(k, TypeErrorKind::Unordered { .. })), "{src}: {e:?}");
+    }
+}
+
+#[test]
 fn a_null_comparison_needs_no_common_type() {
     // `x == null` is a tag test, not Eq, so it does not require i64 and null to be
     // comparable as values.

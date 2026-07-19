@@ -1,0 +1,34 @@
+// The documented hole in "ordering is total": `f64` uses IEEE semantics at the leaf,
+// so NaN compares false against everything including itself — and because records and
+// lists compare *fieldwise*, that propagates. A record holding NaN is not equal to
+// itself.
+//
+// This is the cost of IEEE at the operator, taken deliberately over IEEE-754's
+// `totalOrder`, which would fix it at the price of making `0.0 == -0.0` false and
+// `NaN == NaN` true. See "Comparison is structural" in docs/decisions.md. The visible
+// consequence is that `sort` on a list containing NaN has no defined result.
+
+use std::io;
+
+record P { x: f64 }
+
+fn main() {
+    let nan = 0.0 / 0.0;
+
+    // The leaf.
+    io::println("#{nan == nan}");
+    io::println("#{nan < nan}");
+
+    // Fieldwise, so a record inherits it: not equal to itself.
+    let a = P { x: nan };
+    io::println("#{a == a}");
+    io::println("#{a < a}");
+
+    // Elementwise, so a list does too.
+    io::println("#{[nan] == [nan]}");
+
+    // An ordinary float is unaffected: structure does not change normal comparison.
+    let b = P { x: 1.5 };
+    io::println("#{b == b}");
+    io::println("#{[1.5] == [1.5]}");
+}
