@@ -71,6 +71,7 @@ pub struct BuildFlags {
     pub debug_symbols: Option<bool>,
     pub sanitize: Vec<String>,
     pub allocator: Option<Allocator>,
+    pub stacktrace: Option<bool>,
     /// Arbitrary flags passed straight through to the C compiler (`-C`).
     pub cflags: Vec<String>,
 }
@@ -85,6 +86,7 @@ struct TomlBuild {
     #[serde(default)]
     sanitize: Vec<String>,
     allocator: Option<String>,
+    stacktrace: Option<bool>,
     #[serde(default)]
     cflags: Vec<String>,
 }
@@ -105,6 +107,9 @@ pub struct BuildConfig {
     pub debug_symbols: bool,
     pub sanitize: Vec<String>,
     pub allocator: Allocator,
+    /// Keep frames walkable so a `throw` can capture one. Mutually exclusive with
+    /// `opt-release`'s `-fomit-frame-pointer`: this wins where they meet.
+    pub stacktrace: bool,
     pub cflags: Vec<String>,
 }
 
@@ -118,6 +123,7 @@ impl BuildConfig {
             debug_symbols: false,
             sanitize: vec![],
             allocator: Allocator::System,
+            stacktrace: false,
             cflags: vec![],
         };
 
@@ -139,6 +145,9 @@ impl BuildConfig {
             if let Some(a) = b.allocator {
                 cfg.allocator = parse_allocator(&a)?;
             }
+            if let Some(t) = b.stacktrace {
+                cfg.stacktrace = t;
+            }
             cfg.cflags.extend(b.cflags);
         }
 
@@ -156,6 +165,9 @@ impl BuildConfig {
             cfg.debug_symbols = d;
         }
         cfg.sanitize.extend(flags.sanitize);
+        if let Some(t) = flags.stacktrace {
+            cfg.stacktrace = t;
+        }
         if let Some(a) = flags.allocator {
             cfg.allocator = a;
         }
@@ -189,8 +201,18 @@ impl BuildConfig {
         if !self.mode.is_debug() {
             args.push("-flto".into());
         }
+        // `opt-release` trims the frame pointer, which is exactly what a stacktrace needs
+        // to walk. The two are mutually exclusive and the trace wins: an explicit
+        // `-fno-omit-frame-pointer` rather than merely dropping the flag, because `-O3`
+        // omits frame pointers on most targets on its own.
         if matches!(self.mode, Mode::OptRelease) {
-            args.extend(["-march=native", "-fomit-frame-pointer", "-DNDEBUG"].map(String::from));
+            args.extend(["-march=native", "-DNDEBUG"].map(String::from));
+            if !self.stacktrace {
+                args.push("-fomit-frame-pointer".into());
+            }
+        }
+        if self.stacktrace {
+            args.push("-fno-omit-frame-pointer".into());
         }
 
         for s in &self.sanitize {
@@ -256,4 +278,46 @@ fn find_manifest(near: &Path) -> Result<Option<TomlFile>> {
         dir = d.parent();
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(mode: Mode, stacktrace: bool) -> BuildConfig {
+        BuildConfig {
+            cc: "cc".into(),
+            mode,
+            opt: None,
+            debug_symbols: false,
+            sanitize: vec![],
+            allocator: Allocator::System,
+            stacktrace,
+            cflags: vec![],
+        }
+    }
+
+    /// A stacktrace needs walkable frames, and `opt-release` trims the frame pointer to
+    /// get them back. The two are mutually exclusive; the trace wins where they meet.
+    #[test]
+    fn stacktrace_and_frame_pointer_omission_are_exclusive() {
+        let omit = |c: &BuildConfig| c.cc_args().iter().any(|a| a == "-fomit-frame-pointer");
+        let keep = |c: &BuildConfig| c.cc_args().iter().any(|a| a == "-fno-omit-frame-pointer");
+
+        // `opt-release` trims by default.
+        assert!(omit(&cfg(Mode::OptRelease, false)));
+        assert!(!keep(&cfg(Mode::OptRelease, false)));
+
+        // Asking for traces suppresses the trim, and says so explicitly: `-O3` omits frame
+        // pointers on most targets on its own, so dropping the flag would not be enough.
+        assert!(!omit(&cfg(Mode::OptRelease, true)));
+        assert!(keep(&cfg(Mode::OptRelease, true)));
+
+        // The lighter modes never trimmed, but still state the requirement when asked.
+        for mode in [Mode::Debug, Mode::Release] {
+            assert!(!omit(&cfg(mode, true)));
+            assert!(keep(&cfg(mode, true)));
+            assert!(!keep(&cfg(mode, false)));
+        }
+    }
 }

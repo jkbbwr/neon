@@ -35,6 +35,11 @@ struct BuildOpts {
     /// Swap the memory allocator.
     #[arg(long, value_enum)]
     allocator: Option<Allocator>,
+    /// Keep frames walkable so a `throw` can capture a stacktrace. Overrides
+    /// `opt-release`'s frame-pointer trimming, which would otherwise make frames
+    /// unwalkable. Also settable as `stacktrace` in `neon.toml`'s `[build]`.
+    #[arg(long)]
+    stacktrace: bool,
     /// A raw flag passed straight through to the C compiler (repeatable). Values almost
     /// always begin with `-`, so hyphen-led values are taken literally.
     #[arg(short = 'C', long = "cflag", allow_hyphen_values = true)]
@@ -51,6 +56,8 @@ impl From<BuildOpts> for BuildFlags {
             debug_symbols: o.debug_symbols.then_some(true),
             sanitize: o.sanitize,
             allocator: o.allocator,
+            // Absence leaves the layer below alone, like `-g`.
+            stacktrace: o.stacktrace.then_some(true),
             cflags: o.cflag,
         }
     }

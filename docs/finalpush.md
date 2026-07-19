@@ -158,5 +158,8 @@ corpus programs run leak-free under ASan.
   `std::cmp`'s `max`/`min`/`max_by`/`min_by`, merge sort so that a lying comparator (NaN
   guarantees one) costs a wrong order rather than a read past the end. Still missing: real
   file I/O, and math beyond the operators.
-- Stacktrace is still unbuilt, and `opt-release` passes `-fomit-frame-pointer`, which
-  fights it.
+- Stacktrace is still unbuilt: no capture, no slot in the error struct. The
+  frame-pointer conflict that used to sit alongside it is settled -- `--stacktrace` (or
+  `stacktrace = true` in `neon.toml`) is mutually exclusive with `opt-release`'s
+  `-fomit-frame-pointer` and wins, passing `-fno-omit-frame-pointer` explicitly since `-O3`
+  trims frame pointers by itself. See `docs/design/errors.md`.

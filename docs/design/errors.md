@@ -75,14 +75,22 @@ it cannot create storage.
   today. Traps `_exit` with no unwinding by design (`docs/decisions.md`), so there are no
   frames to walk. Two routes, neither cheap:
   - DWARF unwinding (`backtrace()` / libunwind). Interacts with the `_exit`-on-trap and
-    allocator decisions, and needs the C emitted with frame pointers — note `opt-release`
-    currently passes `-fomit-frame-pointer`.
+    allocator decisions, and needs the C emitted with frame pointers.
   - A shadow stack the compiler maintains, paid for on every call. Predictable and
-    portable; costs the hot path.
+    portable; costs the hot path. Note this one does not care about frame pointers at all.
 
-  Opt-in is already wired conceptually: traces are a `mode` concern, on in `debug` and off
-  in `release`, and `mode` exists in `neon.toml` and the CLI. With traces off the slot is
-  not in the layout, so it costs nothing.
+  *The frame-pointer conflict is settled (2026-07-19) and is no longer a blocker.*
+  `opt-release` trims the frame pointer; a stacktrace needs it. They are mutually exclusive
+  and the trace wins: `--stacktrace`, or `stacktrace = true` under `[build]` in
+  `neon.toml`, suppresses `-fomit-frame-pointer` and passes `-fno-omit-frame-pointer`
+  instead. Explicitly, because `-O3` omits frame pointers on most targets on its own, so
+  merely dropping the flag would not have been enough --
+  `stacktrace_and_frame_pointer_omission_are_exclusive` in `cli/src/buildcfg.rs` pins both
+  halves. The switch exists and does nothing else yet; what is unbuilt is the capture and
+  the slot.
+
+  Opt-in beyond that is a `mode` concern: traces on in `debug`, off in `release`. With
+  traces off the slot is not in the layout, so it costs nothing.
 
   Open: whether frames record argument values (much more useful, much more capture cost),
   and whether a rethrow extends the original trace or starts a new one.
