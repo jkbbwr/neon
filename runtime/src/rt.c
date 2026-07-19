@@ -645,6 +645,34 @@ static neon_map* neon_map_clone(neon_map* m, size_t cap) {
     return c;
 }
 
+// Two maps are equal when they hold the same set of keys with equal values. Borrows both.
+//
+// Iteration order is not part of the answer, so this looks each key up in `b` rather than
+// walking the two slot arrays in step: the same entries can sit at different slots after a
+// different insertion history, and an open-addressed table has no canonical order.
+// Comparing lengths first makes "same keys" enough -- if every key of `a` is in `b` and the
+// counts match, neither can hold a key the other lacks.
+bool neon_map_eq(neon_map* a, neon_map* b) {
+    if (a == b) {
+        return true;
+    }
+    if (a->len != b->len) {
+        return false;
+    }
+    size_t ksz = a->kw->value->size, vsz = a->vw->size;
+    for (size_t i = 0; i < a->cap; i++) {
+        if (a->ctrl[i] != NEON_MAP_FULL) {
+            continue;
+        }
+        const void* key = a->keys + i * ksz;
+        void* other = neon_map_find(b, key);
+        if (other == NULL || !a->vw->eq(a->vals + i * vsz, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 neon_map* neon_map_set(neon_map* m, const void* key, const void* val) {
     // Shared, or too full to probe well: copy before mutating. Uniquely owned maps are
     // updated in place, which is what makes the immutable interface cheap.

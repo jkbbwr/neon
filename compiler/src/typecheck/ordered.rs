@@ -41,7 +41,6 @@ pub(super) fn is_ordered(env: &Env, ty: TyId, bound: &HashSet<String>) -> bool {
 ///
 /// - a **closure**: no structural answer exists, and C cannot `==` a `neon_closure`. This
 ///   one is permanent; the rest are gaps to be closed.
-/// - a **`Map`**: opaque, so `==` compared the two pointers and equal maps came back false.
 /// - a **self-referencing record**: pointer-backed, same as `Map`.
 ///
 /// Unlike ordering there is no bound to escape through, because equality takes none: a bare
@@ -80,7 +79,13 @@ fn equatable_rec(env: &Env, ty: TyId, seen: &mut Vec<TyId>) -> bool {
         }
     } else {
         match super::nominal_head_of(env, ty).as_deref() {
-            Some("Map") => false,
+            // A map compares by content, so its *values* must be comparable. Its keys
+            // already are -- a key type without content equality could not be hashed into
+            // the table in the first place.
+            Some("Map") => match arg_of(env, ty, 1) {
+                Some(val) => equatable_rec(env, val, seen),
+                None => false,
+            },
             Some("List") => match arg_of(env, ty, 0) {
                 Some(elem) => equatable_rec(env, elem, seen),
                 None => false,

@@ -625,6 +625,8 @@ fn eq_expr(r: &Repr, a: &str, b: &str) -> String {
         // Elementwise, not by address: `[1,2,3] == [1,2,3]` is true, and a list used as a
         // map key finds its entry.
         Repr::List(_) => format!("neon_list_eq({a}, {b})"),
+        // Same keys with equal values, regardless of slot order.
+        Repr::Map(_, _) => format!("neon_map_eq({a}, {b})"),
         // One inhabitant: two of them are equal without reading anything. Reading would in
         // fact be wrong -- a `neon_unit` in a union payload is never written, so `memcmp`
         // would decide on uninitialised bytes.
@@ -1279,6 +1281,7 @@ fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
                 Repr::Record { .. }
                     | Repr::Tuple(_)
                     | Repr::List(_)
+                    | Repr::Map(_, _)
                     | Repr::Nullable(_)
                     | Repr::Null
                     | Repr::Unit

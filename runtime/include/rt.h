@@ -195,6 +195,7 @@ bool neon_map_contains(neon_map* m, const void* key);               // consumes 
 neon_map* neon_map_set(neon_map* m, const void* key, const void* val); // consumes m and key
 void* neon_map_at(neon_map* m, const void* key);   // borrows both; traps if absent
 void* neon_map_find(neon_map* m, const void* key); // borrows both; NULL when absent
+bool neon_map_eq(neon_map* a, neon_map* b);        // borrows both; same keys, equal values
 neon_list* neon_map_keys(neon_map* m, const neon_witness* w);   // consumes m
 neon_list* neon_map_values(neon_map* m, const neon_witness* w); // consumes m
 

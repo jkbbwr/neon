@@ -59,6 +59,7 @@ collections/list_iteration.neon
 collections/list_push_does_not_mutate_base.neon
 collections/list_set_does_not_mutate_base.neon
 collections/list_sort.neon
+collections/map_equality.neon
 collections/map_get_missing_throws.neon
 collections/map_index_missing_key_traps.neon
 collections/map_iteration.neon

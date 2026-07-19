@@ -1,0 +1,41 @@
+// Two maps are equal when they hold the same keys with equal values. Insertion order
+// is not part of the answer: an open-addressed table has no canonical slot order, so
+// the comparison looks each key up in the other map rather than walking both in step.
+//
+// This used to compare the two *pointers*, so equal maps were unequal — silently, since
+// the checker had nothing to say about it.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    let a = map::set(map::set(map::new(), "x", 1), "y", 2);
+
+    // Same entries, opposite insertion order: distinct allocations, distinct slot
+    // layouts, equal maps.
+    let b = map::set(map::set(map::new(), "y", 2), "x", 1);
+    io::println("#{a == b}");
+
+    // A differing value, a missing key, an extra key.
+    io::println("#{a == map::set(map::set(map::new(), "x", 1), "y", 9)}");
+    io::println("#{a == map::set(map::new(), "x", 1)}");
+    io::println("#{a == map::set(map::set(map::set(map::new(), "x", 1), "y", 2), "z", 3)}");
+
+    // A map is its own equal, and two empties agree.
+    io::println("#{a == a}");
+    let e1: Map[str, i64] = map::new();
+    let e2: Map[str, i64] = map::new();
+    io::println("#{e1 == e2}");
+
+    // Values compare structurally too, not by address: these lists are separate
+    // allocations holding the same elements.
+    let l1 = map::set(map::new(), "k", [1, 2]);
+    let l2 = map::set(map::new(), "k", [1, 2]);
+    io::println("#{l1 == l2}");
+    io::println("#{l1 == map::set(map::new(), "k", [1, 3])}");
+
+    // And a map nested as a value.
+    let n1 = map::set(map::new(), "inner", a);
+    let n2 = map::set(map::new(), "inner", b);
+    io::println("#{n1 == n2}");
+}

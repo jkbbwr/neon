@@ -1,21 +1,19 @@
 //@ compile-fail
 //@ error-contains: cannot be compared with `==`
 //
-// Equality is meant to be structural on every type, and is on primitives, `str`,
-// records, tuples, lists and unions. Four shapes the backend cannot compare are
-// refused rather than answered wrongly — before this, `Map == Map` returned false
-// for equal maps (it compared two addresses) and a closure `==` reached the C
-// compiler, which rejected it with a message naming a generated temp file.
+// Equality is structural on primitives, `str`, records, tuples, lists, unions and maps.
+// A closure is the one type it can never be: there is no structural answer to whether
+// two functions are equal, and C cannot compare two `neon_closure` values either — this
+// used to reach the C compiler, which rejected it with a message naming a generated
+// temp file.
 //
-// A closure is permanent: there is no structural answer. `Map`, a self-referencing
-// record and a `List` behind `null` are gaps — each is an opaque pointer today. Note
-// `P | null`, `str | null` and `i64 | null` are fine, since they carry a tag.
+// So this is a permanent diagnostic rather than a gap. Compare whatever the closures
+// were chosen by instead.
 
 use std::io;
-use std::collections::map;
 
 fn main() {
-    let a = map::set(map::new(), "k", 1);
-    let b = map::set(map::new(), "k", 1);
-    io::println("#{a == b}");
+    let f = (x: i64) => x + 1;
+    let g = (x: i64) => x + 1;
+    io::println("#{f == g}");
 }
