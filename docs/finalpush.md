@@ -118,23 +118,36 @@ corpus programs run leak-free under ASan.
   A parameter or a function return of the same type is fine, which is why the corpus test
   goes through functions. The fix belongs with `let`'s lowering, not with comparison.
 
-- **A generic cannot call a generic.** Pre-existing and unrelated to comparison —
-  verified identical on `7fbd131`. Passing an argument whose type is the caller's own
-  rigid type variable solves *nothing*: `solve_generics` returns an empty substitution, so
-  the callee's type parameters are never bound and lowering emits `neon_value` where the
-  concrete type belongs.
+- ~~**A generic cannot call a generic.**~~ **Fixed 2026-07-19.** `generic::infer`
+  short-circuited on `template == concrete`, which is exactly the case when a generic
+  passes its own rigid `T` along: nothing was bound, the callee was left unmonomorphised,
+  and lowering laid its instance out generically -- `id(x)` assigned a `void*` to an
+  `int64_t`, and a `List[T]` round-trip read every element at the wrong width and
+  corrupted the heap. The early-out now fires only when the template mentions none of the
+  variables being solved, and a variable bound to *itself* no longer out-ranks a concrete
+  answer found later (nested `map::set` calls raced exactly that way, `K := K` blocking
+  `K := str`). Pinned by `functions/generic_calls_generic.neon`.
+
+  This also unblocked marker propagation: `where T: Ord` is discharged from the call
+  site's substitution, so with one there, `fn relay[T](a: T, b: T) { max(a, b) }` is now
+  correctly rejected unless it declares the bound
+  (`operators/marker_ord_propagates.neon`).
+
+- **A lambda inside a generic is not monomorphised.** Found while writing `sort`. A
+  lambda declared in a generic function does not instantiate at the enclosing type
+  argument, so its body compares abstract values:
 
   ```neon
-  fn id[T](x: T) -> T { x }
-  fn relay[T](x: T) -> T { id(x) }        // gcc: assignment to 'int64_t' from 'neon_value'
+  fn sort[T](xs: List[T]) -> List[T] where T: Ord {
+      sort_by(xs, (a: T, b: T) => if a < b { :lt } else if b < a { :gt } else { :eq })
+  }
   ```
 
-  This is worth fixing early: it blocks any layered generic code, and it is also why a
-  `where T: Ord` marker bound cannot yet be *propagated*. The bound is discharged from the
-  call site's substitution, and when that substitution is empty there is nothing to check —
-  so `fn relay[T](a: T, b: T) { max(a, b) }` with no bound of its own is accepted, and
-  `relay(map, map)` reaches the backend. Direct calls are checked correctly; it is only the
-  generic-to-generic hop that escapes, and it escapes because the hop is broken anyway.
+  The lambda answered `:eq` for every pair, so sorting a `List[str]` returned it in the
+  original order -- quietly, since a stable sort with a constant comparator is the
+  identity. A direct `<` on a bound `T` *is* monomorphised, so `list::sort` spells out its
+  own ordered merge and `sort_by` keeps the comparator version. Collapsing the two back
+  together is the test that this is fixed.
 
 - **Bound failures inside a generic call report twice.** Pre-existing; a protocol bound
   does it too. Arguments are checked once while solving the callee's generics and again

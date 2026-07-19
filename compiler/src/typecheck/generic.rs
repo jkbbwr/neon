@@ -22,12 +22,38 @@ pub fn infer(
     vars: &HashSet<NameId>,
     subst: &mut HashMap<NameId, TyId>,
 ) {
-    if template == concrete {
+    // Identical types still have work to do when the template mentions a variable being
+    // solved. A generic that calls another generic passes its *own* rigid `T`, so the
+    // template `List[T]` and the argument `List[T]` are the same `TyId` -- and returning
+    // here bound nothing, leaving the callee unmonomorphised. Codegen then laid its
+    // instance out generically and read every element at the wrong width: `sort_by` on a
+    // list of `str` corrupted the heap. The early-out is still worth having for the common
+    // case of a fully concrete argument.
+    if template == concrete && !mentions_var(t, template, vars, &mut Vec::new()) {
         return;
     }
     if let Some(v) = as_var(t, template) {
         if vars.contains(&v) {
-            subst.entry(v).or_insert(concrete);
+            // First binding wins -- that is what makes inference top-down, so an expected
+            // type pins a variable and the arguments conform to it.
+            //
+            // The exception is a variable bound to *itself*. A generic calling a generic
+            // passes its own rigid `T`, which yields `T := T`: real, and necessary, since
+            // it is what tells lowering to resolve the callee at the enclosing instance's
+            // binding. But it teaches nothing about the type, so it must not out-rank a
+            // concrete answer found later. Nested `map::set` calls produce exactly that
+            // race -- the inner call's `Map[K, V]` return and the outer's parameter are
+            // the same `TyId`, so `K := K` landed first and blocked `K := str`.
+            let self_bound = |ty| as_var(t, ty) == Some(v);
+            match subst.get(&v).copied() {
+                None => {
+                    subst.insert(v, concrete);
+                }
+                Some(prev) if self_bound(prev) && !self_bound(concrete) => {
+                    subst.insert(v, concrete);
+                }
+                _ => {}
+            }
             return;
         }
     }
@@ -58,6 +84,34 @@ pub fn infer(
 }
 
 /// True when `ty` is a rigid variable (so a bound cannot yet be discharged).
+/// Whether `ty` mentions any of `vars`, at any depth. `seen` breaks the cycle on a
+/// recursive type, which would otherwise walk itself forever.
+fn mentions_var(t: &Types, ty: TyId, vars: &HashSet<NameId>, seen: &mut Vec<TyId>) -> bool {
+    if seen.contains(&ty) {
+        return false;
+    }
+    // A variable mixed with anything else (`T | null`) is not a bare var, so check the
+    // variable set directly rather than going through `as_var`.
+    let names = t.atomset_of(t.data(ty).vars);
+    if names.names.iter().any(|n| vars.contains(n)) {
+        return true;
+    }
+    seen.push(ty);
+    let found = if let Some(fields) = single_record(t, ty) {
+        fields.iter().any(|&(_, f)| mentions_var(t, f, vars, seen))
+    } else if let Some(elems) = single_tuple(t, ty) {
+        elems.iter().any(|&e| mentions_var(t, e, vars, seen))
+    } else if let Some((params, ret, throws)) = single_arrow(t, ty) {
+        params.iter().any(|&p| mentions_var(t, p, vars, seen))
+            || mentions_var(t, ret, vars, seen)
+            || mentions_var(t, throws, vars, seen)
+    } else {
+        false
+    };
+    seen.pop();
+    found
+}
+
 pub fn is_var(t: &Types, ty: TyId) -> bool {
     as_var(t, ty).is_some()
 }

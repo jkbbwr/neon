@@ -1079,7 +1079,12 @@ impl Checker<'_> {
                 if !is_null(lhs) && !is_null(rhs) && !self.env.is_error(l) && !self.env.is_error(r) {
                     let meet = self.env.solver.t.intersect(l, r);
                     let both_atoms = self.is_atomic(l) && self.is_atomic(r);
-                    if self.env.solver.is_empty(meet) && !both_atoms {
+                    // One side being a subtype of the other is comparable even when the
+                    // meet is empty: `xs == []` compares `List[i64]` with `List[never]`,
+                    // and `List[never]` has no *inhabitants* to intersect with, so the
+                    // overlap test alone rejected the natural way to ask "is this empty".
+                    let related = self.env.solver.is_subtype(l, r) || self.env.solver.is_subtype(r, l);
+                    if self.env.solver.is_empty(meet) && !both_atoms && !related {
                         let (a, b) = (self.show(l), self.show(r));
                         self.error(e.span.clone(), TypeErrorKind::Incomparable { left: a, right: b });
                     } else if !super::ordered::is_equatable(self.env, l)

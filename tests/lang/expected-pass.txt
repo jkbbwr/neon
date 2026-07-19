@@ -58,6 +58,7 @@ collections/list_index_out_of_bounds_traps.neon
 collections/list_iteration.neon
 collections/list_push_does_not_mutate_base.neon
 collections/list_set_does_not_mutate_base.neon
+collections/list_sort.neon
 collections/map_get_missing_throws.neon
 collections/map_index_missing_key_traps.neon
 collections/map_iteration.neon
@@ -98,6 +99,7 @@ errors/uncaught_at_top_level.neon
 functions/declaration.neon
 functions/dot_call_rejected.neon
 functions/explicit_type_arguments.neon
+functions/generic_calls_generic.neon
 functions/generic_identity.neon
 functions/higher_order.neon
 functions/mutual_recursion.neon
@@ -136,6 +138,7 @@ operators/float_arith.neon
 operators/float_special_values.neon
 operators/int_arith.neon
 operators/marker_ord_bound.neon
+operators/marker_ord_propagates.neon
 operators/marker_ord_unsatisfied.neon
 operators/nan_propagates_through_structure.neon
 operators/ordering_generic_needs_the_bound.neon

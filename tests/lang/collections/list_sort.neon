@@ -1,0 +1,64 @@
+// `sort` orders structurally and needs `where T: Ord`; `sort_by` takes the comparison
+// as an argument and needs no bound, which is how a type whose meaningful order is not
+// its structural one gets sorted. See "Comparison is structural" and "Markers" in
+// docs/decisions.md.
+//
+// Merge sort, so it is stable and so a comparator that lies -- the NaN case -- costs a
+// wrong order rather than a read past the end of the list.
+
+use std::io;
+use std::string;
+use std::cmp;
+use std::collections::list;
+
+record Person { name: str, age: i64 }
+
+fn show(xs: List[i64]) -> str {
+    let out = "";
+    for x in xs {
+        out = string::concat(out, "#{x} ");
+    };
+    out
+}
+
+fn main() {
+    // Structural order on primitives.
+    io::println(show(list::sort([3, 1, 2])));
+    io::println(show(list::sort([5, 4, 3, 2, 1])));
+    io::println(show(list::sort([1, 2, 3])));
+
+    // Degenerate lengths.
+    let empty: List[i64] = [];
+    io::println("#{list::len(list::sort(empty))}");
+    io::println(show(list::sort([7])));
+
+    // Duplicates survive; sorting is a permutation, not a dedup.
+    io::println(show(list::sort([2, 1, 2, 1])));
+
+    // str sorts bytewise, and a prefix sorts before what extends it.
+    let names = list::sort(["bb", "a", "b", "ab"]);
+    io::println(string::join(names, ","));
+
+    // A record sorts by field in declaration order: `name` decides before `age`.
+    let people = list::sort([
+        Person { name: "b", age: 1 },
+        Person { name: "a", age: 9 },
+    ]);
+    io::println(people[0].name);
+
+    // `sort_by` supplies the order, so it can sort by a field the structural order
+    // would have reached second -- and needs no `Ord` bound to do it.
+    let by_age = list::sort_by(
+        [Person { name: "b", age: 1 }, Person { name: "a", age: 9 }],
+        (p: Person, q: Person) => if p.age < q.age { :lt } else if q.age < p.age { :gt } else { :eq },
+    );
+    io::println(by_age[0].name);
+
+    // Descending, by inverting the comparator.
+    io::println(show(list::sort_by([1, 3, 2], (a: i64, b: i64) => if b < a { :lt } else if a < b { :gt } else { :eq })));
+
+    // max/min, and the `_by` forms that take the comparison instead of a bound.
+    io::println("#{cmp::max(3, 7)}");
+    io::println("#{cmp::min(3, 7)}");
+    io::println("#{cmp::max_by(Person { name: "a", age: 9 }, Person { name: "b", age: 1 }, (p: Person, q: Person) => if p.age < q.age { :lt } else { :gt }).name}");
+}

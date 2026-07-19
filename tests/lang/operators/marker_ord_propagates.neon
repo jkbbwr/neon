@@ -1,0 +1,26 @@
+//@ compile-fail
+//@ error-contains: does not satisfy
+//
+// A `where T: Ord` bound has to be *passed on*: a generic that calls an ordered
+// generic with its own type parameter must declare the bound itself. `relay` does
+// not, so the call to `max` is rejected inside `relay` rather than blowing up at
+// whatever type a caller eventually supplies.
+//
+// This depends on inference binding `T := T` across a generic-to-generic hop. While
+// that returned an empty substitution there was no binding to discharge the bound
+// against, so this compiled and `relay(map, map)` reached the backend as a comparison
+// of two addresses. See functions/generic_calls_generic.neon.
+
+use std::io;
+
+fn max[T](a: T, b: T) -> T where T: Ord {
+    if a < b { b } else { a }
+}
+
+fn relay[T](a: T, b: T) -> T {
+    max(a, b)
+}
+
+fn main() {
+    io::println("#{relay(1, 2)}");
+}

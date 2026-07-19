@@ -42,10 +42,6 @@ pub(super) fn is_ordered(env: &Env, ty: TyId, bound: &HashSet<String>) -> bool {
 /// - a **closure**: no structural answer exists, and C cannot `==` a `neon_closure`. This
 ///   one is permanent; the rest are gaps to be closed.
 /// - a **`Map`**: opaque, so `==` compared the two pointers and equal maps came back false.
-/// - a **`List` behind `null`**: `T | null` for a pointer-backed `T` lowers to a bare
-///   nullable pointer with no tag, which the structural routing does not reach. Note that
-///   `P | null`, `str | null` and `i64 | null` are *fine* -- they carry a tag and compare
-///   by it -- so this is narrower than "nullable".
 /// - a **self-referencing record**: pointer-backed, same as `Map`.
 ///
 /// Unlike ordering there is no bound to escape through, because equality takes none: a bare
@@ -85,8 +81,6 @@ fn equatable_rec(env: &Env, ty: TyId, seen: &mut Vec<TyId>) -> bool {
     } else {
         match super::nominal_head_of(env, ty).as_deref() {
             Some("Map") => false,
-            // A pointer-backed container behind `null` loses its tag; see the doc above.
-            Some("List") if d.base & super::types::B_NULL != 0 => false,
             Some("List") => match arg_of(env, ty, 0) {
                 Some(elem) => equatable_rec(env, elem, seen),
                 None => false,

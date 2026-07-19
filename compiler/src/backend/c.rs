@@ -589,6 +589,20 @@ fn lex_then(r: &Repr, a: &str, b: &str, rest: &str) -> String {
     format!("({} ? {rest} : {})", eq_expr(r, a, b), cmp_expr(r, a, b))
 }
 
+/// Whether an expression of nullable repr `r` holds null, as a C condition. Mirrors
+/// `is_null`, which answers the same question for a `Value` rather than an expression.
+fn null_test(r: &Repr, e: &str) -> String {
+    match r {
+        Repr::Nullable(inner) if matches!(inner.as_ref(), Repr::Str) => format!("({e}.data == NULL)"),
+        // A closure is a `{fn, env}` pair: a capture-less closure has a NULL env and is
+        // not null, so nullability rides on the function pointer.
+        Repr::Nullable(inner) if matches!(inner.as_ref(), Repr::Closure { .. }) => {
+            format!("({e}.fn == NULL)")
+        }
+        _ => format!("({e} == NULL)"),
+    }
+}
+
 /// Content equality, matching `hash_expr`: equal keys must hash equal.
 fn eq_expr(r: &Repr, a: &str, b: &str) -> String {
     match r {
@@ -615,6 +629,14 @@ fn eq_expr(r: &Repr, a: &str, b: &str) -> String {
         // fact be wrong -- a `neon_unit` in a union payload is never written, so `memcmp`
         // would decide on uninitialised bytes.
         Repr::Unit | Repr::Null => "true".to_string(),
+        // `T | null` for a pointer-backed `T` carries no tag -- null *is* the null pointer
+        // -- so the null-ness of each side is tested first, and the payload compared only
+        // when both are present. Without this the two pointers were compared directly and
+        // two equal-but-distinct lists came back unequal.
+        Repr::Nullable(inner) => {
+            let (na, nb) = (null_test(r, a), null_test(r, b));
+            format!("({na} ? {nb} : (!{nb} && {}))", eq_expr(inner, a, b))
+        }
         // Same tag, then the payload that tag selects. The `memcmp` fallback below is
         // *wrong* here and was reachable as soon as records compared fieldwise: a union's
         // payload is a C `union`, so the bytes past the live variant are never written, and
@@ -1206,6 +1228,23 @@ fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
         if let Some(s) = union_compare(f, op, args) {
             return s;
         }
+        // A nullable against a literal `null`: the two sides have different reprs -- a
+        // value initialised with `null` is lowered as `Repr::Null` (a `neon_unit`), not as
+        // the nullable it was annotated with -- so this is a null *test*, not a compare.
+        if let (Some(&x), Some(&y)) = (args.first(), args.get(1)) {
+            let (rx, ry) = (f.value_repr(x), f.value_repr(y));
+            let test = match (rx, ry) {
+                (Repr::Nullable(_), Repr::Null) => Some(null_test(rx, &var(x))),
+                (Repr::Null, Repr::Nullable(_)) => Some(null_test(ry, &var(y))),
+                _ => None,
+            };
+            if let Some(t) = test {
+                return match op {
+                    PrimOp::Ne => format!("(!{t})"),
+                    _ => t,
+                };
+            }
+        }
         // Two unions: `union_compare` handles only union-against-a-bare-variant, and
         // `prim_operand` below would project *both* sides to their first variant and
         // compare those -- so `(i64 | bool)` operands compared an i64 against a bool and
@@ -1232,7 +1271,19 @@ fn prim(f: &Func, op: PrimOp, args: &[Value]) -> String {
     // bytewise compare. Scalars fall through to the plain operators below.
     if matches!(op, PrimOp::Eq | PrimOp::Ne | PrimOp::Lt | PrimOp::Le | PrimOp::Gt | PrimOp::Ge) {
         let r = args.first().map(|&v| scalar(v));
-        let aggregate = matches!(r, Some(Repr::Record { .. } | Repr::Tuple(_) | Repr::List(_)));
+        // `Null`/`Unit` are `neon_unit` structs with one inhabitant: C cannot `==` them,
+        // and `eq_expr` answers `true` without reading bytes that were never written.
+        let aggregate = matches!(
+            r,
+            Some(
+                Repr::Record { .. }
+                    | Repr::Tuple(_)
+                    | Repr::List(_)
+                    | Repr::Nullable(_)
+                    | Repr::Null
+                    | Repr::Unit
+            )
+        );
         if let Some(r) = r {
             if aggregate {
                 return match op {

@@ -1,0 +1,40 @@
+// A generic may call another generic, passing along its own type parameter.
+//
+// This did not work: inference short-circuited when the parameter template and the
+// argument type were the *same* `TyId`, which is exactly the case here -- `relay[T]`
+// hands `id` its own rigid `T`. Nothing was bound, so the callee was left
+// unmonomorphised and lowering laid its instance out generically: `id(x)` produced C
+// that assigned a `void*` to an `int64_t`, and a `List[T]` round-trip read every
+// element at the wrong width and corrupted the heap.
+
+use std::io;
+use std::string;
+use std::collections::list;
+
+fn id[T](x: T) -> T { x }
+fn relay[T](x: T) -> T { id(x) }
+
+// The same hop with the parameter *inside* a type, which is the shape `sort` uses.
+fn copy[T](xs: List[T]) -> List[T] {
+    let out: List[T] = [];
+    let i = 0;
+    while i < list::len(xs) {
+        out = list::push(out, xs[i]);
+        i = i + 1;
+    };
+    out
+}
+
+fn twice[T](xs: List[T]) -> List[T] { copy(copy(xs)) }
+
+record Point { x: i64, y: i64 }
+
+fn main() {
+    io::println("#{relay(7)}");
+    io::println(relay("seven"));
+
+    // Element widths differ: i64 is 8 bytes, str is a 3-word view, Point is 16.
+    io::println("#{list::len(twice([1, 2, 3]))}");
+    io::println(string::join(twice(["a", "b"]), ","));
+    io::println("#{twice([Point { x: 1, y: 2 }])[0].y}");
+}
