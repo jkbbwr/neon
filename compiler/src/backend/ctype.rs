@@ -54,6 +54,18 @@ pub struct TypeTable {
     key_witness_defs: Vec<(String, Repr)>,
 }
 
+/// A repr that codegen cannot pin to a C type. Every one of these was a silent
+/// `neon_value` until now, and each silence cost a bug: an unpinned repr becomes a bare
+/// `void*` that C accepts anywhere a pointer is accepted, so the value is not erased —
+/// it is *typed* as erased while holding unboxed bits, with no header, witness or tag.
+/// `is`/`as` then read a garbage tag, and a field read lands at the wrong offset.
+///
+/// Panicking is the point. The alternative is emitting C that compiles and is wrong,
+/// which is how the previous implementation died.
+fn ice(r: &Repr, what: &str) -> ! {
+    panic!("internal error: codegen reached {what}: {r:?}")
+}
+
 impl TypeTable {
     /// Collect every record and tuple repr reachable in the program.
     pub fn build(program: &Program) -> TypeTable {
@@ -337,13 +349,13 @@ impl TypeTable {
             Repr::Closure { .. } => "neon_closure".into(),
             Repr::BoxedRec(atom) => match self.boxed_names.get(atom) {
                 Some(n) => format!("{n}*"),
-                None => "neon_value".into(),
+                None => ice(r, "a boxed record with no registered wrapper"),
             },
             Repr::Record { .. } | Repr::Tuple(_) | Repr::Union(_) => self
                 .names
                 .get(&key_with(r, &self.recursive))
                 .cloned()
-                .unwrap_or_else(|| "neon_value".into()),
+                .unwrap_or_else(|| ice(r, "an aggregate that was never interned")),
             // A back-edge names a type without describing it, so type the resolution.
             // A recursive union finds its interned struct either way (both spellings
             // share the Z-key), but a recursion that terminates through a pointer —
@@ -354,7 +366,7 @@ impl TypeTable {
             Repr::Recursive(_) => {
                 let resolved = self.resolve(r);
                 if matches!(resolved, Repr::Recursive(_)) {
-                    "neon_value".into()
+                    ice(r, "a recursive back-edge that does not resolve")
                 } else {
                     self.c_type(resolved)
                 }
@@ -364,19 +376,24 @@ impl TypeTable {
                 Repr::Str => "neon_str".into(),
                 other => self.c_type(other),
             },
+            // The one deliberate erasure, and now the only place in the compiler that
+            // names `neon_value`. It is reached when the source said `any` — never as a
+            // fallback.
+            Repr::Any => "neon_value".into(),
+            // Uninhabited, and reached often: it is the error half of a result whose
+            // function does not throw, so a C type must be spelled even though no value
+            // of it exists. Kept as `neon_value` — the historical spelling — deliberately.
+            // `neon_unit` also passes the suite, but a pointer and a one-byte struct give
+            // any union containing this variant different sizes, and two paths disagreeing
+            // about a layout is the exact failure this file now panics to prevent. This is
+            // not erasure: nothing is ever loaded or stored through it.
+            Repr::Never => "neon_value".into(),
             // A type variable here is always a compiler bug: monomorphisation ran, so
-            // every repr reaching codegen should be concrete. Boxing it instead — which
-            // this arm's catch-all silently did — is how three separate substitution
-            // misses reached the C backend, where they became either a type error in
-            // generated code or, worse, a value read off the wrong layout. Fail loudly at
-            // the boundary rather than emit something that compiles.
+            // every repr reaching codegen should be concrete.
             Repr::Var(n) => panic!(
                 "internal error: type variable '{n} reached codegen — a repr was built \
                  without applying the instance substitution (see `repr_of_ty`)"
             ),
-            // `any` is the one deliberate erasure; the rest are boxed until their own
-            // passes land.
-            _ => "neon_value".into(),
         }
     }
 
