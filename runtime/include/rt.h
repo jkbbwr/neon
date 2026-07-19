@@ -187,10 +187,14 @@ neon_str neon_str_join(neon_list* parts, neon_str sep);     // consumes both; Li
 // ---- map ----
 neon_map* neon_map_new(const neon_key_witness* kw, const neon_witness* vw);
 int64_t neon_map_len(neon_map* m);                                  // consumes m
-bool neon_map_contains(neon_map* m, const void* key);               // consumes m
-neon_map* neon_map_set(neon_map* m, const void* key, const void* val); // consumes m
-void* neon_map_at(neon_map* m, const void* key);   // borrows m; slot pointer, traps if absent
-void* neon_map_find(neon_map* m, const void* key); // borrows m; NULL when absent
+// `contains` and `set` *consume* their key, like any other native: `set` moves it into the
+// table, or drops it when the table already holds that key. `at` and `find` borrow it --
+// they are reached through `Op::Index`, whose operands the refcount pass releases itself,
+// so releasing here too would double-free.
+bool neon_map_contains(neon_map* m, const void* key);               // consumes m and key
+neon_map* neon_map_set(neon_map* m, const void* key, const void* val); // consumes m and key
+void* neon_map_at(neon_map* m, const void* key);   // borrows both; traps if absent
+void* neon_map_find(neon_map* m, const void* key); // borrows both; NULL when absent
 neon_list* neon_map_keys(neon_map* m, const neon_witness* w);   // consumes m
 neon_list* neon_map_values(neon_map* m, const neon_witness* w); // consumes m
 

@@ -1,0 +1,29 @@
+// A `List` works as a map key: hashed and compared by content, and released rather
+// than leaked once the lookup is done.
+//
+// Every map native consumes its key, the same convention the rest of the runtime
+// follows. `contains` and `at` never discharged that, and `set` did so only when it
+// stored the key -- so a key the table already held, or one used purely to look up,
+// leaked. Invisible for an `i64` or a literal `str`, which own nothing; 72 bytes a
+// call for a `List`, which is why this test uses one.
+//
+// Content-keyed: the lists below are distinct allocations, so finding an entry with a
+// *different* list that happens to be equal is the thing being checked.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    let m = map::set(map::set(map::new(), [1, 2], "a"), [3], "b");
+
+    io::println("#{map::len(m)}");
+    io::println("#{map::contains(m, [1, 2])}");
+    io::println("#{map::contains(m, [3])}");
+    io::println("#{map::contains(m, [9, 9])}");
+
+    // Overwriting an existing key: the table keeps the key it has, and the incoming
+    // one has to be dropped rather than leaked.
+    let m2 = map::set(m, [1, 2], "c");
+    io::println("#{map::len(m2)}");
+    io::println(m2[[1, 2]]);
+}

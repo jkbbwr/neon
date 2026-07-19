@@ -146,23 +146,16 @@ corpus programs run leak-free under ASan.
   does it too. Arguments are checked once while solving the callee's generics and again
   under the solution, so any diagnostic in an argument position is emitted twice.
 
-- **A list used as a map key leaks.** Pre-existing, and unrelated to comparison — it
-  reproduces identically on `7fbd131`, before that work. One list object plus its data
-  buffer (72 bytes for `[1, 2]`) is never released:
+- ~~**A list used as a map key leaks.**~~ **Fixed 2026-07-19.** The map natives never had
+  a stated ownership rule for their *key*, only for the map. `contains` released the map
+  and dropped the key on the floor, and `set` discharged it only on the path where it
+  stored the key -- so overwriting an existing key leaked too. Both now consume the key,
+  like any other native. `at` and `find` deliberately do not: they are reached through
+  `Op::Index`, whose operands the refcount pass releases itself, and consuming there
+  double-freed (caught by ASan while writing the test). The header now states the rule per
+  function. Pinned by `collections/map_list_key.neon`, which uses a `List` key because a
+  scalar or literal key owns nothing and hides the bug.
 
-  ```neon
-  let m = map::set(map::new(), [1, 2], "found");   // 72 bytes leaked at exit
-  ```
-
-  A `str` key does not leak, and a plain `list::push` does not leak, so it is specific to
-  the key path — most likely the map's own drop never releases keys through their witness.
-  Worth fixing next to the map ABI; until then `Map[List[T], V]` cannot be a corpus test,
-  because the corpus runs under ASan with leak detection on.
-
-  (Its *lookup* now works: hashing a list by address while comparing it structurally would
-  have broken the "equal keys hash equal" invariant, so `hash_expr` hashes the length. That
-  fixed a second pre-existing bug — `map::contains(m, [1, 2])` used to return false for a
-  key that was there — at the cost of a weak hash. See the comment on `hash_expr`.)
 - Return overloading **does** work: `dispatch.rs` falls back to the expected type when no
   parameter mentions the subject, so `fn make() -> T` resolves from context.
 - Stdlib breadth. Sorting landed 2026-07-19: `list::sort`/`sort_by`/`merge` and

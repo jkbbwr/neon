@@ -62,6 +62,7 @@ collections/list_sort.neon
 collections/map_get_missing_throws.neon
 collections/map_index_missing_key_traps.neon
 collections/map_iteration.neon
+collections/map_list_key.neon
 collections/map_set_does_not_mutate_base.neon
 collections/nested_list_value_semantics.neon
 control/for_break_continue.neon

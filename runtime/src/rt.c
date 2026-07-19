@@ -586,12 +586,26 @@ static size_t neon_map_slot(neon_map* m, const void* key, bool* found) {
     return first_dead != (size_t)-1 ? first_dead : 0;
 }
 
+// Release a key the map is not going to store. Every map native *consumes* its key, the
+// same convention every other native follows: the caller hands over one reference and does
+// not release it afterwards. `set` discharges that by moving the key into the table, and
+// the lookups discharge it here. Missing this leaked a key per lookup -- invisible for an
+// `i64` or a literal `str`, and 72 bytes a call for a `List` key.
+static void neon_map_release_key(neon_map* m, const void* key) {
+    if (m->kw->value->release) {
+        m->kw->value->release((void*)key);
+    }
+}
+
 void* neon_map_find(neon_map* m, const void* key) {
     bool found = false;
     size_t i = neon_map_slot(m, key, &found);
     return found ? m->vals + i * m->vw->size : NULL;
 }
 
+// Borrows its key, unlike `contains` and `set`. It is reached through `Op::Index` rather
+// than `Op::Native`, and the refcount pass releases an index's operands itself -- releasing
+// here as well double-freed the key.
 void* neon_map_at(neon_map* m, const void* key) {
     void* v = neon_map_find(m, key);
     if (v == NULL) {
@@ -608,6 +622,7 @@ int64_t neon_map_len(neon_map* m) {
 
 bool neon_map_contains(neon_map* m, const void* key) {
     bool r = neon_map_find(m, key) != NULL;
+    neon_map_release_key(m, key);
     neon_release((neon_header*)m);
     return r;
 }
@@ -643,6 +658,8 @@ neon_map* neon_map_set(neon_map* m, const void* key, const void* val) {
     bool found = false;
     size_t i = neon_map_slot(m, key, &found);
     if (found) {
+        // The table keeps the key it already has, so the incoming one is ours to drop.
+        neon_map_release_key(m, key);
         if (m->vw->release) m->vw->release(m->vals + i * vsz);
     } else {
         memcpy(m->keys + i * ksz, key, ksz);
