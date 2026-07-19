@@ -50,8 +50,12 @@ common unshared case, and the flat table wins decisively on cache behaviour; HAM
 deferred behind the same `map::` surface for the rare heavily-shared-and-updated workload.
 
 **Errors.** A throwing call returns a **tagged result** `{ tag, union{ ok, err } }`; the
-caller checks the tag. An uncaught error reaching `main` prints `to_string` to **stderr**
-and exits with the chosen panic code.
+caller checks the tag. This is the calling convention of every throwing function,
+*including one reached through a closure*: `Repr::Closure` carries its `throws`, a
+throwing lambda's lifted function (and a named throwing function's adapter thunk) returns
+the tagged result, and a closure call unwraps it exactly like a direct call. An uncaught
+error reaching `main` prints `to_string` to **stderr** and exits with the chosen panic
+code.
 
 **Codegen & IR.** Full **monomorphisation** (no generic boxing), instances mangled from
 `(fn, concrete types)`, termination trusted to `TooDeep`. **SSA with block arguments**;
@@ -121,7 +125,8 @@ Repr =
   | Aggregate { fields: [Repr] }          // record, tuple — ordered, unnamed here
   | Union { tag: Repr, variants: [Repr] } // a tagged union
   | Box(Repr)                             // a pointer to a heap object (see below)
-  | Closure { params: [Repr], ret: Repr } // fn pointer + environment
+  | Closure { params: [Repr], throws: Repr, ret: Repr } // fn pointer + environment;
+                                          // throws ≠ never ⇒ fn returns Union([ret, throws])
   | Runtime(RtType)                       // str, List, Map — owned by the runtime ABI
 ```
 

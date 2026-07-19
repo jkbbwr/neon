@@ -66,8 +66,9 @@ fn substitute_repr(r: &Repr, subst: &std::collections::HashMap<String, Repr>) ->
         Repr::Map(k, v) => {
             Repr::Map(Box::new(substitute_repr(k, subst)), Box::new(substitute_repr(v, subst)))
         }
-        Repr::Closure { params, ret } => Repr::Closure {
+        Repr::Closure { params, throws, ret } => Repr::Closure {
             params: params.iter().map(|r| substitute_repr(r, subst)).collect(),
+            throws: Box::new(substitute_repr(throws, subst)),
             ret: Box::new(substitute_repr(ret, subst)),
         },
         _ => r.clone(),
@@ -106,8 +107,12 @@ fn match_repr(template: &Repr, concrete: &Repr, subst: &mut std::collections::Ha
                 }
             }
         }
-        (Repr::Closure { params: ap, ret: ar }, Repr::Closure { params: bp, ret: br }) => {
+        (
+            Repr::Closure { params: ap, throws: at, ret: ar },
+            Repr::Closure { params: bp, throws: bt, ret: br },
+        ) => {
             ap.iter().zip(bp).for_each(|(x, y)| match_repr(x, y, subst));
+            match_repr(at, bt, subst);
             match_repr(ar, br, subst);
         }
         _ => {}
@@ -560,16 +565,18 @@ fn lower_lambda_job(env: &Env, result: &TypecheckResult, job: LambdaJob) -> (Fun
     let ExprKind::Lambda { params: lparams, body } = &job.lambda.kind else {
         unreachable!("a lambda job holds a lambda");
     };
-    // The lambda's inferred arrow gives its parameter and return reprs.
-    let (param_reprs, ret_repr) = match result.ty(job.lambda.id).map(|t| repr_of(&env.solver.t, t)) {
-        Some(Repr::Closure { params, ret }) => (params, *ret),
-        _ => (vec![], Repr::Unit),
-    };
+    // The lambda's inferred arrow gives its parameter, throws and return reprs.
+    let (param_reprs, throws_repr, ret_repr) =
+        match result.ty(job.lambda.id).map(|t| repr_of(&env.solver.t, t)) {
+            Some(Repr::Closure { params, throws, ret }) => (params, *throws, *ret),
+            _ => (vec![], Repr::Never, Repr::Unit),
+        };
     // The inferred arrow is the *generic* one, so its variables are still open; the
     // enclosing instance's substitution closes them.
     let param_reprs: Vec<Repr> =
         param_reprs.iter().map(|r| substitute_repr(r, &job.subst)).collect();
     let ret_repr = substitute_repr(&ret_repr, &job.subst);
+    let throws_repr = substitute_repr(&throws_repr, &job.subst);
 
     let mut lo = Lower::with_subst(
         env,
@@ -579,6 +586,10 @@ fn lower_lambda_job(env: &Env, result: &TypecheckResult, job: LambdaJob) -> (Fun
         ret_repr.clone(),
         job.subst.clone(),
     );
+    // A throwing lambda returns the tagged result, like any throwing function.
+    if !matches!(throws_repr, Repr::Never) {
+        lo.b.set_throws(throws_repr);
+    }
 
     // The environment parameter, then unpack each capture from it.
     let env_repr = Repr::Tuple(job.captures.iter().map(|(_, r, _)| r.clone()).collect());
@@ -1192,7 +1203,7 @@ impl Lower<'_> {
         if let ExprKind::Path(p) = &callee.kind {
             if let [one] = p.as_slice() {
                 if let Some(callee_v) = self.lookup(one) {
-                    return self.b.emit(Op::CallClosure { callee: callee_v, args: arg_vs }, repr, ty);
+                    return self.lower_closure_call(callee, callee_v, arg_vs, repr, ty);
                 }
             }
             // A direct call to a named module function: native symbol or a Neon body.
@@ -1255,7 +1266,35 @@ impl Lower<'_> {
         // The callee is an expression producing a closure -- `f()(x)`, `(lambda)(x)` --
         // so evaluate it and call through it.
         let callee_v = self.lower_expr(callee);
-        self.b.emit(Op::CallClosure { callee: callee_v, args: arg_vs }, repr, ty)
+        self.lower_closure_call(callee, callee_v, arg_vs, repr, ty)
+    }
+
+    /// Call through a closure value. A throwing closure's function returns the tagged
+    /// result — its repr carries the `throws` — so the call is unwrapped exactly like a
+    /// direct call to a throwing function.
+    fn lower_closure_call(
+        &mut self,
+        callee: &Expr,
+        callee_v: Value,
+        args: Vec<Value>,
+        repr: Repr,
+        ty: TyId,
+    ) -> Value {
+        let err_repr = match self.b.value_repr(callee_v) {
+            Repr::Closure { throws, .. } => throws.as_ref().clone(),
+            _ => Repr::Never,
+        };
+        let result = self.b.emit(Op::CallClosure { callee: callee_v, args }, repr.clone(), ty);
+        // The error's TyId, for the handler's parameter; the arrow the checker recorded
+        // for the callee carries it. The repr above stays authoritative — it is
+        // substituted where the arrow type would still mention a variable.
+        let err_ty = self
+            .result
+            .ty(callee.id)
+            .and_then(|t| self.env.solver.t.as_arrow(t))
+            .map(|a| a.throws)
+            .unwrap_or(ty);
+        self.wrap_throwing_repr(result, err_repr, err_ty, repr, ty)
     }
 
     /// Lower a call the checker resolved by protocol dispatch. A `Direct` to a native
@@ -1512,12 +1551,25 @@ impl Lower<'_> {
     /// Wrap a call whose target may throw: check the tagged result and, on error, jump
     /// to the enclosing handler with the error; on success continue with the ok value.
     fn wrap_throwing(&mut self, result: Value, throws_ty: TyId, ok_repr: Repr, ty: TyId) -> Value {
-        if matches!(repr_of(&self.env.solver.t, throws_ty), Repr::Never) {
+        let err_repr = repr_of(&self.env.solver.t, throws_ty);
+        self.wrap_throwing_repr(result, err_repr, throws_ty, ok_repr, ty)
+    }
+
+    /// The same, with the error repr already in hand — a closure call reads it off the
+    /// callee's repr, which is substituted where a TyId would still be generic.
+    fn wrap_throwing_repr(
+        &mut self,
+        result: Value,
+        err_repr: Repr,
+        throws_ty: TyId,
+        ok_repr: Repr,
+        ty: TyId,
+    ) -> Value {
+        if matches!(err_repr, Repr::Never) {
             return result;
         }
         // The call yields a tagged result, not the callee's declared return. Retyping it
         // here keeps codegen and the refcount pass agreeing about what the value holds.
-        let err_repr = repr_of(&self.env.solver.t, throws_ty);
         self.b.set_value_repr(result, Repr::Union(vec![ok_repr.clone(), err_repr.clone()]));
 
         let iserr = self.b.emit(Op::IsErr(result), Repr::Bool, ty);

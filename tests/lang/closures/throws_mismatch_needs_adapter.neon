@@ -1,0 +1,22 @@
+//@ compile-fail
+//@ error-contains: calling convention
+//
+// Subtyping says a function that throws nothing is usable where one that throws
+// is expected — but the `throws` clause is part of the calling convention (a
+// throwing closure returns a tagged result), and there is no adapter between the
+// two conventions yet. A previously-bound value flowing into a more-throwing
+// slot is therefore rejected rather than silently miscompiled; a *lambda* in the
+// same position is fine, because it adopts the expected clause at creation.
+
+use std::io;
+
+fn pure(n: i64) -> i64 { n }
+
+fn run(f: (i64) throws IndexError -> i64, n: i64) throws IndexError -> i64 {
+    try f(n)
+}
+
+fn main() {
+    let x = try run(pure, 3) catch (e) { -1 };
+    io::println(to_string(x));
+}

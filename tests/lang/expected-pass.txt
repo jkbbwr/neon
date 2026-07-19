@@ -50,6 +50,9 @@ closures/lambda_local_return.neon
 closures/lambda_basics.neon
 closures/rebind_captured_name_is_an_error.neon
 closures/shadowing_a_captured_name_is_fine.neon
+closures/throwing_fn_as_value.neon
+closures/throwing_lambda.neon
+closures/throws_mismatch_needs_adapter.neon
 collections/iolist_and_files.neon
 collections/list_construction.neon
 collections/list_element_type_is_checked.neon

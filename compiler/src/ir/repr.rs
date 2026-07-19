@@ -50,8 +50,13 @@ pub enum Repr {
     /// point: the descriptor closes when the last reference dies, so cleanup rides on ARC
     /// rather than on the caller remembering.
     File,
-    /// A closure: a function pointer plus a boxed environment.
-    Closure { params: Vec<Repr>, ret: Box<Repr> },
+    /// A closure: a function pointer plus a boxed environment. `throws` is part of the
+    /// calling convention, not the layout: a throwing closure's function returns the
+    /// tagged result `Union([ret, throws])` rather than `ret`, exactly like a named
+    /// throwing function. It is a field rather than folded into `ret` because folding
+    /// changed the type graph and broke recursive arrow types — the union's struct and
+    /// its value-witness resolved the back-edge differently (see finalpush.md).
+    Closure { params: Vec<Repr>, throws: Box<Repr>, ret: Box<Repr> },
     /// A tagged union of two or more distinct variants.
     Union(Vec<Repr>),
     /// `T | null` where `T` is pointer-backed: a nullable pointer, `null` = null pointer.
@@ -129,8 +134,8 @@ impl Repr {
             Repr::Tuple(rs) | Repr::Union(rs) => rs.iter().all(Repr::is_concrete),
             Repr::List(r) | Repr::Nullable(r) => r.is_concrete(),
             Repr::Map(k, v) => k.is_concrete() && v.is_concrete(),
-            Repr::Closure { params, ret } => {
-                params.iter().all(Repr::is_concrete) && ret.is_concrete()
+            Repr::Closure { params, throws, ret } => {
+                params.iter().all(Repr::is_concrete) && throws.is_concrete() && ret.is_concrete()
             }
             _ => true,
         }
@@ -458,6 +463,7 @@ fn repr_components(t: &Types, ty: TyId, cyclic: &HashSet<TyId>, boxed: &HashSet<
         let a = t.arrow_atoms[atom as usize].clone();
         comps.push(Repr::Closure {
             params: a.params.iter().map(|&p| repr_rec(t, p, cyclic, boxed, false)).collect(),
+            throws: Box::new(repr_rec(t, a.throws, cyclic, boxed, false)),
             ret: Box::new(repr_rec(t, a.ret, cyclic, boxed, false)),
         });
     }

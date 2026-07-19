@@ -90,9 +90,11 @@ pub enum TypeErrorKind {
     Unordered { ty: String },
     /// `a == b` on a type the backend cannot compare structurally.
     Unequatable { ty: String },
-    /// A *throwing* function used as a value. Its throws is not in the closure
-    /// representation, so the tagged-result convention would be lost.
-    ThrowingFnAsValue(String),
+    /// A function value flowing into an arrow type with a *different* `throws`.
+    /// The clause is part of the calling convention — a throwing closure returns
+    /// a tagged result — and there is no adapter between the two conventions, so
+    /// the subtyping the types would allow cannot be realised at run time.
+    ArrowThrowsMismatch { expected: String, found: String },
     /// `break` or `continue` with no enclosing loop -- including one that only *looks*
     /// enclosing, because a lambda sits in between.
     OutsideLoop(String),
@@ -236,13 +238,13 @@ impl fmt::Display for TypeError {
                 f,
                 "`{left}` and `{right}` share no common type, so they cannot be compared"
             ),
-            TypeErrorKind::ThrowingFnAsValue(n) => write!(
+            TypeErrorKind::ArrowThrowsMismatch { expected, found } => write!(
                 f,
-                "`{n}` throws, so it cannot be used as a value yet. A closure's \
-                 representation records its parameters and result but not its `throws`, \
-                 so the tagged result a throwing function returns would be read as its \
-                 plain return type. Wrap it in a lambda that handles the error, or call \
-                 it directly"
+                "this function throws `{found}`, but it is used where one that throws \
+                 `{expected}` is expected. The `throws` clause is part of the calling \
+                 convention -- a throwing function returns a tagged result -- and there \
+                 is no adapter between the two yet, so the clauses must match exactly. \
+                 Wrap it in a lambda with the expected signature"
             ),
             TypeErrorKind::OutsideLoop(kw) => write!(
                 f,

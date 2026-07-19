@@ -1,0 +1,40 @@
+// A named throwing function used as a value. Its arrow carries the `throws`, the
+// closure repr carries it in turn, and the adapter thunk returns the tagged
+// result — so calling through the value behaves exactly like calling directly.
+// This was a diagnostic (`ThrowingFnAsValue`) until the repr could say "throws".
+//
+// The goldens check values: the first shipped version of the thunk returned the
+// declared type instead of the tagged result, which the C compiler caught — but
+// a tag misread would compile clean and print garbage, which only values catch.
+
+use std::io;
+use std::string;
+
+// `IndexError` comes from the prelude.
+
+fn boom(n: i64) throws IndexError -> i64 {
+    if n < 0 {
+        throw IndexError { message: "negative" };
+    }
+    n * 2
+}
+
+fn run(f: (i64) throws IndexError -> i64, n: i64) throws IndexError -> i64 {
+    try f(n)
+}
+
+fn main() {
+    let ok = try run(boom, 21) catch (e) { -1 };
+    io::println(to_string(ok));
+
+    let caught = try run(boom, -1) catch (e) {
+        io::println(string::concat("caught: ", e.message));
+        -1
+    };
+    io::println(to_string(caught));
+
+    // Held in a local first, then called through the value.
+    let f = boom;
+    let held = try f(4) catch (e) { -1 };
+    io::println(to_string(held));
+}

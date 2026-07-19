@@ -1,0 +1,55 @@
+// A lambda may throw. It cannot *declare* `throws` — there is no syntax — but it
+// never needed to: like the return type, the throws is an output, inferred from
+// the body. The closure's repr carries the clause, the lifted function returns a
+// tagged result, and calling through the value unwraps it exactly like a direct
+// call — so `(i64) throws E -> i64` is inhabited at last.
+//
+// The goldens check values on both paths: a wrong tag or a garbage unwrap would
+// print the wrong number, not just crash.
+
+use std::io;
+use std::string;
+
+// `IndexError` comes from the prelude.
+
+fn run(f: (i64) throws IndexError -> i64, n: i64) throws IndexError -> i64 {
+    try f(n)
+}
+
+fn main() {
+    // Bound to a local with no annotation: the throws is inferred from the body.
+    let clamp = (n: i64) => if n < 0 {
+        throw IndexError { message: "negative" };
+        0
+    } else {
+        n
+    };
+
+    let ok = try run(clamp, 41) catch (e) { -1 };
+    io::println(to_string(ok));
+
+    let caught = try run(clamp, -5) catch (e) {
+        io::println(string::concat("caught: ", e.message));
+        -1
+    };
+    io::println(to_string(caught));
+
+    // Inline in checking mode: the expected arrow's clause flows in, and a body
+    // that cannot fail still adopts it — the slot's calling convention, not the
+    // body, decides the representation.
+    let doubled = try run((n: i64) => n * 2, 21) catch (e) { -1 };
+    io::println(to_string(doubled));
+
+    // `try?` softens a closure call like any other: the error becomes null.
+    let softened = try? clamp(-3) orelse -7;
+    io::println(to_string(softened));
+
+    // Calling the closure value directly, not through a parameter.
+    let direct = try clamp(7) catch (e) { -1 };
+    io::println(to_string(direct));
+    let direct_err = try clamp(-2) catch (e) {
+        io::println(e.message);
+        -9
+    };
+    io::println(to_string(direct_err));
+}

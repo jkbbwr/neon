@@ -175,8 +175,12 @@ pub fn repr(r: &Repr) -> String {
         Repr::Tuple(rs) => format!("({})", rs.iter().map(repr).collect::<Vec<_>>().join(", ")),
         Repr::List(e) => format!("list[{}]", repr(e)),
         Repr::Map(k, v) => format!("map[{}, {}]", repr(k), repr(v)),
-        Repr::Closure { params, ret } => {
-            format!("fn({}) -> {}", params.iter().map(repr).collect::<Vec<_>>().join(", "), repr(ret))
+        Repr::Closure { params, throws, ret } => {
+            let ps = params.iter().map(repr).collect::<Vec<_>>().join(", ");
+            match throws.as_ref() {
+                Repr::Never => format!("fn({ps}) -> {}", repr(ret)),
+                e => format!("fn({ps}) throws {} -> {}", repr(e), repr(ret)),
+            }
         }
         Repr::Union(vs) => vs.iter().map(repr).collect::<Vec<_>>().join(" | "),
         Repr::Nullable(r) => format!("{}?", repr(r)),

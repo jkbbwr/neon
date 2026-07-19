@@ -1,5 +1,15 @@
 # Task: make throwing closures representable
 
+**DONE 2026-07-19.** Landed as specified below — `Repr::Closure` gained a `throws` field —
+plus one bug the brief did not predict: the recursive case failed again, this time in
+`TypeTable::c_type`, which typed a `Recursive` back-edge by names-lookup and fell back to
+`neon_value` when the unfolding is pointer-shaped (a nullable closure), disagreeing with
+the value-witness generated from the *resolved* repr. `c_type` now resolves the back-edge
+and types the resolution. One deliberate narrowing: a bound value flowing into an arrow
+with a *different* `throws` is an `ArrowThrowsMismatch` diagnostic — the clause is calling
+convention and there is no adapter yet; lambdas adopt the expected clause at creation, so
+cases 1, 2 and 4 below all work. See `docs/finalpush.md` for the record.
+
 Repo: `~/projects/personal/neon2` (not `neon` — that's an older sibling checkout, ignore it).
 Read `HANDOFF.md` and `docs/finalpush.md` first. Everything below is verified as of
 2026-07-19, on a tree at 716 tests / 169 backend corpus, all green.

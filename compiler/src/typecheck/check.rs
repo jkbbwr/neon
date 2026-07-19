@@ -45,6 +45,7 @@ pub fn check_all(
         bounds: vec![],
         rigids: vec![],
         lambda_returns: vec![],
+        lambda_throws: vec![],
         capture_floors: vec![],
     };
     for (path, m) in modules {
@@ -77,6 +78,10 @@ pub fn check_all(
 enum Throws {
     Declared(TyId),
     ImplicitError,
+    /// A lambda body. There is no syntax to declare a lambda's `throws` — like its
+    /// return type, it is an output, derivable from the body — so whatever propagates
+    /// out is collected (in `lambda_throws`) instead of checked against a clause.
+    Infer,
 }
 
 struct Checker<'a> {
@@ -103,6 +108,10 @@ struct Checker<'a> {
     /// One frame per enclosing lambda, collecting the types its `return`s produce. A
     /// lambda declares no return type, so its type is the union of its tail and these.
     lambda_returns: Vec<Vec<TyId>>,
+    /// One frame per enclosing lambda, collecting the error types that propagate out
+    /// of it — a `throw` or a `try`-propagate in its body. A lambda declares no
+    /// `throws` either; the union of these is the clause its arrow gets.
+    lambda_throws: Vec<Vec<TyId>>,
     /// One entry per enclosing lambda: the `locals` depth where that lambda's own
     /// scope begins. A name found in a frame below the innermost floor was captured,
     /// and assigning to a capture is an error -- the closure holds a private copy.
@@ -402,6 +411,27 @@ impl Checker<'_> {
             if !self.assignable(t, want) {
                 let (found, expect) = (self.show(t), self.show(want));
                 self.error(e.span.clone(), TypeErrorKind::Mismatch { expected: expect, found });
+            } else if let (Some(a), Some(w)) = (
+                self.env.solver.t.as_arrow(t),
+                self.env.solver.t.as_arrow(want),
+            ) {
+                // Subtyping admits a function that throws less where one that throws
+                // more is expected — but the `throws` clause is part of the calling
+                // convention (a throwing closure returns a tagged result), and the
+                // backend has no adapter between the two conventions: `coerce` passes a
+                // `neon_closure` through unchanged, so the mismatch would compile clean
+                // and read garbage. Until an adapter exists, require the clauses to
+                // agree. Lambdas adopt the expected clause at creation, so this bites
+                // only a previously-bound value flowing into a more-throwing slot.
+                let same = self.env.solver.is_subtype(a.throws, w.throws)
+                    && self.env.solver.is_subtype(w.throws, a.throws);
+                if !same && !self.env.is_error(a.throws) && !self.env.is_error(w.throws) {
+                    let (found, expected) = (self.show(a.throws), self.show(w.throws));
+                    self.error(
+                        e.span.clone(),
+                        TypeErrorKind::ArrowThrowsMismatch { expected, found },
+                    );
+                }
             }
         }
         self.result.set_ty(e.id, t);
@@ -715,20 +745,24 @@ impl Checker<'_> {
         //                 error handled that escapes uncaught at run time.
         //   `break`       resolved to an enclosing loop, and reached `unreachable`.
         //
-        // A lambda has no `throws` clause, so it still cannot throw; that part was already
-        // right.
+        // A lambda cannot *declare* `throws` — there is no syntax — but it never needed
+        // to: parameters are inputs and need a source, while the return type and throws
+        // are outputs, always derivable from the body. So the body is checked in `Infer`
+        // mode and whatever propagates out is collected.
         let want_ret = want.as_ref().map(|a| a.ret);
         let never = self.env.solver.t.never();
-        let saved_throws = self.throws.replace(Throws::Declared(never));
+        let saved_throws = self.throws.replace(Throws::Infer);
         let saved_ret = self.ret.take();
         let saved_sinks = std::mem::take(&mut self.throw_sinks);
         let saved_breaks = std::mem::take(&mut self.loop_breaks);
         self.ret = want_ret;
         self.lambda_returns.push(vec![]);
+        self.lambda_throws.push(vec![]);
 
         let tail = self.expr(module, body, want_ret);
 
         let returned = self.lambda_returns.pop().unwrap_or_default();
+        let thrown = self.lambda_throws.pop().unwrap_or_default();
         self.throws = saved_throws;
         self.ret = saved_ret;
         self.throw_sinks = saved_sinks;
@@ -739,7 +773,18 @@ impl Checker<'_> {
         // The lambda's return type is its tail unioned with whatever its `return`s give.
         let ret = returned.into_iter().fold(tail, |acc, t| self.union_branches(acc, t));
 
-        let arrow = self.env.solver.t.arrow(param_tys, never, ret);
+        // Its `throws` is what the body propagates — plus the expected arrow's clause,
+        // when one flows in. Adopting the clause matters beyond subtyping: the clause is
+        // part of the calling convention (a throwing closure returns a tagged result), so
+        // a lambda filling a `(i64) throws E -> i64` slot must *be* one, even when its
+        // own body cannot fail. Widening the throws is free at creation and the body's
+        // errors still have to fit the clause, checked by `expr`'s assignability.
+        let mut throws = thrown.into_iter().fold(never, |acc, t| self.union_branches(acc, t));
+        if let Some(a) = &want {
+            throws = self.union_branches(throws, a.throws);
+        }
+
+        let arrow = self.env.solver.t.arrow(param_tys, throws, ret);
         self.result.set_lambda(e.id, arrow);
         arrow
     }
@@ -1000,6 +1045,13 @@ impl Checker<'_> {
                         self.error(span, TypeErrorKind::NotAnError { thrown: t });
                     }
                 }
+                // A lambda body: nothing to check against — the escape *becomes* part
+                // of the lambda's inferred `throws`.
+                Some(Throws::Infer) => {
+                    if let Some(frame) = self.lambda_throws.last_mut() {
+                        frame.push(throws);
+                    }
+                }
                 other => {
                     let want = match other {
                         Some(Throws::Declared(t)) => t,
@@ -1113,18 +1165,10 @@ impl Checker<'_> {
         }
         let joined = p.join("::");
         if let Some(sig) = self.env.fn_named(module, p) {
-            // Using a *throwing* function as a value would lose its calling convention:
-            // `Repr::Closure` records parameters and result but not `throws`, so the
-            // tagged result it actually returns is read as its declared type. That
-            // produced invalid C, and once the thunk was corrected, a garbage value.
-            // Refuse it until the representation carries the throws.
-            let (ty, throws) = (sig.ty, sig.throws);
-            let never = self.env.solver.t.never();
-            if throws != never && !self.env.is_error(throws) {
-                self.error(e.span.clone(), TypeErrorKind::ThrowingFnAsValue(joined));
-                return self.poison();
-            }
-            return ty;
+            // A function used as a value, throwing or not: its arrow carries the
+            // `throws`, the closure repr carries it in turn, and the adapter thunk
+            // returns the tagged result — the calling convention survives the trip.
+            return sig.ty;
         }
         // A name that exists but is fenced off reports why, rather than "not in scope".
         if let Some(owner) = self.env.hidden_by_internal(module, p) {
@@ -1655,6 +1699,9 @@ impl Checker<'_> {
         for a in args.iter().skip(arrow.params.len()) {
             self.expr(module, a, None);
         }
+        // A call through a value throws what its arrow says — same rule as a direct
+        // call: bare outside a `try`, it is an error; inside one, it lands in the sink.
+        self.note_throw(e.span.clone(), arrow.throws, true);
         arrow.ret
     }
 

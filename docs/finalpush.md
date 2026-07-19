@@ -151,39 +151,34 @@ corpus programs run leak-free under ASan.
   `return`s. Separately, `break`/`continue` with *no* enclosing loop was silently accepted
   anywhere -- `fn main() { break; }` compiled -- and is now a diagnostic.
 
-- **Throwing closures do not exist, and the arrow type that describes one is uninhabited.**
-  `Repr::Closure` records parameters and result but **not `throws`**, so the tagged result a
-  throwing function returns would be read as its declared type. Both ways of producing such
-  a value are therefore closed: a lambda cannot throw (`lambda()` pins its sink to `never`),
-  and a named throwing function used as a value is a diagnostic. So
-  `(i64) throws E -> i64` parses, and nothing can inhabit it —
-  `types/arrow_type_throws.neon` passes only because it declares such types without
-  building one.
+- ~~**Throwing closures do not exist, and the arrow type that describes one is
+  uninhabited.**~~ **Fixed 2026-07-19**, per the brief in `docs/tasks/throwing-closures.md`:
+  `Repr::Closure` gained a real `throws` field (the reverted fold-into-`ret` approach broke
+  recursive arrow types; the field leaves the type graph identical, which is what the
+  recursion is sensitive to). A lambda's `throws` is inferred from its body like its return
+  type (`Throws::Infer` mode in the checker) and it adopts the expected arrow's clause when
+  one flows in; a lifted throwing lambda returns the tagged result (`set_throws` in
+  `lower_lambda_job`); a closure call reads the throws off the callee's repr and unwraps
+  through `wrap_throwing`, exactly like a direct call; the `ThrowingFnAsValue` diagnostic is
+  gone. `Resource[T, E]` in `docs/design/resources.md` is unblocked. Pinned by
+  `closures/throwing_lambda.neon` and `closures/throwing_fn_as_value.neon`, which check
+  values on both paths.
 
-  This blocks `Resource[T, E]` in `docs/design/resources.md`: cleanup is specified as
-  `(T) throws E -> ()`, which cannot currently be written. Non-throwing cleanup works today,
-  so `Resource[T, never]` is buildable and `resource::new(fd, close)` compiles.
+  The recursive case that killed the fold — `mu type F = null | (i64) throws :err -> F` —
+  exposed one more back-edge-resolves-differently bug, in `c_type` itself: a `Recursive`
+  whose unfolding has no struct (a nullable closure is pointer-shaped) fell back to
+  `neon_value`, while the value-witness was generated from the *resolved* repr and touched
+  `.env`. `c_type` now types the resolution.
 
-  **An attempt was made 2026-07-19 and reverted.** Recorded so it is not re-walked:
-
-  - The approach: fold the throws into the closure's return, `ret = Union([ret, throws])`,
-    matching `Func::result_repr`. No new field, and `CallClosure`'s C cast is built from the
-    result value's repr, which lowering controls — so it needs only `wrap_throwing` after
-    the call (reusing what direct calls already do) and a `set_throws` in
-    `lower_lambda_job`, which was simply never called.
-  - It works for the flat case and **breaks recursive arrow types**:
-    `mu type F = null | (i64) throws :err -> F`. The tagged-result union's C struct gets
-    `neon_value` for the boxed `F`, while its *witness* is generated from a repr whose
-    variant is still a `Closure`, so the witness emits `.env` on a `void*`. The recursive
-    back-edge resolves differently in the two paths.
-  - So the next attempt should probably give `Repr::Closure` a real `throws` field rather
-    than folding, leaving the type graph unchanged and combining the two only where the C
-    signature is built. That keeps the recursion structure identical to today's.
-  - `emit_thunks` was fixed on the way and kept: it built the adapter from the declared
-    return type rather than the tagged result. Correct on its own, and needed by any fix.
-
-  `docs/tasks/throwing-closures.md` is a self-contained brief for picking this up: every
-  call site, the failed approach with its exact symptom, and the cases that must work.
+  One honest hole remains, guarded rather than silent: subtyping admits a function that
+  throws *less* where a more-throwing arrow is expected, but the clause is part of the
+  calling convention and there is no adapter between the two — `coerce` would pass the
+  `neon_closure` through unchanged and the caller would read a tag that is not there. A
+  previously-bound value flowing into a different-throws slot is now an
+  `ArrowThrowsMismatch` diagnostic (lambdas are unaffected: they adopt the expected clause
+  at creation). Pinned by `closures/throws_mismatch_needs_adapter.neon`. The same
+  variance-without-adapters hole exists for parameter and return types and predates this
+  work. An adapter (a wrapper closure re-tagging the result) would lift the restriction.
 
 - **A protocol method call inside an interpolation hole miscompiles.** Accepted by the
   checker, rejected by the C compiler -- so it is a miscompile, and the shape is one
@@ -199,18 +194,11 @@ corpus programs run leak-free under ASan.
   function call in a hole is fine; it is specifically a protocol method. `try`/`catch` is
   not involved, despite where it was first noticed.
 
-- **A named throwing function used as a value miscompiles.** `emit_thunks` builds the
-  closure-ABI adapter from the function's *declared* return type, but a throwing function
-  returns the tagged result, so the thunk returns `nu1` from a slot typed `int64_t`:
-
-  ```neon
-  fn boom(n: i64) throws IndexError -> i64 { ... }
-  fn run(f: (i64) throws IndexError -> i64) throws IndexError -> i64 { try f(1) }
-  run(boom)                                // gcc: incompatible types when returning 'nu1'
-  ```
-
-  A lambda in the same position is fine, which is why this went unnoticed. It blocks the
-  point-free `resource::new(fd, close)` shape in `docs/design/resources.md`.
+- ~~**A named throwing function used as a value miscompiles.**~~ **Fixed 2026-07-19**, as
+  part of the throwing-closures work above: `emit_thunks` already built the adapter from
+  `fn_ret_type` (the tagged result), and with `Repr::Closure` carrying the `throws`, the
+  call side now unwraps what the thunk returns. `run(boom)` and the held-in-a-local shape
+  are pinned by `closures/throwing_fn_as_value.neon`.
 
 - **An error in a stdlib module is reported against the *user's* file, with a nonsense
   span.** A broken stdlib file poisons every compile -- expected -- but the diagnostic

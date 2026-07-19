@@ -147,11 +147,18 @@ impl TypeTable {
                 }
                 self.intern(r, "nu");
             }
-            Repr::Closure { params, ret } => {
+            Repr::Closure { params, throws, ret } => {
                 for p in params {
                     self.register(p);
                 }
                 self.register(ret);
+                // A throwing closure's function returns the tagged result; register its
+                // layout so a call's cast (and the value it lands in) can name the struct
+                // even when this program never stores such a result itself.
+                if !matches!(throws.as_ref(), Repr::Never) {
+                    self.register(throws);
+                    self.register(&Repr::Union(vec![ret.as_ref().clone(), throws.as_ref().clone()]));
+                }
             }
             // A back-edge carries no structure, so register the type it names instead —
             // once. The guard is what stops the cycle re-entering itself forever.
@@ -332,11 +339,26 @@ impl TypeTable {
                 Some(n) => format!("{n}*"),
                 None => "neon_value".into(),
             },
-            Repr::Record { .. } | Repr::Tuple(_) | Repr::Union(_) | Repr::Recursive(_) => self
+            Repr::Record { .. } | Repr::Tuple(_) | Repr::Union(_) => self
                 .names
                 .get(&key_with(r, &self.recursive))
                 .cloned()
                 .unwrap_or_else(|| "neon_value".into()),
+            // A back-edge names a type without describing it, so type the resolution.
+            // A recursive union finds its interned struct either way (both spellings
+            // share the Z-key), but a recursion that terminates through a pointer —
+            // `mu type F = null | (i64) throws E -> F` unfolds to a nullable closure —
+            // has no struct at all, and the old `neon_value` fallback disagreed with
+            // the value-witness, which is generated from the *resolved* repr and
+            // touches `.env` on the member this type declares.
+            Repr::Recursive(_) => {
+                let resolved = self.resolve(r);
+                if matches!(resolved, Repr::Recursive(_)) {
+                    "neon_value".into()
+                } else {
+                    self.c_type(resolved)
+                }
+            }
             // A nullable pointer is just the pointer type; `null` is a null pointer.
             Repr::Nullable(inner) => match inner.as_ref() {
                 Repr::Str => "neon_str".into(),
@@ -546,9 +568,12 @@ fn key_with(r: &Repr, rec: &HashMap<TyId, Repr>) -> String {
         }
         Repr::List(e) => format!("L[{}]", key(e)),
         Repr::Map(k, v) => format!("M[{},{}]", key(k), key(v)),
-        Repr::Closure { params, ret } => {
-            format!("C[{}=>{}]", params.iter().map(key).collect::<Vec<_>>().join(","), key(ret))
-        }
+        Repr::Closure { params, throws, ret } => format!(
+            "C[{}!{}=>{}]",
+            params.iter().map(key).collect::<Vec<_>>().join(","),
+            key(throws),
+            key(ret)
+        ),
         Repr::Union(vs) => format!("U[{}]", vs.iter().map(key).collect::<Vec<_>>().join(",")),
         Repr::Nullable(i) => format!("N[{}]", key(i)),
     }

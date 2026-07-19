@@ -99,8 +99,20 @@ fn reprs_print_in_their_own_syntax() {
         "Circle{r: i64}"
     );
     assert_eq!(
-        print::repr(&Repr::Closure { params: vec![Repr::I64], ret: Box::new(Repr::Str) }),
+        print::repr(&Repr::Closure {
+            params: vec![Repr::I64],
+            throws: Box::new(Repr::Never),
+            ret: Box::new(Repr::Str),
+        }),
         "fn(i64) -> str"
+    );
+    assert_eq!(
+        print::repr(&Repr::Closure {
+            params: vec![Repr::I64],
+            throws: Box::new(Repr::Tag),
+            ret: Box::new(Repr::Str),
+        }),
+        "fn(i64) throws tag -> str"
     );
     assert_eq!(
         print::repr(&Repr::Union(vec![Repr::I64, Repr::Str])),

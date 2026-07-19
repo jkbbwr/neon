@@ -148,7 +148,29 @@ fn an_arrow_is_a_closure() {
     let arrow = ty.arrow(vec![i], never, s);
     assert_eq!(
         repr_of(&ty, arrow),
-        Repr::Closure { params: vec![Repr::I64], ret: Box::new(Repr::Str) }
+        Repr::Closure {
+            params: vec![Repr::I64],
+            throws: Box::new(Repr::Never),
+            ret: Box::new(Repr::Str),
+        }
+    );
+}
+
+#[test]
+fn a_throwing_arrow_carries_its_throws() {
+    let mut ty = t();
+    let i = ty.i64();
+    let s = ty.str();
+    let err = ty.name("err");
+    let err = ty.atom(err);
+    let arrow = ty.arrow(vec![i], err, s);
+    assert_eq!(
+        repr_of(&ty, arrow),
+        Repr::Closure {
+            params: vec![Repr::I64],
+            throws: Box::new(Repr::Tag),
+            ret: Box::new(Repr::Str),
+        }
     );
 }
 
