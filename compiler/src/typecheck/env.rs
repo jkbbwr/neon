@@ -765,15 +765,26 @@ impl Env {
         }
     }
 
-    /// Add the checker's diagnostics to the declaration pass's, so a caller reports
-    /// from one list and the two phases' errors interleave in source order rather than
-    /// arriving as two batches.
-    pub fn extend_errors(&mut self, more: Vec<TypeError>) {
-        self.errors.extend(more);
-    }
-
+    /// Everything raised through `Env::error` and not yet handed to a caller.
+    ///
+    /// Read this in exactly one situation: after `Env::build_with`, to decide whether the
+    /// declarations are sound enough to check bodies against. It is *not* a second error
+    /// channel to poll after checking — `check_all` drains this list into its return value
+    /// (see `take_errors`), so once checking has run this is empty by construction and a
+    /// caller reading only `check_all`'s return value cannot miss a diagnostic. That
+    /// property is the whole point: reading half the errors used to be possible, and a
+    /// poison type reaching codegen was the result.
     pub fn errors(&self) -> &[TypeError] {
         &self.errors
+    }
+
+    /// Take everything raised so far, leaving the list empty.
+    ///
+    /// `check_all` calls this so its return value is the single, complete channel. Nothing
+    /// else should: taking errors elsewhere hides them from the caller that was going to
+    /// report them.
+    pub fn take_errors(&mut self) -> Vec<TypeError> {
+        std::mem::take(&mut self.errors)
     }
 
     pub fn protocols(&self) -> &[Protocol] {

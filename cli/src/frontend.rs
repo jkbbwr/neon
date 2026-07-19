@@ -78,18 +78,9 @@ pub fn check(path: &Path, lib: bool) -> Result<Checked> {
         }
         std::process::exit(1);
     }
+    // `check_all` returns every diagnostic, its own and the ones `Env::error` raises while
+    // resolving annotations, sorted by span. There is no second list to consult.
     let (result, errs) = neon_compiler::typecheck::check::check_all(&mut env, &modules);
-
-    // Checking produces errors through *two* channels, and both have to be read. The
-    // returned `errs` are the checker's own; resolving a type annotation raises through
-    // `Env::error` instead, so an unknown type written inside a function body lands in
-    // `env.errors()` and nowhere else. Only the pre-check `env.errors()` was consulted
-    // above, so those were dropped: `let x: NoSuchType = 5` compiled clean, and the poison
-    // type it produced reached codegen, where the backend's guard fired and the user got
-    // an internal compiler error instead of "unknown type". Every bad type name written in
-    // a body behaved that way, not just the one that exposed it.
-    let mut errs = errs;
-    errs.extend(env.errors().iter().cloned());
     if !errs.is_empty() {
         for e in &errs {
             r.eprint_full(e.span.clone(), &e.to_string(), &e.labels(), e.help().as_deref());

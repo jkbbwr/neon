@@ -58,14 +58,16 @@ pub fn run(file: &OsString, lib: bool) -> Result<()> {
 
     let mut env = Env::build_with(&modules, unit);
     // Declarations first: a body checked against a signature that did not resolve
-    // would report the same mistake twice.
-    if env.errors().is_empty() {
-        let (_result, errs) = neon_compiler::typecheck::check::check_module(&mut env, &module);
-        env.extend_errors(errs);
-    }
-    let errors = env.errors();
+    // would report the same mistake twice. When they are sound, `check_module` returns
+    // every diagnostic of the run — its own and the ones raised while resolving
+    // annotations — so there is one list either way.
+    let errors = if env.errors().is_empty() {
+        neon_compiler::typecheck::check::check_module(&mut env, &module).1
+    } else {
+        env.take_errors()
+    };
     if !errors.is_empty() {
-        for e in errors {
+        for e in &errors {
             r.eprint_full(e.span.clone(), &e.to_string(), &e.labels(), e.help().as_deref());
         }
         let n = errors.len();

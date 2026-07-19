@@ -32,6 +32,26 @@ pub fn check_module(env: &mut Env, m: &ast::Module) -> (TypecheckResult, Vec<Typ
 /// Neon code that has to be lowered, and lowering reads types and call resolutions out of
 /// this result. Ids are unique across modules (see `ast::number_exprs_from`), so one map
 /// covers them all.
+///
+/// # The returned list is every error
+///
+/// Checking used to report through two channels: this return value, and `Env::errors`,
+/// where resolving a type annotation raises. A caller reading only one of them silently
+/// dropped the other's diagnostics — `let x: NoSuchType = 5` compiled, and the poison type
+/// it produced reached codegen. There were 23 call sites and every one had to *remember*.
+///
+/// So this drains `Env::errors` into what it returns. Whatever the environment was already
+/// holding when it arrived (declaration errors from `Env::build_with`) comes back too, so
+/// the invariant needs no qualification: **read the return value and you have seen
+/// everything**. `env.errors()` is empty afterwards, which also means a caller cannot
+/// double-report by reading both.
+///
+/// Callers that gate on declarations — check `env.errors()` after `build_with` and refuse
+/// to check bodies against signatures that did not resolve — are unaffected: they read that
+/// list *before* this runs.
+///
+/// The result is sorted by span, so the two phases' diagnostics interleave in source order
+/// rather than arriving as two batches, and deduplicated on (span, kind).
 pub fn check_all(
     env: &mut Env,
     modules: &[(Vec<String>, &ast::Module)],
@@ -60,8 +80,17 @@ pub fn check_all(
     // argument was reported twice. Deduplicating the finished list is cheaper than
     // threading a "probing, stay quiet" mode through every expression form, and an
     // identical kind at an identical span is the same mistake by construction.
+    //
+    // The same pass folds in the environment's channel. `Env::error` is where resolving a
+    // type annotation raises, and it fires *during* the walk above, so its diagnostics
+    // belong to the same run and are deduplicated against the checker's on the same key.
+    // Draining it is what makes this return value the only list a caller has to read.
+    let mut errors = c.env.take_errors();
+    errors.extend(std::mem::take(&mut c.errors));
+    // Stable, so two diagnostics at one span keep the order they were raised in.
+    errors.sort_by(|a, b| (a.span.start, a.span.end).cmp(&(b.span.start, b.span.end)));
     let mut seen = Vec::new();
-    c.errors.retain(|e| {
+    errors.retain(|e| {
         let key = (e.span.clone(), e.kind.clone());
         if seen.contains(&key) {
             return false;
@@ -69,7 +98,7 @@ pub fn check_all(
         seen.push(key);
         true
     });
-    (c.result, c.errors)
+    (c.result, errors)
 }
 
 /// What the enclosing function may fail with. A declared clause is a *type*, checked by

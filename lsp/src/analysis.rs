@@ -132,6 +132,9 @@ impl Analyzer {
             return env.errors().iter().map(convert).collect();
         }
 
+        // Every diagnostic of the run, resolution errors included: `check_all` drains the
+        // environment's channel into what it returns, so an unknown type written inside a
+        // body reaches the editor rather than vanishing.
         let (_result, errs) = neon_compiler::typecheck::check::check_all(&mut env, &modules);
         errs.iter().map(convert).collect()
     }

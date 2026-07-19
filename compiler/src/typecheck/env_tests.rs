@@ -1,4 +1,4 @@
-use super::env::{Env, TypeErrorKind};
+use super::env::{Env, TypeError, TypeErrorKind};
 use super::resolve::Scope;
 use super::types::TyId;
 use crate::{ast, lexer, parser};
@@ -779,7 +779,10 @@ fn a_stdlib_fn_may_reference_a_later_module() {
 
 // ---- use trees ----
 
-fn build2(prefix: &[&str], lib: &str, user: &str) -> Env {
+/// Declare a library module under `prefix` alongside `user`, check `user`, and return
+/// every diagnostic. `check_module` drains the environment's channel into its return
+/// value, so this one list is the whole story.
+fn build2(prefix: &[&str], lib: &str, user: &str) -> Vec<TypeError> {
     let lib = parse(lib);
     let user = parse(user);
     let p: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
@@ -788,8 +791,7 @@ fn build2(prefix: &[&str], lib: &str, user: &str) -> Env {
         super::env::Unit::RootApplication,
     );
     let (_r, errs) = super::check::check_module(&mut env, &user);
-    env.extend_errors(errs);
-    env
+    errs
 }
 
 #[test]
@@ -799,7 +801,7 @@ fn a_glob_use_brings_a_module_member_into_scope() {
         "@native(\"p\") fn println(s: str)",
         "use std::io::*\nfn main() { println(\"hi\") }",
     );
-    assert!(e.errors().is_empty(), "{:?}", e.errors());
+    assert!(e.is_empty(), "{e:?}");
 }
 
 #[test]
@@ -809,7 +811,7 @@ fn a_renamed_use_binds_the_alias_not_the_last_segment() {
         "@native(\"p\") fn println(s: str)",
         "use std::io::println as say\nfn main() { say(\"hi\") }",
     );
-    assert!(e.errors().is_empty(), "{:?}", e.errors());
+    assert!(e.is_empty(), "{e:?}");
 }
 
 #[test]
@@ -819,7 +821,7 @@ fn a_grouped_use_imports_each_member() {
         "@native(\"p\") fn println(s: str)\n@native(\"e\") fn eprintln(s: str)",
         "use std::io::{println, eprintln}\nfn main() { println(\"a\"); eprintln(\"b\") }",
     );
-    assert!(e.errors().is_empty(), "{:?}", e.errors());
+    assert!(e.is_empty(), "{e:?}");
 }
 
 #[test]

@@ -175,17 +175,20 @@ fn check(path: &Path, src: &str) -> Result<(), Failure> {
 
     let mut env = Env::build_with(&modules, Unit::RootApplication);
     // Declarations first: a body checked against a signature that did not resolve
-    // reports the same mistake twice.
-    if env.errors().is_empty() {
-        let (_r, errs) = neon_compiler::typecheck::check::check_module(&mut env, &module);
-        env.extend_errors(errs);
-    }
-    if env.errors().is_empty() {
+    // reports the same mistake twice. Otherwise `check_module`'s return value is the
+    // complete list — it drains the environment's channel into it — so reading both
+    // would double-count.
+    let errors = if env.errors().is_empty() {
+        neon_compiler::typecheck::check::check_module(&mut env, &module).1
+    } else {
+        env.take_errors()
+    };
+    if errors.is_empty() {
         return Ok(());
     }
     // `error-contains` matches the whole diagnostic a user sees, help line included:
     // the actionable text (`|>`, the `try` triad) now lives in `help`, not the title.
-    let it = env.errors().iter().map(|e| {
+    let it = errors.iter().map(|e| {
         let msg = match e.help() {
             Some(h) => format!("{e}\n{h}"),
             None => e.to_string(),

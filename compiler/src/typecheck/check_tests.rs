@@ -40,6 +40,88 @@ fn mismatch(src: &str) {
     );
 }
 
+// ---- one error channel ----
+//
+// Checking used to report through two lists: what `check_all` returned, and `Env::errors`,
+// where resolving a type annotation raises. A caller reading only the return value dropped
+// every unknown type name written inside a function body, and the poison type that produced
+// reached codegen. These tests pin the fix at the API, not at any one call site: whatever a
+// caller does, reading the returned `Vec` is enough.
+
+#[test]
+fn an_unknown_type_in_a_body_is_in_the_returned_errors() {
+    // The exact shape of the original bug. `Env::error` raises this while resolving the
+    // annotation, so before the fix `errs` was empty and the program checked "clean".
+    let m = parse("fn f() { let x: NoSuchType = 5; }");
+    let mut env = Env::build(&m);
+    assert!(env.errors().is_empty(), "the declarations resolve: {:?}", env.errors());
+
+    let (_r, errs) = check_module(&mut env, &m);
+    assert!(
+        errs.iter().any(|e| e.kind == TypeErrorKind::Unknown("NoSuchType".into())),
+        "the returned list must carry the resolution error: {errs:?}"
+    );
+}
+
+#[test]
+fn checking_leaves_no_errors_behind_in_the_env() {
+    // The other half of the invariant. If `Env::errors` still held a copy, a caller
+    // reading both would report it twice; if it held something the return value did not,
+    // the two-channel bug would be back.
+    let m = parse("fn f() { let x: NoSuchType = 5; }");
+    let mut env = Env::build(&m);
+    let (_r, errs) = check_module(&mut env, &m);
+    assert!(!errs.is_empty(), "the fixture is meant to fail");
+    assert!(
+        env.errors().is_empty(),
+        "check_module must drain the env's channel: {:?}",
+        env.errors()
+    );
+}
+
+#[test]
+fn both_kinds_of_error_are_reported_once_each_in_span_order() {
+    // Two resolution errors (raised via `Env::error`) and one checker error (a mismatch),
+    // interleaved in the source. All three must appear, none twice, sorted by position.
+    let src = "fn f() {
+    let a: NoSuchType = 5;
+    let b: i64 = \"s\";
+    let c: AlsoMissing = 5;
+}";
+    let m = parse(src);
+    let mut env = Env::build(&m);
+    let (_r, errs) = check_module(&mut env, &m);
+
+    let kinds: Vec<_> = errs.iter().map(|e| e.kind.clone()).collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == TypeErrorKind::Unknown("NoSuchType".into())).count(),
+        1,
+        "reported exactly once: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == TypeErrorKind::Unknown("AlsoMissing".into())).count(),
+        1,
+        "reported exactly once: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| matches!(k, TypeErrorKind::Mismatch { .. })).count(),
+        1,
+        "reported exactly once: {kinds:?}"
+    );
+    assert_eq!(errs.len(), 3, "no extras: {kinds:?}");
+
+    let spans: Vec<usize> = errs.iter().map(|e| e.span.start).collect();
+    let mut sorted = spans.clone();
+    sorted.sort_unstable();
+    assert_eq!(spans, sorted, "diagnostics come out in source order: {spans:?}");
+    // And the middle one really is the checker's, so the sort interleaved the two phases
+    // rather than concatenating them.
+    assert!(
+        matches!(kinds[1], TypeErrorKind::Mismatch { .. }),
+        "the mismatch sits between the two unknowns: {kinds:?}"
+    );
+}
+
 // ---- the keystone ----
 
 #[test]
