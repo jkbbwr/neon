@@ -1,0 +1,37 @@
+// A `let`'s annotation is the binding's type, and the binding is laid out that way.
+//
+// The checker always agreed -- `let x: i64 | str = 1` binds the union, not `i64` --
+// but lowering saw only the initialiser and used *its* repr, so the binding became the
+// variant rather than the union. `let none: P | :none = :none` was a bare tag, and any
+// later use expecting the union read the wrong layout: comparing it against a `P`
+// emitted C comparing a `uint64_t` with a struct, which the C compiler rejected.
+//
+// A parameter or a function return of the same type never had the problem, since both
+// take their repr from the signature. Only `let` discarded it.
+
+use std::io;
+
+record P { x: i64 }
+
+fn main() {
+    let some: P | :none = P { x: 1 };
+    let none: P | :none = :none;
+
+    // Comparing against a bare variant: needs the tag the union repr carries.
+    io::println("#{some == P { x: 1 }}");
+    io::println("#{some == P { x: 2 }}");
+    io::println("#{none == P { x: 1 }}");
+
+    // And against each other, as two unions.
+    io::println("#{some == none}");
+    io::println("#{none == none}");
+
+    // Narrowing still works on the widened binding.
+    io::println("#{none is :none}");
+    io::println("#{some is P}");
+
+    // The same widening for a primitive union.
+    let n: i64 | str = 5;
+    io::println("#{n == 5}");
+    io::println("#{n == 6}");
+}

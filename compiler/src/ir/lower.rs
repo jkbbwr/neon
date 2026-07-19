@@ -750,7 +750,17 @@ impl Lower<'_> {
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Let { pat, value, .. } => {
-                let v = self.lower_expr(value);
+                let mut v = self.lower_expr(value);
+                // Widen to the declared type when there is one. `let n: P | :none = :none`
+                // otherwise bound a bare tag, and every later use that expected the union
+                // read the wrong layout -- comparing it against a `P` emitted C that
+                // compared a `uint64_t` with a struct.
+                if let Some(declared) = self.result.declared(value.id) {
+                    let want = self.repr_of_ty(declared);
+                    if want != *self.b.value_repr(v) {
+                        v = self.b.emit(Op::Cast(v), want, declared);
+                    }
+                }
                 self.bind_pattern(pat, v);
             }
             StmtKind::Assign { name, value } => {

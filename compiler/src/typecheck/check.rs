@@ -49,6 +49,21 @@ pub fn check_all(
     for (path, m) in modules {
         c.decls(path, &m.decls);
     }
+    // One mistake, one diagnostic. A generic call checks each argument twice -- once while
+    // solving the callee's type parameters, then again under the solution, which is what
+    // lets an expected type flow into a lambda argument -- so anything wrong *inside* an
+    // argument was reported twice. Deduplicating the finished list is cheaper than
+    // threading a "probing, stay quiet" mode through every expression form, and an
+    // identical kind at an identical span is the same mistake by construction.
+    let mut seen = Vec::new();
+    c.errors.retain(|e| {
+        let key = (e.span.clone(), e.kind.clone());
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
     (c.result, c.errors)
 }
 
@@ -291,7 +306,12 @@ impl Checker<'_> {
                 }
                 let t = self.expr(module, value, want);
                 // The annotation is the binding's type when there is one: `let x:
-                // i64|str = 1` binds the wider type, not `i64`.
+                // i64|str = 1` binds the wider type, not `i64`. Record it against the
+                // initialiser so lowering lays the binding out at the declared type too --
+                // it sees only the initialiser, whose type is the narrow one.
+                if let Some(w) = want {
+                    self.result.set_declared(value.id, w);
+                }
                 self.bind_pattern(pat, want.unwrap_or(t));
             }
             ast::StmtKind::Assign { name, value } => {

@@ -104,18 +104,11 @@ corpus programs run leak-free under ASan.
   which is not valid C once the variant is a record, a tuple or a `str`. Both now compare
   tag first, then the payload through `eq_expr`.
 
-- **A `let` with a union annotation keeps the narrow repr.** Pre-existing, verified
-  identical on `7fbd131`, and not an equality bug -- it just surfaces through one:
-
-  ```neon
-  let none: P | :none = :none;
-  none == P { x: 1 }        // gcc: invalid operands to binary == ('uint64_t' and 'nr0')
-  ```
-
-  The annotation says `P | :none`, but the value is lowered at the repr of the variant it
-  was initialised with (`Tag`), so any later use expecting the union sees the wrong layout.
-  A parameter or a function return of the same type is fine, which is why the corpus test
-  goes through functions. The fix belongs with `let`'s lowering, not with comparison.
+- ~~**A `let` with a union annotation keeps the narrow repr.**~~ **Fixed 2026-07-19.** The
+  checker always bound the annotation's type; lowering saw only the initialiser and used
+  *its* repr, so `let none: P | :none = :none` became a bare tag and any later use
+  expecting the union read the wrong layout. The declared type is now recorded against the
+  initialiser and the binding widens to it. Pinned by `types/let_annotation_widens.neon`.
 
 - ~~**A generic cannot call a generic.**~~ **Fixed 2026-07-19.** `generic::infer`
   short-circuited on `template == concrete`, which is exactly the case when a generic
@@ -142,9 +135,12 @@ corpus programs run leak-free under ASan.
   `list::sort` is back to delegating to `sort_by` through exactly such a lambda, and
   `functions/lambda_in_generic.neon` checks values rather than just running.
 
-- **Bound failures inside a generic call report twice.** Pre-existing; a protocol bound
-  does it too. Arguments are checked once while solving the callee's generics and again
-  under the solution, so any diagnostic in an argument position is emitted twice.
+- ~~**Bound failures inside a generic call report twice.**~~ **Fixed 2026-07-19.** A
+  generic call checks each argument twice -- once while solving the callee's type
+  parameters, then again under the solution, which is what lets an expected type reach a
+  lambda argument -- so anything wrong inside an argument was reported twice. The finished
+  diagnostic list is deduplicated by (span, kind), which is cheaper than threading a
+  "probing, stay quiet" mode through every expression form.
 
 - ~~**A list used as a map key leaks.**~~ **Fixed 2026-07-19.** The map natives never had
   a stated ownership rule for their *key*, only for the map. `contains` released the map

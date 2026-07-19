@@ -28,6 +28,12 @@ pub struct TypecheckResult {
     /// lowering otherwise re-derives them from the turbofish *syntax*, which carries only
     /// a type's head — enough to mangle a name, not enough to lay one out.
     generic_args: HashMap<ExprId, Vec<(String, TyId)>>,
+    /// A `let`'s declared type, keyed on its initialiser. The annotation is the binding's
+    /// type -- `let x: i64 | str = 1` binds the union -- but lowering sees only the
+    /// initialiser, whose type is the narrow one. Without this the binding was laid out at
+    /// the *variant's* repr: `let n: P | :none = :none` became a bare tag, and any later
+    /// use expecting the union read the wrong layout.
+    declared_types: HashMap<ExprId, TyId>,
 }
 
 impl TypecheckResult {
@@ -51,6 +57,15 @@ impl TypecheckResult {
     /// A generic call's solved type arguments.
     pub fn generics(&self, e: ExprId) -> Option<&[(String, TyId)]> {
         self.generic_args.get(&e).map(Vec::as_slice)
+    }
+
+    /// The declared type of the `let` whose initialiser this is.
+    pub fn declared(&self, e: ExprId) -> Option<TyId> {
+        self.declared_types.get(&e).copied()
+    }
+
+    pub fn set_declared(&mut self, e: ExprId, t: TyId) {
+        self.declared_types.insert(e, t);
     }
 
     /// The error type a `try` expression's handler receives.
