@@ -1,0 +1,22 @@
+// `print` writes without a trailing newline, so two calls land on one line. `println`
+// adds one, and `eprintln` goes to stderr.
+//
+// All three were declared in `std::io` while only `println` existed in the runtime, so
+// any program calling the other two failed to compile — the generated C referenced
+// symbols that `rt.h` did not declare. Nothing exercised them, which is the only reason
+// that survived.
+//
+// The harness diffs stdout, so `eprintln`'s destination is not checked here beyond its
+// output being absent from stdout — which is the half that would break a program.
+
+use std::io;
+
+fn main() {
+    io::print("one");
+    io::print(" two");
+    io::println(" three");
+
+    io::eprintln("this goes to stderr");
+
+    io::println("after");
+}

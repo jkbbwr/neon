@@ -1,0 +1,26 @@
+ -> parent=<null> name=<null>
+. -> parent=<null> name=<null>
+/ -> parent=<null> name=<null>
+/// -> parent=<null> name=<null>
+a -> parent=<null> name=a
+a/b -> parent=a name=b
+/a -> parent=/ name=a
+/a/b -> parent=/a name=b
+/a/b/c.txt -> parent=/a/b name=c.txt
+a/b/ -> parent=a name=b
+a//b -> parent=a name=b
+a/./b -> parent=a name=b
+.. -> parent=<null> name=<null>
+a/.. -> parent=a name=<null>
+../.. -> parent=.. name=<null>
+/.. -> parent=/ name=<null>
+.hidden -> parent=<null> name=.hidden
+.
+at /a/b/c
+at /a/b
+at /a
+at /
+steps=3
+at a/b
+at a
+steps=1

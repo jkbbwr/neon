@@ -1,5 +1,8 @@
 [workspace]
-members = ["compiler", "cli", "runtime"]
+members = ["compiler", "cli", "lsp", "runtime"]
+# Editor plugins. `extra/zed` is itself a Rust crate (a Zed extension compiles to wasm),
+# so without this the workspace would try to build it against the wrong target.
+exclude = ["extra"]
 resolver = "2"
 
 [workspace.package]

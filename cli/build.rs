@@ -25,7 +25,14 @@ fn main() {
     let sysroot = target_dir();
 
     stage_tree(&rt_include, &sysroot.join("include"));
-    stage_file(&rt_root.join("lib/libneon_rt.a"), &sysroot.join("lib/libneon_rt.a"));
+    // Every runtime variant, not just the release one. A build links exactly one of these
+    // (`cli/src/buildcfg.rs::runtime_variant`) and never substitutes another, so a variant
+    // missing from the staged sysroot is a build that cannot happen at all — most sharply
+    // the sanitized archive, without which `--sanitize address` must fail rather than
+    // quietly link an uninstrumented runtime. Kept in step with `runtime/CMakeLists.txt`.
+    for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
+        stage_file(&rt_root.join("lib").join(archive), &sysroot.join("lib").join(archive));
+    }
     if stdlib_src.is_dir() {
         stage_tree(&stdlib_src, &sysroot.join("stdlib"));
     }

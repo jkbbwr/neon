@@ -155,6 +155,16 @@ impl<'a> Fmt<'a> {
         }
     }
 
+    /// Move the source cursor past what was just printed.
+    ///
+    /// `max`, never assignment: the AST is not walked in strictly increasing
+    /// source order — an outer node advances after its children already have,
+    /// and a node may print a span that ends before one already covered. The
+    /// cursor is what `gap` measures blank lines from and what `trailing` reads
+    /// a line number out of, so letting it move backwards would recover the
+    /// wrong separation and hang trailing comments off the wrong line. It does
+    /// not affect which comments are printed: `flush` walks a monotonic index
+    /// into the trivia table, so nothing can come out twice.
     fn advance(&mut self, end: usize) {
         self.last_end = self.last_end.max(end);
     }
@@ -1464,6 +1474,20 @@ fn is_block_like_kind(e: &ExprKind) -> bool {
     )
 }
 
+/// How tightly an expression binds, on the same scale the parser uses.
+///
+/// The binary levels come straight from `op.prec()`, so they cannot disagree
+/// with the parser. The classes above and below the ladder — `P_UNARY`,
+/// `P_POSTFIX`, `P_ATOM`, `P_GREEDY` — are defined relative to `ops::MAX_PREC`
+/// rather than as literals, so adding a binary level cannot silently collide
+/// with one of them.
+///
+/// Everything here has to match how `parser::atom_expr`, `prefix_ops` and
+/// `postfix_ops` actually nest, not how they read: `try` looks greedy and is
+/// not, and `break` with no value looks atomic and is not. Both are noted at
+/// their arms. An answer that is too *high* drops a parenthesis the meaning
+/// depended on; too low only adds a redundant one, so where a form is genuinely
+/// unclear this errs downward.
 fn expr_prec(e: &Expr) -> u8 {
     match &e.kind {
         ExprKind::Binary { op, .. } => op.prec(),
@@ -1488,6 +1512,10 @@ fn expr_prec(e: &Expr) -> u8 {
     }
 }
 
+/// The type grammar's ladder, which is separate from the expression one and
+/// short enough to be spelled out here: `|` loosest, then `&`, then `!`, then
+/// atoms. `TP_FN` is `TP_ANY` because an arrow reads its return type to the end
+/// of the type, so it only fits where a whole type is expected.
 fn type_prec(t: &TypeSpec) -> u8 {
     match &t.kind {
         TypeSpecKind::Union(_) => TP_UNION,

@@ -43,6 +43,16 @@
 use super::ssa::{Block, BlockId, Func, Inst, Op, Program, Target, Term, Value};
 use std::collections::{HashMap, HashSet};
 
+/// Insert retains and releases across the whole program, in place.
+///
+/// This is the last IR pass and has to be: the placement is computed against a specific
+/// CFG, and it adds blocks of its own to split edges. Anything that reshapes control flow
+/// afterwards — threading a jump, merging a block into its predecessor — would move a
+/// release onto a path that does not own the value, or off the path that does. Running it
+/// twice would likewise double every count; it is not idempotent.
+///
+/// Functions are independent, since ownership is transferred at call boundaries by
+/// convention rather than inferred across them.
 pub fn insert(program: &mut Program) {
     for f in &mut program.funcs {
         insert_fn(f);
@@ -74,6 +84,10 @@ fn base_of(f: &Func, ptr: &HashSet<Value>) -> HashMap<Value, Value> {
 }
 
 /// The owner at the bottom of a projection chain — what actually holds the storage.
+/// An owner is its own root, so this is the identity on anything not in `base_of`, which
+/// is why callers can hand it any value without checking first. The walk terminates
+/// because `base_of`'s edges always point at an operand, and SSA operands are defined
+/// before their uses.
 fn root_base(base_of: &HashMap<Value, Value>, v: Value) -> Value {
     let mut cur = v;
     while let Some(&b) = base_of.get(&cur) {
@@ -90,6 +104,18 @@ struct Plan {
     edges: Vec<Vec<Inst>>,
 }
 
+/// Plan one function, then rewrite it. The two phases are kept apart on purpose: every
+/// `Plan` is computed against the untouched function, so no block's analysis can observe
+/// the retains and releases another block's rewrite already inserted.
+///
+/// `ptr` is the value set the pass tracks, and it is gated on `Repr::is_counted`, not
+/// `is_pointer` — an aggregate holding a string is counted even though the aggregate
+/// itself is inline (see `repr`). An empty `ptr` is the common case for numeric code and
+/// exits before any dataflow runs.
+///
+/// The rewrite appends edge blocks numbered from `f.blocks.len()` upward, in the order
+/// they are created, so a block's id remains its index in `f.blocks` — the invariant
+/// `Func::block` indexes on.
 fn insert_fn(f: &mut Func) {
     let ptr: HashSet<Value> = f.values().filter(|&v| f.value_repr(v).is_counted()).collect();
     if ptr.is_empty() {
@@ -281,6 +307,15 @@ fn insert_fn(f: &mut Func) {
 
 /// Root-collapsed liveness: live sets hold owners only, and a use of a view marks its
 /// root. Standard backward dataflow; block parameters are definitions, not live-in.
+///
+/// Only the block boundaries are returned. `insert_fn` redoes the intra-block backward
+/// walk itself, because it needs the liveness *at each instruction* to decide move-versus-
+/// retain, and materialising that for every program point would be far more state than
+/// the one pass that wants it justifies.
+///
+/// The edge contribution folds in the block arguments as well as the successor's live-in:
+/// an owner passed along an edge is live at the terminator even if the successor never
+/// mentions it under that name, since the successor sees it as a parameter.
 #[allow(clippy::type_complexity)]
 fn liveness(
     f: &Func,
@@ -338,7 +373,17 @@ fn liveness(
     }
 }
 
-/// A pointer op's operands split into consuming and borrowing uses.
+/// A pointer op's operands split into consuming and borrowing uses — the input to every
+/// retain decision, so the split *is* the ownership convention.
+///
+/// Consuming means the reference goes somewhere that will release it later: a callee's
+/// parameter, or a slot in an aggregate or closure environment. Borrowing means the op
+/// only reads: projections, tests, `Prim` comparisons, and a `CallClosure`'s callee.
+/// `Index` borrows both operands even though its *result* is owned — `emit_index` retains
+/// what it hands back, which is why `base_of` deliberately omits `Index`.
+///
+/// `Retain`/`Release` report no uses at all. They are the pass's own output; counting them
+/// as uses would make the analysis depend on its own results.
 fn operand_uses(op: &Op, ptr: &HashSet<Value>) -> (Vec<Value>, Vec<Value>) {
     let mut consuming = Vec::new();
     let mut borrowing = Vec::new();
@@ -396,6 +441,16 @@ fn term_operands(term: &Term, f: &mut impl FnMut(Value)) {
     }
 }
 
+/// Each outgoing edge as its target and the arguments passed along it, one entry per edge
+/// even when two arms share a target — the two edges get separate bookkeeping, and
+/// collapsing them would attribute one edge's retains to both.
+///
+/// The order here is the contract that ties the three loops together: `liveness` reads it,
+/// `insert_fn` builds `Plan::edges` from it, and the rewrite consumes that list positionally
+/// against `Term`'s own arms (`then` then `els`; the switch arms in order, then `default`).
+/// Reordering any one of those without the others silently attaches edge code to the wrong
+/// successor. `ret`/`throw`/`unreachable` return nothing, and `insert_fn` special-cases the
+/// first two into a single pre-terminator entry rather than an edge.
 fn successor_edges(term: &Term) -> Vec<(BlockId, Vec<Value>)> {
     match term {
         Term::Jump(t) => vec![(t.to, t.args.clone())],

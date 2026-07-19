@@ -1,0 +1,27 @@
+id = "neon"
+name = "Neon"
+version = "0.1.0"
+schema_version = 1
+description = "Neon language support: file-type registration and neon-lsp wiring (diagnostics + formatting)."
+authors = ["Neon contributors"]
+
+languages = ["languages/neon"]
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+# Diagnostics and document formatting. That is everything `neon-lsp` advertises today
+# (see `lsp/src/main.rs`); nothing else is declared here, deliberately.
+[language_servers.neon-lsp]
+name = "Neon Language Server"
+languages = ["Neon"]
+
+[language_servers.neon-lsp.language_ids]
+Neon = "neon"
+
+# No `[grammars.neon]` entry. Zed requires a grammar to be fetched from a git
+# `repository` + `rev` (there is no local-path option), and this repository has no
+# published remote carrying a Neon grammar. `grammar` is optional in Zed's
+# LanguageConfig, so the language still registers and the language server still
+# attaches -- there is simply no tree-sitter highlighting. See README.md.

@@ -29,6 +29,17 @@ pub enum Stage {
 
 /// Run the IR pipeline to the requested stage: lower (with monomorphisation), then
 /// optimise, then insert reference counts.
+///
+/// The stages are a prefix, not a menu — each early return hands back the program in a
+/// genuinely intermediate state. Only `Final` is safe to emit: `Lowered` and `Optimised`
+/// carry no retains or releases at all, so compiling either would leak everything and free
+/// nothing. Codegen therefore always asks for `Final`, and the earlier stages exist for
+/// `neon ir` to print.
+///
+/// The order is forced rather than chosen. The optimiser has to run before refcounting
+/// because it rewrites control flow, and refcount placement is pinned to a specific CFG
+/// (see `refcount::insert`); running it after would strand releases on paths that no
+/// longer own the value.
 pub fn compile(
     env: &Env,
     result: &TypecheckResult,

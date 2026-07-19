@@ -1,0 +1,16 @@
+a.txt -> stem=a ext=txt md=a.md bare=a
+/x/y/a.txt -> stem=a ext=txt md=/x/y/a.md bare=/x/y/a
+a.tar.gz -> stem=a.tar ext=gz md=a.tar.md bare=a.tar
+README -> stem=README ext=<null> md=README.md bare=README
+.bashrc -> stem=.bashrc ext=<null> md=.bashrc.md bare=.bashrc
+. -> stem=<null> ext=<null> md=<null> bare=<null>
+.. -> stem=<null> ext=<null> md=<null> bare=<null>
+a. -> stem=a. ext=<null> md=a..md bare=a.
+a..b -> stem=a. ext=b md=a..md bare=a.
+/ -> stem=<null> ext=<null> md=<null> bare=<null>
+ -> stem=<null> ext=<null> md=<null> bare=<null>
+a/b.txt/ -> stem=b ext=txt md=a/b.md bare=a/b
+x/.. -> stem=<null> ext=<null> md=<null> bare=<null>
+/x/.config -> stem=.config ext=<null> md=/x/.config.md bare=/x/.config
+/x/y/a.tar.bz2
+/

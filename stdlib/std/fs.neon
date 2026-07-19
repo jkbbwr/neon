@@ -19,7 +19,10 @@
 use std::string;
 use std::resource;
 
-// Thrown by everything here that can fail. Owned by this module rather than the prelude.
+// Thrown by everything here that can fail. Its `message` names the operation, the path and
+// the `strerror` text, so a caller has nothing to reassemble. A `File` does not remember
+// the path it was opened with, so failures on a handle say `<file>` instead; keep the path
+// yourself if the message has to identify it.
 record IoError { message: str }
 impl Display for IoError { fn to_string(v: IoError) -> str { v.message } }
 impl Error for IoError { fn message(v: IoError) -> str { v.message } }
@@ -32,9 +35,10 @@ impl Error for IoError { fn message(v: IoError) -> str { v.message } }
 newtype Bytes = str
 
 // What can be written in one go. A tree rather than a buffer: building it costs no copying
-// and no concatenation, and `write_all` turns the leaves into an `iovec` array for a single
-// `writev`. This is Erlang's iodata, and the reason immutable strings do not make output
-// quadratic.
+// and no concatenation -- nesting a list inside a list is a pointer, not a concatenation --
+// and `write_all` turns the leaves into an `iovec` array for `writev`. This is Erlang's
+// iodata, and the reason immutable strings do not make output quadratic. Build the tree,
+// write once.
 mu type IoList = str | Bytes | List[IoList]
 
 // A handle is a descriptor guarded by a `Resource`, so all of it comes from one place:
@@ -55,6 +59,19 @@ internal mod raw {
     @native("neon_io_writev") fn writev(fd: i64, parts: List[str]) -> i64
     @native("neon_io_remove") fn remove(path: str) -> i64
     @native("neon_io_strerror") fn strerror(code: i64) -> str
+
+    // The cleanup a handle carries: closing is the resource's job, so a forgotten close
+    // -- or one skipped by a `throw` -- still happens, and its error is available to
+    // whoever closes explicitly.
+    fn guard(fd: i64) -> File {
+        File { r: resource::new(fd, (d: i64) => {
+            let code = raw::close(d);
+            if code < 0 {
+                try fail(code, "cannot close", "<file>");
+            }
+            null
+        }) }
+    }
 }
 
 @native("neon_io_exists") fn exists(path: str) -> bool
@@ -65,25 +82,12 @@ fn fail(code: i64, what: str, path: str) throws IoError -> null {
 
 // ---- handles ----
 
-// The cleanup a handle carries: closing is the resource's job, so a forgotten close --
-// or one skipped by a `throw` -- still happens, and its error is available to whoever
-// closes explicitly.
-fn guard(fd: i64) -> File {
-    File { r: resource::new(fd, (d: i64) => {
-        let code = raw::close(d);
-        if code < 0 {
-            try fail(code, "cannot close", "<file>");
-        }
-        null
-    }) }
-}
-
 fn open(path: str) throws IoError -> File {
     let fd = raw::open(path, 0);
     if fd < 0 {
         try fail(fd, "cannot open", path);
     };
-    guard(fd)
+    raw::guard(fd)
 }
 
 fn create(path: str) throws IoError -> File {
@@ -91,7 +95,7 @@ fn create(path: str) throws IoError -> File {
     if fd < 0 {
         try fail(fd, "cannot create", path);
     };
-    guard(fd)
+    raw::guard(fd)
 }
 
 fn open_append(path: str) throws IoError -> File {
@@ -99,7 +103,7 @@ fn open_append(path: str) throws IoError -> File {
     if fd < 0 {
         try fail(fd, "cannot open", path);
     };
-    guard(fd)
+    raw::guard(fd)
 }
 
 // Release the descriptor now rather than whenever the handle dies. Optional -- ARC closes
@@ -130,8 +134,10 @@ fn read_all(f: File) throws IoError -> str {
     data
 }
 
-// Write every piece of `data`, in order, in a single `writev`. The payload bytes are never
-// copied: the tree's leaves become an `iovec` array of pointer/length pairs.
+// Write every piece of `data`, in order. The payload bytes are never copied: the tree's
+// leaves become an `iovec` array of pointer/length pairs. One `writev` covers up to
+// `IOV_MAX` pieces, so a larger tree takes one syscall per batch, and a partial write is
+// resumed rather than reported.
 fn write_all(f: File, data: IoList) throws IoError -> null {
     let fd = try fd_of(f);
     let code = raw::writev(fd, flatten(data));
@@ -142,10 +148,6 @@ fn write_all(f: File, data: IoList) throws IoError -> null {
 }
 
 // ---- iolists ----
-//
-// `mu type IoList = str | Bytes | List[IoList]` (prelude). Building one costs no copying:
-// nesting a list inside a list is a pointer, not a concatenation. This is Erlang's iodata,
-// and it is why immutable strings do not make output quadratic. Build the tree, write once.
 
 // The leaves, left to right. `Bytes` and `str` share a representation, so a leaf of either
 // kind becomes the same view; only the type told them apart.
@@ -178,8 +180,8 @@ fn collect(data: IoList, acc: List[str]) -> List[str] {
 
 // No explicit close, and no wrapping to close on the error path: the handle is refcounted,
 // so the descriptor closes when `f` dies -- including when `read_all` throws straight past
-// the end of this function. An earlier draft caught, closed and rethrew at every one of
-// these; ARC does it instead.
+// the end of this function. Catching, closing and rethrowing here would be dead weight;
+// ARC already does it. The same holds for every helper below that opens a handle.
 fn read(path: str) throws IoError -> str {
     let f = try open(path);
     try read_all(f)

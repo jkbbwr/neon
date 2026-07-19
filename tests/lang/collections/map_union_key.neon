@@ -1,0 +1,38 @@
+// A union or nullable key is hashed by the same content its equality compares.
+//
+// The two must agree or the map loses data: a key that compares equal to a stored
+// one but hashes differently lands in a bucket nobody looks in, and `contains`
+// answers `false` for a key the map holds. That is exactly what happened — the
+// backend hashed the raw representation of anything it had no arm for, so a
+// `str | null` key hashed its `{data, len, owner}` triple while comparing its bytes
+// with `neon_str_eq`. Two equal strings at different addresses missed each other.
+//
+// Forty entries, and the probes are built by concatenation so they are distinct
+// allocations from the keys stored. A handful of entries would find the key anyway
+// by scanning a nearly empty table, which is how this survived.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    let nullable: Map[str | null, i64] = map::new();
+    let unioned: Map[str | i64, i64] = map::new();
+
+    let i = 0;
+    while i < 40 {
+        let nk: str | null = "key" + "#{i}";
+        let uk: str | i64 = "key" + "#{i}";
+        nullable = map::set(nullable, nk, i);
+        unioned = map::set(unioned, uk, i);
+        i = i + 1;
+    }
+
+    let nprobe: str | null = "ke" + "y7";
+    let uprobe: str | i64 = "ke" + "y7";
+    let missing: str | null = "ke" + "y99";
+
+    io::println("#{map::len(nullable)}");
+    io::println("#{map::contains(nullable, nprobe)}");
+    io::println("#{map::contains(unioned, uprobe)}");
+    io::println("#{map::contains(nullable, missing)}");
+}

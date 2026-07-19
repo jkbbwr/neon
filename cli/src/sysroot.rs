@@ -1,7 +1,8 @@
+use crate::buildcfg::RuntimeVariant;
 use color_eyre::eyre::{bail, eyre, Result};
 use std::path::PathBuf;
 
-/// Locates `include/`, `lib/libneon_rt.a` and `stdlib/`.
+/// Locates `include/`, the `lib/libneon_rt*.a` variants and `stdlib/`.
 ///
 /// Resolved at runtime, never baked in: a compile-time path describes the
 /// machine that built the compiler, not the one running it.
@@ -71,8 +72,44 @@ impl Sysroot {
         self.0.join("include")
     }
 
-    pub fn runtime_lib(&self) -> PathBuf {
-        self.0.join("lib/libneon_rt.a")
+    /// Where the prebuilt runtime archives live. The release one, `libneon_rt.a`, doubles
+    /// as the marker `probe` looks for: it is the variant that always exists.
+    pub fn lib_dir(&self) -> PathBuf {
+        self.0.join("lib")
+    }
+
+    /// The prebuilt archive for `variant`, or an error naming what is missing.
+    ///
+    /// A missing archive is never quietly swapped for another. That matters most for the
+    /// sanitized variant — a sanitizer reports nothing about code compiled without it, so
+    /// substituting the plain archive would produce a build that looks sanitized and
+    /// checks only half the program — but the same rule applies to all three, because a
+    /// silently downgraded runtime is a lie about what was built either way.
+    pub fn runtime_lib(&self, variant: RuntimeVariant) -> Result<PathBuf> {
+        let path = self.lib_dir().join(variant.archive());
+        if path.is_file() {
+            return Ok(path);
+        }
+        let present: Vec<String> = [
+            RuntimeVariant::Release,
+            RuntimeVariant::Debug,
+            RuntimeVariant::Sanitized,
+        ]
+        .iter()
+        .map(|v| v.archive())
+        .filter(|a| self.lib_dir().join(a).is_file())
+        .map(str::to_string)
+        .collect();
+        bail!(
+            "this build needs the runtime archive `{}`, which is not in the sysroot at {}.\n\
+             Present there: {}.\n\
+             The toolchain's runtime is incomplete; rebuild or reinstall it. Another \
+             variant will not be substituted — it would change what the build actually \
+             links without saying so.",
+            variant.archive(),
+            self.0.display(),
+            if present.is_empty() { "nothing".into() } else { present.join(", ") },
+        )
     }
 
     pub fn stdlib(&self) -> PathBuf {

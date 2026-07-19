@@ -4,6 +4,20 @@
 //! changes what a program means, and it can only be checked once the one thing
 //! formatting is *supposed* to change — where each node sits — is taken out of
 //! the comparison.
+//!
+//! The walk below must stay **total**: every field that carries a `Span`, at every
+//! depth, has to be visited. A missed one does not fail loudly — it leaves a real
+//! position in one tree and a real position in the other, and the equality test
+//! then reports a difference that formatting was entitled to make. The result is a
+//! round-trip test that fails on correct output, so the pressure is to weaken the
+//! test rather than fix the walk. When a node gains a span-bearing field, it gains
+//! a line here.
+//!
+//! `ExprId` is deliberately *not* zeroed. Ids come from `number_exprs`, which the
+//! round-trip callers do not run, so both sides hold `ExprId::UNSET` and compare
+//! equal. Comparing two trees that have been numbered would need ids stripped too:
+//! they are assigned in pre-order, so any node added or removed renumbers
+//! everything after it.
 
 use super::*;
 
@@ -16,6 +30,9 @@ pub fn strip_spans(module: &mut Module) {
     }
 }
 
+/// The shapes that look like omissions but are not: an `AliasDecl` and a `ConstDecl` have
+/// no span field, and a `UseDecl`'s `UseTree` carries its positions on the `UseDecl`
+/// itself rather than per node, so one assignment covers the whole tree.
 fn decl(d: &mut Decl) {
     d.span = ZERO;
     match &mut d.kind {
@@ -57,6 +74,9 @@ fn decl(d: &mut Decl) {
     }
 }
 
+/// A `FnDecl` carries no span of its own — the enclosing `Decl` holds it, and a protocol
+/// or impl method has none at all — so this only descends. Every position a diagnostic
+/// about a signature can point at lives on a `Param`, an `Annotation` or a `TypeSpec`.
 fn fn_decl(f: &mut FnDecl) {
     for a in &mut f.annotations {
         a.span = ZERO;

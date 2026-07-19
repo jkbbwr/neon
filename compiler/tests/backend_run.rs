@@ -22,6 +22,31 @@ fn lang_root() -> PathBuf {
 fn runtime_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime")
 }
+/// The **sanitized** prebuilt runtime archive, `libneon_rt_san.a`.
+///
+/// This suite runs with ASan+UBSan on, and that is load-bearing: it is what caught a
+/// stack-buffer-overflow in `neon_map_set` and a 24-byte/8-byte slot mismatch in every
+/// `list::new()`, both of which the suite otherwise ran green over. Measured: a sanitizer
+/// reports **nothing** about a heap error that happens inside code compiled without
+/// `-fsanitize` — the program exits 0 and says nothing. So linking the plain archive here
+/// would not weaken this oracle, it would blind it to every bug that lives in the runtime,
+/// which is most of the ones it has found. Hence: this variant or a hard failure, never a
+/// fallback.
+///
+/// Found via `NEON_RT_LIB_DIR`, which `compiler/build.rs` sets from the runtime crate's
+/// cmake output.
+fn runtime_archive() -> PathBuf {
+    let path = PathBuf::from(env!("NEON_RT_LIB_DIR")).join("libneon_rt_san.a");
+    assert!(
+        path.is_file(),
+        "the sanitized runtime archive is missing at {}.\n\
+         This suite must link a sanitized runtime; it will not fall back to an \
+         uninstrumented one, which would silently stop reporting every error inside the \
+         runtime. Run `cargo build -p neon-runtime`.",
+        path.display()
+    );
+    path
+}
 
 /// The stdlib, numbered from 0, plus the next free expression id. The program is numbered
 /// after it so ids are unique across the whole compilation — the stdlib's bodies are real
@@ -103,7 +128,9 @@ fn run_one(dir: &Path, rel: &str) -> Result<(), Failed> {
         ])
         .arg(&exe)
         .arg(&c_file)
-        .arg(runtime_root().join("src/rt.c"))
+        // After the `.c`: a static archive only contributes members resolving symbols
+        // already referenced.
+        .arg(runtime_archive())
         .arg("-I")
         .arg(runtime_root().join("include"))
         // `std::math` bottoms out in libm, separate from libc on Linux.

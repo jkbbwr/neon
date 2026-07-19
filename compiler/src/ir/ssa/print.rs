@@ -6,6 +6,8 @@ use super::{Block, Func, Op, PrimOp, Program, SwitchKey, Target, Term, Value};
 use crate::ir::repr::Repr;
 use std::fmt::Write;
 
+/// Every function, blank-line separated. The recursive-type and boxed-record side tables a
+/// `Program` also carries are not printed — a dump shows code, not the type environment.
 pub fn program(p: &Program) -> String {
     let mut out = String::new();
     for (i, f) in p.funcs.iter().enumerate() {
@@ -17,6 +19,11 @@ pub fn program(p: &Program) -> String {
     out
 }
 
+/// One function, signature and blocks. The signature shows `Func::ret` — the *declared*
+/// return — so a throwing function prints as returning its plain value even though it
+/// actually returns the tagged `Union([ret, throws])` of `Func::result_repr`. The `throws`
+/// repr and a lambda's `env` repr are likewise not on the line; read them off the IR, not
+/// the dump. A lambda's environment is still visible as its first parameter.
 pub fn func(f: &Func) -> String {
     let mut out = String::new();
     let params: Vec<String> =
@@ -29,6 +36,10 @@ pub fn func(f: &Func) -> String {
     out
 }
 
+/// One block, appended in place — blocks print in `Func::blocks` order, which is creation
+/// order and need not be reverse-postorder, so a join may appear before the branch feeding
+/// it. Reprs are shown on parameters only; an instruction result's repr is not printed, so
+/// a value's type is read from wherever it was defined.
 fn block(out: &mut String, f: &Func, b: &Block) {
     // The entry block's parameters are the function's, already on the signature; any
     // other block shows its parameters, and a parameterless block shows none.
@@ -52,6 +63,10 @@ fn block(out: &mut String, f: &Func, b: &Block) {
     let _ = writeln!(out, "    {}", term(&b.term));
 }
 
+/// One instruction's operation. `@name` is a static function, `%n` a value, `:name` an
+/// atom, and a quoted string is a Rust `{:?}` so an embedded quote or newline round-trips
+/// visibly. `const.f64` prints the raw bit pattern rather than a decimal, since that is
+/// what `Op::ConstF64` holds and a decimal rendering would not be exact.
 fn op(o: &Op) -> String {
     match o {
         Op::ConstI64(n) => format!("const.i64 {n}"),
@@ -87,6 +102,9 @@ fn op(o: &Op) -> String {
     }
 }
 
+/// A terminator. `throw` is not a separate control-flow construct at the C level — it
+/// returns the error case of the tagged result — but it prints as its own keyword because
+/// which of the two a function does is the thing worth seeing.
 fn term(t: &Term) -> String {
     match t {
         Term::Ret(Some(v)) => format!("ret {}", val(*v)),
@@ -105,6 +123,8 @@ fn term(t: &Term) -> String {
     }
 }
 
+/// A branch target. The parentheses are elided when there are no arguments, matching the
+/// way `block` prints a parameterless block, so the two forms read as a pair.
 fn target(t: &Target) -> String {
     if t.args.is_empty() {
         format!("block{}", t.to.0)
@@ -113,6 +133,8 @@ fn target(t: &Target) -> String {
     }
 }
 
+/// A switch arm's discriminant. An atom keeps its `:` sigil; a nominal variant prints bare,
+/// which is how the two are told apart in a dump.
 fn key(k: &SwitchKey) -> String {
     match k {
         SwitchKey::Int(n) => n.to_string(),
@@ -122,6 +144,8 @@ fn key(k: &SwitchKey) -> String {
     }
 }
 
+/// A value, by its raw index. Numbering is per function and dense, so `%7` in two
+/// functions is two unrelated values.
 fn val(v: Value) -> String {
     format!("%{}", v.0)
 }
@@ -130,6 +154,9 @@ fn vals(vs: &[Value]) -> String {
     vs.iter().map(|&v| val(v)).collect::<Vec<_>>().join(", ")
 }
 
+/// A primitive's mnemonic. There is one per `PrimOp`, not one per (op, type) pair: `add`
+/// covers both integer and float addition, because the operands' reprs already say which,
+/// and printing them separately would claim a distinction the IR does not make.
 fn prim(p: PrimOp) -> &'static str {
     match p {
         PrimOp::Add => "add",

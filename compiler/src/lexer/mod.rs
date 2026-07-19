@@ -1,3 +1,28 @@
+//! Bytes to tokens. Hand-written, single pass, no backtracking.
+//!
+//! Two things shape the whole design.
+//!
+//! **String interpolation nests.** `"a #{f("b")} c"` puts a string inside a hole
+//! inside a string, and no regular language can describe that. So the lexer
+//! carries a `Mode` *stack* rather than a flag, and a string literal comes out
+//! as a flat run of tokens (`StrStart StrText InterpStart .. InterpEnd StrEnd`)
+//! that the parser reassembles into a tree. Nothing downstream needs a special
+//! case for quotes inside holes, or for holes inside holes.
+//!
+//! **Trivia is not thrown away.** Comments and line starts are collected into a
+//! side table, not into the token stream, so the parser's input is exactly the
+//! grammar's alphabet and no combinator has to step over a comment. `lex`
+//! returns tokens alone for the compiler; `lex_full` returns the side tables
+//! too, which is the only reason `neon fmt` can preserve comments and the
+//! author's blank lines. See `trivia.rs`.
+//!
+//! Errors accumulate rather than abort: the lexer runs to the end of the file
+//! and returns every complaint at once, because one bad escape should not hide
+//! the next twenty tokens' worth of mistakes. Positions are byte offsets into
+//! the original `&str` throughout, so a span can always be sliced back out of
+//! the source — the formatter depends on that to reprint literals and comments
+//! verbatim.
+
 mod error;
 mod token;
 mod trivia;
@@ -60,6 +85,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// The whole file, in one pass driven by the mode stack.
+    ///
+    /// Errors are collected, not raised: the loop always reaches EOF, so a
+    /// single bad escape does not hide every mistake after it. Only when the
+    /// file is clean is the line table built and a `Lexed` returned — nothing
+    /// downstream is allowed to see a half-lexed file.
     fn run(mut self) -> Result<Lexed, Vec<LexError>> {
         // A BOM at the very start is consumed silently; anywhere else it is an
         // error naming itself, rather than a mystery character.
@@ -446,6 +477,13 @@ impl<'a> Lexer<'a> {
 
     // ---- string mode ----
 
+    /// One run of string content, up to whichever comes first: the closing
+    /// quote, a `#{` hole, or EOF.
+    ///
+    /// It returns at each of those rather than looping, because all three change
+    /// the mode stack and the caller re-dispatches on the new mode. Escapes are
+    /// decoded into the `StrText` payload here, so the token carries the *value*;
+    /// the formatter recovers the author's spelling from the span instead.
     fn string_body(&mut self) {
         let start = self.pos;
         let mut text = String::new();
@@ -643,6 +681,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// An integer or float literal.
+    ///
+    /// Only the magnitude is lexed; a leading `-` is a separate token that the
+    /// parser folds in. That is what keeps `i64::MIN` writable — see
+    /// `Token::Int`.
+    ///
+    /// A float keeps its *text* rather than its value — underscores stripped,
+    /// spelling otherwise intact — so the formatter can reprint `1e0` as the
+    /// author wrote it instead of as `1`.
     fn number(&mut self, start: usize) {
         let radix = match (self.peek(), self.peek_at(1)) {
             (Some(b'0'), Some(b'x' | b'X')) => 16,

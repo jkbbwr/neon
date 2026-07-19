@@ -1,0 +1,22 @@
+/foo/bar <- /foo = true
+/foobar <- /foo = false
+bytes say true
+a/b/c <- a/b = true
+a/b/c <- a/b/c = true
+a/b <- a/b/c = false
+a/b/c <-  = true
+ <-  = true
+ <- a = false
+a//b///c <- a/b = true
+a/b/c <- a//b/ = true
+./a/b <- a = true
+/a/b <- a = false
+a/b <- /a = false
+/a/b <- / = true
+a/b <- / = false
+/ <- / = true
+/a/../b <- /b = false
+/b <- /b = true
+true
+false
+false

@@ -1,0 +1,50 @@
+// A `while x is T` guard on a nullable binding is a *runtime* test, re-run on
+// every iteration. Walking a chain by rebinding the guarded variable to the next
+// link is the ordinary way to consume a `T | null`, and the loop must stop the
+// first time the chain ends.
+//
+// This looped forever with `cur` null inside the body: a `str | null` is
+// represented as a nullable pointer rather than a tagged union, and codegen took
+// the "concrete type" path for `is`, which compares the repr's *name*. A
+// nullable is named after its payload, so `cur is str` folded to the constant
+// `true` and the guard never fired.
+
+use std::io;
+use std::string;
+
+fn step(s: str) -> str | null {
+    if s == "x" { null } else { "x" }
+}
+
+fn main() {
+    let cur: str | null = "a";
+    while cur is str {
+        io::println(cur as str);
+        cur = step(cur as str);
+    };
+    io::println("exited");
+
+    // The guard is false on entry when the binding starts null: zero iterations.
+    let none: str | null = null;
+    while none is str {
+        io::println("unreachable");
+        none = null;
+    };
+    io::println("never entered");
+
+    // `is null` on the same binding is the complement, and equally a runtime test.
+    let maybe: str | null = null;
+    let seen = 0;
+    while maybe is null {
+        seen = seen + 1;
+        maybe = if seen == 2 { "done" } else { null };
+    };
+    io::println(maybe as str);
+    io::println(to_string(seen));
+
+    // A nullable is not some unrelated type, whether or not it holds a value.
+    let s: str | null = "here";
+    io::println(to_string(s is i64));
+    io::println(to_string(s is str));
+    io::println(to_string(s is null));
+}

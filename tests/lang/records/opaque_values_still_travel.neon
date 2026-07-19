@@ -5,12 +5,16 @@
 // This is the property that makes the feature usable rather than merely restrictive: a
 // handle travels wherever the program needs it and stays unforgeable the whole way.
 //
-// `vault` also exercises the parent half of the rule — an `internal mod` declares the
-// record and the module around it reaches inside, which is the shape `std::fs` uses. So
-// the rule is "the declaring module and its immediate parent", not "the declaring module
-// alone". Note the nested type is never *named* from the root: `vault::inner::Secret`
+// The rule is not "the declaring module alone". A module nested inside the declaring one
+// may reach in, because an `internal mod` is the implementation of the module around it
+// and cannot be barred from the type it exists to implement — `std::fs` builds its `File`
+// that way. The immediate parent may reach in too, for the mirror arrangement. Note the
+// nested type is never *named* from the root: `vault::inner::Secret`
 // does not resolve there, which is a separate module-path limitation, so `vault` hands
 // out its own single-level `Token` for the parts that need a type annotation.
+//
+// Both directions are exercised: a parent reaching into its child (`mint`), and a child
+// reaching into its parent (`inner::wrap`).
 
 use std::io;
 
@@ -20,6 +24,12 @@ internal mod vault {
     internal mod inner {
         opaque record Secret { code: i64 }
         fn seal(n: i64) -> Secret { Secret { code: n } }
+
+        // A nested module reaching *outward* into the module that contains it. This is
+        // the `internal mod raw` shape: the inner module is the implementation of the
+        // outer one, so it cannot be barred from the type it exists to implement --
+        // `std::fs` builds its `File` exactly here.
+        fn wrap(n: i64) -> Token { Token { code: n } }
     }
 
     // The immediate parent reaches inside its child: the `internal mod raw` shape.
@@ -28,6 +38,7 @@ internal mod vault {
         Token { code: s.code }
     }
     fn value(t: Token) -> i64 { t.code }
+    fn minted_inside(n: i64) -> Token { inner::wrap(n) }
     fn bump(t: Token) -> Token { mint(value(t) + 1) }
 }
 
@@ -43,6 +54,9 @@ fn main() {
     let env = Envelope { held: vault::mint(7), label: "sealed" };
     io::println(env.label);
     io::println(to_string(vault::value(env.held)));
+
+    // Built by a module nested inside the one that declares the type.
+    io::println(to_string(vault::value(vault::minted_inside(3))));
 
     // Carried in a list.
     let many = [vault::mint(1), vault::mint(2)];

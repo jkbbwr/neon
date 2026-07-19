@@ -1,40 +1,43 @@
 // The prelude: what syntax depends on, in scope everywhere without a `use`.
 //
-// Kept small on purpose. A name here is a name no program can declare -- adding `IoError`
-// broke two corpus tests that had their own -- so the bar is "syntax needs it", not "it is
-// useful". `ParseError`, `KeyError`, `IoError`, `Mappable`, `Bytes` and `IoList` all moved
-// out to the modules that own them (2026-07-19).
+// Kept small on purpose. A name here is a name no program can declare, so the bar is
+// "syntax needs it", not "it is useful". Everything else lives in the module that owns it:
+// `ParseError` in `std::string`, `KeyError` in `std::collections::map`, `IoError`, `Bytes`
+// and `IoList` in `std::fs`, `Mappable` in `std::collections::list`.
 //
-// What is left, and why:
-//   Display, Error     `#{x}` desugars to `to_string(x)`; `main`'s implicit channel
-//                      demands that whatever escapes implements `Error`.
-//   Ord                the `where T: Ord` bound; ordering is a language rule.
-//   List, Map           the compiler recognises these names in `record_repr` and gives
-//                      them runtime representations, so they must be unambiguous.
+// What is here, and why:
+//   Display, Error      `#{x}` desugars to `to_string(x)`; `main`'s implicit channel
+//                       demands that whatever escapes implements `Error`.
+//   Ord                 the `where T: Ord` bound; ordering is a language rule.
+//   List, Map           `record_repr` matches these two names literally and gives them
+//                       their runtime representations, so they must be unambiguous.
 //   range               `for i in range(a, b)` is the loop idiom; moving it would put an
-//                      import in front of every counted loop.
+//                       import in front of every counted loop.
 //   IndexError          thrown by both `std::string` and `std::collections::list`, so it
-//                      has no single owner to move to. A shared `std::error` would be the
-//                      home if one existed.
+//                       has no single owner to move to. A shared `std::error` would be the
+//                       home if one existed.
 //   Ordering            returned by the `_by` callbacks that `std::cmp` and
-//                      `std::collections::list` both take -- same shared-owner problem.
+//                       `std::collections::list` both take -- same shared-owner problem.
 //
-// Declared at the root, so `Display`, `Ordering` and the protocol names resolve by
-// their short names from any module. `#{x}` desugars to `to_string(x)`.
+// Declared at the root, so these names resolve by their short names from any module.
 //
 // Comparison is *not* dispatched: `==` and `<` are structural primitives the backend
 // expands per type, not protocol calls, so there is no `Eq` protocol and nothing to
-// implement. `Ord` survives only as a *marker* — a bound a generic writes to say its
-// parameter can be ordered, answered from structure. See "Comparison is structural"
-// in docs/decisions.md.
+// implement. `Ord` survives only as a marker; see below. "Comparison is structural" in
+// docs/decisions.md has the reasoning.
 
-// Still useful as a return type for hand-written comparison functions, e.g. the
-// callback `sort_by` takes. Nothing in the language depends on it.
+// The return type for hand-written comparison functions, e.g. the callback `sort_by`
+// takes. Nothing in the language depends on it.
 type Ordering = :lt | :eq | :gt
 
-// `for i in range(a, b)` — the half-open range [a, b) as a list. Written in Neon rather
-// than as a native: a C function cannot build a `List[i64]` without the element's
-// value-witness, which codegen generates per program.
+// `for i in range(a, b)` -- the half-open range [a, b) as a list, empty when `to <= from`.
+// Written in Neon rather than as a native: a C function cannot build a `List[i64]` without
+// the element's value-witness, which codegen generates per program.
+//
+// It really is a list, not a lazy sequence -- there is no laziness in the language to be
+// had -- so a counted loop allocates one `i64` per iteration up front. That is fine at the
+// sizes loops are usually written for and wrong for a range in the millions, where a
+// `while` costs nothing.
 fn range(from: i64, to: i64) -> List[i64] {
     let out: List[i64] = [];
     let i = from;
@@ -50,21 +53,19 @@ fn range(from: i64, to: i64) -> List[i64] {
 opaque record List[T] {}
 opaque record Map[K, V] {}
 
-// An open file. Here rather than in `std::fs` for the same mechanical reason as the two
-// above: the compiler recognises the name and gives it a runtime representation. Being
-// refcounted is the point -- the descriptor closes when the last reference dies, so
-// cleanup rides on ARC instead of on the caller remembering, and leaving through a `throw`
-// leaks nothing. `opaque` keeps its innards invisible; there is nothing to see anyway.
 // ---- markers ----
 
 // A bound with no methods: `where T: Ord` says T can be ordered, and the compiler
 // answers that from T's structure. There is nothing to implement and no way to
 // override it -- see "Comparison is structural" in docs/decisions.md.
 //
-// Order is infectious. A record is ordered when every field is, `List[T]` when T is;
-// a Map, a closure, a union and a self-referencing record are not. For a type whose
-// meaningful order is not its structural one, pass the order in: `max_by`/`sort_by`
-// take a comparator and need no bound at all.
+// Order is infectious. A record is ordered when every field is, `List[T]` when T is; an
+// atom, `null`, a Map, a closure, a union and a self-referencing record are not. A union
+// is the surprising one: there is no honest rank between its arms, so
+// `(i64 | :none) < (i64 | :none)` is a diagnostic even though its *equality* is fine.
+//
+// For a type whose meaningful order is not its structural one, pass the order in:
+// `max_by`/`sort_by` take a comparator and need no bound at all.
 marker Ord
 
 // ---- the protocols ----
@@ -76,16 +77,14 @@ protocol Display for T {
 // An error explains what went wrong. That is a different question from `Display`'s
 // "how does this value render", so `Error` owns `message` rather than borrowing
 // `to_string`: a type can be both a value and an error without the two answers
-// fighting over one method. `message` is the only thing an error knows about itself —
+// fighting over one method. `message` is the only thing an error knows about itself --
 // a stacktrace belongs to the throw, not to the value, so the compiler supplies it.
 protocol Error for T {
     fn message(v: T) -> str
 }
 
-// `IndexError` stays here because two modules throw it -- `std::string` and
-// `std::collections::list` -- so it has no single owner to move to. The others moved to the
-// module that throws them: `ParseError` to `std::string`, `KeyError` to
-// `std::collections::map`, `IoError` to `std::fs`.
+// Thrown by two modules -- `std::string` and `std::collections::list` -- which is why it
+// is here rather than owned by one of them.
 //
 // `Display` renders the value; `Error::message` explains the failure. Here they read the
 // same field, but they answer different questions and a type is free to answer them

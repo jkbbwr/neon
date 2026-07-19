@@ -1,6 +1,20 @@
 //! The syntax tree.
 //!
 //! Spans are carried on every node a diagnostic can point at.
+//!
+//! The tree is what the parser produced and nothing more: it is deliberately *not*
+//! resolved, normalised or desugared. A path stays a list of segments rather than a
+//! binding, a literal keeps the text it was written with, and sugar keeps its own node
+//! rather than becoming its expansion. That is what allows one tree to serve both the
+//! checker and the formatter — a formatter fed a desugared tree cannot print the program
+//! back, and a tree that normalises anything has already made a decision the formatter is
+//! then obliged to reproduce.
+//!
+//! Two identities ride alongside the tree, and they answer different questions.
+//! [`ExprId`] is *which expression* — stable, assigned in pre-order by [`number_exprs`],
+//! and what the checker keys types on. A [`Span`] is *where the text is* — not unique
+//! (two nodes can share one) and legitimately changed by formatting, which is why
+//! [`strip_spans`] exists to take it out of a tree comparison.
 
 mod ids;
 mod spans;

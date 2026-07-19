@@ -243,10 +243,15 @@ impl TypeTable {
     }
 
     /// The address-of expression for a map key's key-witness.
+    ///
+    /// Ices on a miss. `0` is a null `neon_key_witness*`, and the runtime dereferences it
+    /// unconditionally to hash and compare — there is no "no key witness" behaviour for it
+    /// to fall back to, so the old default bought a segfault at the first insertion in
+    /// exchange for hiding which key repr was never interned.
     pub fn key_witness_ref(&self, r: &Repr) -> String {
         match self.key_witness_names.get(&key_with(r, &self.recursive)) {
             Some(n) => format!("&{n}"),
-            None => "0".into(),
+            None => ice(r, "a map key with no interned key-witness"),
         }
     }
 
@@ -256,10 +261,16 @@ impl TypeTable {
     }
 
     /// The address-of expression for an element type's value-witness.
+    ///
+    /// Ices on a miss, for the same reason `key_witness_ref` does. A witness carries the
+    /// element's *size*, and a container handed a null one has no way to know how many
+    /// bytes a slot is; it is also what boxing into `any` records so the value can be
+    /// released later. `0` here is not "no witness needed", it is a container that cannot
+    /// describe its own contents.
     pub fn witness_ref(&self, r: &Repr) -> String {
         match self.witness_names.get(&key_with(r, &self.recursive)) {
             Some(n) => format!("&{n}"),
-            None => "0".into(),
+            None => ice(r, "an element type with no interned value-witness"),
         }
     }
 
@@ -279,10 +290,21 @@ impl TypeTable {
         self.env_drop_defs.push((name, r.clone()));
     }
 
-    /// The env-drop function name for a closure environment, or `0` when it has no
-    /// captured references to release (an empty environment).
+    /// The env-drop function name for a closure environment.
+    ///
+    /// Ices on a miss. The old default was `0`, documented as "an empty environment has
+    /// nothing to release" — but an empty environment never reaches here:
+    /// `emit_make_closure` returns early when there are no captures, and a boxed record's
+    /// shape is interned by `register` alongside its wrapper. So the only way to get a `0`
+    /// was a *non*-empty environment whose repr had not been interned, and `0` there is a
+    /// `neon_header` freed without releasing anything it captured — a silent leak of every
+    /// counted capture, on the one path (`neon_release` reaching zero) that no test watches.
+    /// A drop is also mandatory for a boxed record: `neon_release` calls it unconditionally.
     pub fn env_drop_ref(&self, r: &Repr) -> String {
-        self.env_drop_names.get(&key_with(r, &self.recursive)).cloned().unwrap_or_else(|| "0".into())
+        match self.env_drop_names.get(&key_with(r, &self.recursive)) {
+            Some(n) => n.clone(),
+            None => ice(r, "a closure environment with no interned drop"),
+        }
     }
 
     /// Every closure-env drop the program needs, as `(name, env tuple repr)`.
@@ -310,6 +332,11 @@ impl TypeTable {
     /// so anything that needs the shape — a layout, a refcount walk — goes through here.
     pub fn resolve<'a>(&'a self, r: &'a Repr) -> &'a Repr {
         match r {
+            // CORRECT DEFAULT: a back-edge naming a type the table does not hold stays a
+            // back-edge, and every caller then refuses rather than guessing — `c_type` ices
+            // on an unresolved `Recursive`, `eq_expr` and `hash_expr` ice, and
+            // `rc_parts_rec` stops on the `seen` chain. Returning `r` keeps that one
+            // decision in the callers instead of inventing a shape here.
             Repr::Recursive(ty) => self.recursive.get(ty).unwrap_or(r),
             _ => r,
         }
@@ -337,6 +364,68 @@ impl TypeTable {
     pub fn boxed_shape(&self, r: &Repr) -> Option<(&str, &Repr)> {
         let Repr::BoxedRec(atom) = r else { return None };
         Some((self.boxed_names.get(atom)?, self.boxed.get(atom)?))
+    }
+
+    /// The name a boxed value's type tag is derived from. It has to agree with what an
+    /// `is Name` test asks for, so a nominal record uses its own name and a primitive its
+    /// spelling in the language.
+    ///
+    /// A method rather than a free function because a *recursive* record is a
+    /// `BoxedRec(atom)` — an atom id and nothing else — and only the type table can turn
+    /// that back into the name the source wrote. It could not, and the old catch-all
+    /// answered with the structural key `P3`: `let a: any = Node { .. }; a is Node` was
+    /// silently `false` for every self-referencing record while a flat one answered `true`.
+    pub fn type_tag_name(&self, r: &Repr) -> String {
+        match r {
+            Repr::I64 => "i64".into(),
+            Repr::F64 => "f64".into(),
+            Repr::Bool => "bool".into(),
+            Repr::Str => "str".into(),
+            Repr::Null => "null".into(),
+            Repr::Unit => "unit".into(),
+            Repr::Tag => "atom".into(),
+            Repr::List(_) => "List".into(),
+            Repr::Map(_, _) => "Map".into(),
+            Repr::Closure { .. } => "fn".into(),
+            Repr::Record { name: Some(n), .. } => n.clone(),
+            Repr::Nullable(inner) => self.type_tag_name(inner),
+            // A back-edge names a type without describing it; tag the type it names, so a
+            // `mu` type and its unfolding agree on one tag.
+            Repr::Recursive(_) => {
+                let resolved = self.resolve(r);
+                if matches!(resolved, Repr::Recursive(_)) {
+                    key(r)
+                } else {
+                    self.type_tag_name(resolved)
+                }
+            }
+            // A self-referencing record: the pointer carries no name, the table does.
+            Repr::BoxedRec(atom) => match self.boxed.get(atom) {
+                Some(Repr::Record { name: Some(n), .. }) => n.clone(),
+                _ => key(r),
+            },
+            // KNOWN GAP, and the reason this is not an `ice`. `Repr::Runtime` carries the
+            // *C symbol* from `@runtime("neon_resource")`, not the Neon name `Resource`,
+            // so there is nothing here to name the type with and `a is Resource` on an
+            // erased runtime-backed value answers `false`. Closing it means carrying the
+            // nominal name on the repr, in `ir/repr.rs`.
+            Repr::Runtime { .. } => key(r),
+            // Anonymous shapes have no name to test against; their structure is the
+            // identity, and `variant_name` in c.rs asks the same question the same way, so
+            // the two sides of an `is` still agree.
+            Repr::Record { name: None, .. } | Repr::Tuple(_) | Repr::Union(_) => key(r),
+            // Unreachable rather than merely unused: `coerce_expr` tags the *source* of a
+            // box, which is always a concrete value, and `variant_name` filters these out
+            // before asking. Naming them anyway keeps the match exhaustive.
+            Repr::Any => "any".into(),
+            Repr::Never => "never".into(),
+            Repr::Var(_) => ice(r, "a type variable being given a type tag"),
+        }
+    }
+
+    /// The type tag stored in a box for a given repr.
+    pub fn type_tag(&self, r: &Repr) -> u64 {
+        fnv1a(&self.type_tag_name(r))
     }
 
     /// The C type for a repr. Aggregates resolve to their struct name (by value); runtime
@@ -445,16 +534,21 @@ impl TypeTable {
         match repr {
             // The heap wrapper for a by-value cycle. The header is first, so the pointer
             // doubles as a `neon_header*` and refcounting needs no offset.
+            // Skipping on a miss emitted the forward `typedef` and no definition, so every
+            // use of the wrapper became an incomplete type and `cc` reported the *uses*
+            // rather than the missing layout. `register` puts the name and the shape into
+            // their tables together, so a miss means those two have drifted.
             Repr::BoxedRec(atom) => {
-                if let Some(shape) = self.boxed.get(atom) {
-                    if let Some(sname) = self.names.get(&key_with(shape, &self.recursive)) {
-                        self.emit_one(out, &sname.clone(), shape, done);
-                    }
-                    let _ = writeln!(out, "struct {name} {{");
-                    let _ = writeln!(out, "    neon_header header;");
-                    let _ = writeln!(out, "    {} value;", self.c_type(shape));
-                    let _ = writeln!(out, "}};");
+                let Some(shape) = self.boxed.get(atom) else {
+                    ice(repr, "a boxed record whose pointee layout was never registered")
+                };
+                if let Some(sname) = self.names.get(&key_with(shape, &self.recursive)) {
+                    self.emit_one(out, &sname.clone(), shape, done);
                 }
+                let _ = writeln!(out, "struct {name} {{");
+                let _ = writeln!(out, "    neon_header header;");
+                let _ = writeln!(out, "    {} value;", self.c_type(shape));
+                let _ = writeln!(out, "}};");
             }
             Repr::Record { name: nominal, fields } => {
                 if let Some(n) = nominal {
@@ -503,28 +597,6 @@ fn is_boxable(r: &Repr) -> bool {
     !matches!(r, Repr::Any | Repr::Never | Repr::Var(_) | Repr::Recursive(_))
 }
 
-/// The name a boxed value's type tag is derived from. It has to agree with what an
-/// `is Name` test asks for, so a nominal record uses its own name and a primitive its
-/// spelling in the language.
-pub fn type_tag_name(r: &Repr) -> String {
-    match r {
-        Repr::I64 => "i64".into(),
-        Repr::F64 => "f64".into(),
-        Repr::Bool => "bool".into(),
-        Repr::Str => "str".into(),
-        Repr::Null => "null".into(),
-        Repr::Unit => "unit".into(),
-        Repr::Tag => "atom".into(),
-        Repr::List(_) => "List".into(),
-        Repr::Map(_, _) => "Map".into(),
-        Repr::Closure { .. } => "fn".into(),
-        Repr::Record { name: Some(n), .. } => n.clone(),
-        Repr::Nullable(inner) => type_tag_name(inner),
-        // Anonymous shapes have no name to test against; their structure is the identity.
-        other => key(other),
-    }
-}
-
 /// FNV-1a, the same 64-bit hash the atom tags use.
 pub fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -533,11 +605,6 @@ pub fn fnv1a(s: &str) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
-}
-
-/// The type tag stored in a box for a given repr.
-pub fn type_tag(r: &Repr) -> u64 {
-    fnv1a(&type_tag_name(r))
 }
 
 /// A record field name, escaped so it is always a valid C identifier and never collides
@@ -597,6 +664,10 @@ fn key_with(r: &Repr, rec: &HashMap<TyId, Repr>) -> String {
         Repr::Record { name, fields } => {
             let body: Vec<String> =
                 fields.iter().map(|(n, r)| format!("{n}={}", key(r))).collect();
+            // CORRECT DEFAULT: an anonymous record has no name, and the empty string is
+            // its name in the key. Two records share a C struct iff their keys match, and
+            // a structural record must not collide with a nominal one that happens to have
+            // the same fields — `R[..]` and `RUser[..]` differ, which is the whole point.
             format!("R{}[{}]", name.as_deref().unwrap_or(""), body.join(","))
         }
         Repr::Tuple(elems) => {

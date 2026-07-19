@@ -32,6 +32,7 @@ basics/comments.neon
 basics/float_literals.neon
 basics/hello.neon
 basics/int_literals.neon
+basics/io_print_variants.neon
 basics/let_binding.neon
 basics/null_literal.neon
 basics/rebind_writes_through_scope.neon
@@ -73,6 +74,7 @@ collections/map_index_missing_key_traps.neon
 collections/map_iteration.neon
 collections/map_list_key.neon
 collections/map_set_does_not_mutate_base.neon
+collections/map_union_key.neon
 collections/nested_list_value_semantics.neon
 collections/stdlib_breadth.neon
 control/for_break_continue.neon
@@ -91,6 +93,9 @@ control/loop_break_value_union.neon
 control/nested_loops.neon
 control/while_break_continue.neon
 control/while_condition_false_never_runs.neon
+control/while_is_guard_on_nullable.neon
+control/while_is_guard_on_record_chain.neon
+control/while_is_guard_still_discriminates.neon
 control/while_loop.neon
 errors/bare_throwing_call_fails.neon
 errors/catch_internal_match.neon
@@ -171,6 +176,12 @@ operators/union_field_equality.neon
 operators/union_vs_union_equality.neon
 operators/unordered_shapes_are_rejected.neon
 operators/unordered_union_is_rejected.neon
+paths/components.neon
+paths/extension.neon
+paths/join.neon
+paths/normalize.neon
+paths/parent_and_file_name.neon
+paths/starts_with.neon
 protocols/ambiguity_resolved_by_qualification.neon
 protocols/ambiguous_call.neon
 protocols/declare_and_impl.neon
@@ -201,6 +212,7 @@ records/value_and_heap_records_same_semantics.neon
 records/value_record_through_any.neon
 resources/resource_cleanup_runs_at_last_use.neon
 resources/resource_lifecycle.neon
+resources/resource_with_refcounted_payload.neon
 strings/interpolation_basic.neon
 strings/interpolation_display.neon
 strings/interpolation_literal_braces.neon
@@ -220,10 +232,12 @@ types/atom_not_in_union_rejected.neon
 types/atom_singleton_type.neon
 types/atom_union.neon
 types/atom_union_mixed_with_other_types.neon
+types/erased_recursive_record_keeps_its_name.neon
 types/generic_record_covariant.neon
 types/generics_are_covariant.neon
 types/intersection_flattens.neon
 types/intersection_requires_every_operand.neon
+types/is_against_a_type_outside_the_union.neon
 types/is_narrows_the_binding.neon
 types/missing_field_non_nullable_rejected.neon
 types/missing_field_satisfies_nullable_field.neon

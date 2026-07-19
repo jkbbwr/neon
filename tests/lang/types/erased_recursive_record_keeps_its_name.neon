@@ -1,0 +1,30 @@
+// A self-referencing record erased into `any` still answers `is` by its own name.
+//
+// A recursive record is heap-boxed, so its repr is an atom id rather than a named
+// record. The type tag written into the box was therefore derived from the
+// structural key (`P3`) instead of from `Node`, and `a is Node` came back `false`
+// for every self-referencing record. A flat record alongside it answered `true`,
+// which is what kept the gap invisible.
+//
+// The erased values are passed as arguments rather than bound, because a `let x:
+// any = <recursive record>` currently leaks its box — a separate refcount bug, and
+// not the one this file is about.
+
+use std::io;
+
+record Node {
+    v: i64,
+    next: Node | null,
+}
+
+record Flat { v: i64 }
+
+fn is_node(a: any) -> bool { a is Node }
+fn is_flat(a: any) -> bool { a is Flat }
+
+fn main() {
+    io::println("#{is_node(Node { v: 1, next: null })}");
+    io::println("#{is_flat(Node { v: 1, next: null })}");
+    io::println("#{is_flat(Flat { v: 2 })}");
+    io::println("#{is_node(Flat { v: 2 })}");
+}

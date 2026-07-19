@@ -67,6 +67,10 @@ struct ValueData {
     ty: TyId,
 }
 
+/// A basic block: parameters in, straight-line instructions, one terminator. Parameters
+/// are where this IR puts what a φ-based IR puts at the top of a block, and the arguments
+/// live on the *edge* (`Target`), so a value merged from two predecessors is named once and
+/// a pass can insert code on one incoming edge without disturbing the other.
 #[derive(Debug, Clone)]
 pub struct Block {
     pub id: BlockId,
@@ -111,6 +115,9 @@ pub enum PrimOp {
     Bnot,
 }
 
+/// What an instruction does. Deliberately close to what a C emitter can print in one line:
+/// there is no addressing, no allocation op and no control flow here — control flow is
+/// `Term`, and the refcount pass is the only thing that adds `Retain`/`Release`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     ConstI64(i64),
@@ -173,6 +180,11 @@ pub struct Target {
     pub args: Vec<Value>,
 }
 
+/// How a block ends. Exactly one per block, and every block has one — a block under
+/// construction carries `Unreachable` until `Builder::terminate` replaces it, so the IR is
+/// never in a state with a missing terminator.
+///
+/// `Ret(None)` is a function returning nothing (a `Unit` return), not a missing value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
     Ret(Option<Value>),
@@ -195,6 +207,8 @@ pub enum SwitchKey {
     Nominal(String),
 }
 
+// `Value` and `BlockId` are dense indices into `values` and `blocks`, minted only by
+// `Builder`, so these lookups index directly and panic on an id from another function.
 impl Func {
     pub fn value_repr(&self, v: Value) -> &Repr {
         &self.values[v.0 as usize].repr
@@ -205,6 +219,9 @@ impl Func {
     pub fn block(&self, id: BlockId) -> &Block {
         &self.blocks[id.0 as usize]
     }
+    /// Every value the function defines — instruction results, block parameters, and the
+    /// unemitted `Never` values lowering mints for diverging expressions — in mint order.
+    /// A pass wanting only the live ones must filter; nothing here prunes.
     pub fn values(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.values.len() as u32).map(Value)
     }
@@ -223,6 +240,8 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// A builder with its entry block already made, so `BlockId(0)` is always the entry and
+    /// callers can add the function's parameters to it before any lowering happens.
     pub fn new(name: impl Into<String>, ret: Repr) -> Self {
         let entry = Block {
             id: BlockId(0),
@@ -254,14 +273,18 @@ impl Builder {
         self.values[v.0 as usize].ty
     }
 
-    /// A fresh empty block.
+    /// A fresh empty block. It starts `Unreachable` and does not become current: lowering
+    /// routinely mints a join before it has anything to put in it, and `Unreachable` is the
+    /// honest state for a block nothing has jumped to or filled in yet.
     pub fn new_block(&mut self) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
         self.blocks.push(Block { id, params: vec![], insts: vec![], term: Term::Unreachable });
         id
     }
 
-    /// Add a parameter to a block and return its value.
+    /// Add a parameter to a block and return its value. Parameters are appended, so every
+    /// predecessor's `Target::args` must be built in the same order they were added here —
+    /// there is no name to check them against.
     pub fn block_param(&mut self, block: BlockId, repr: Repr, ty: TyId) -> Value {
         let v = self.value(repr, ty);
         self.blocks[block.0 as usize].params.push(v);
@@ -289,7 +312,9 @@ impl Builder {
         self.blocks[self.current.0 as usize].insts.push(Inst { result: None, op });
     }
 
-    /// Finish the current block with a terminator.
+    /// Finish the current block with a terminator. This overwrites whatever was there, so
+    /// a caller lowering a form that may already have terminated (a body ending in
+    /// `return`) must check `Lower::terminated` first rather than relying on this.
     pub fn terminate(&mut self, term: Term) {
         self.blocks[self.current.0 as usize].term = term;
     }
@@ -304,7 +329,10 @@ impl Builder {
         self.finish_impl(params, Some(env))
     }
 
-    /// Record that this function throws, so its result becomes a tagged union.
+    /// Record that this function throws, so its result becomes the tagged
+    /// `Union([ret, err])` that `Func::result_repr` spells out. `err` must never be
+    /// `Repr::Never`: a `never` clause means the function does not throw, and setting it
+    /// anyway would tag a result the callers read untagged.
     pub fn set_throws(&mut self, err: Repr) {
         self.throws = Some(err);
     }

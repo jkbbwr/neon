@@ -4,9 +4,8 @@
 // `Map[K, V]` is not a functor over one parameter, so it iterates through
 // `map::values`/`map::keys` first. See docs/design/stdlib.md.
 //
-// Declared here rather than in the prelude: nothing about it is syntax. The impl below is
-// not an orphan because this module owns the protocol, even though `List` does not live
-// here.
+// The impl below is not an orphan: `List` is declared in the prelude, but this module owns
+// the protocol, and owning either end is enough.
 protocol Mappable for C[_] {
     fn map[T, U](c: C[T], f: (T) -> U) -> C[U]
     fn filter[T](c: C[T], keep: (T) -> bool) -> C[T]
@@ -41,9 +40,13 @@ impl Mappable for List {
     }
 }
 
-// Immutable lists. Every operation returns a new list; these are values, which is
-// what makes their generic argument covariant. `rc == 1` reuse makes the copy free
-// when the input is uniquely owned.
+// Immutable lists. Every operation returns a new list; these are values, which is what
+// makes their generic argument covariant.
+//
+// The copy is not always paid for. A uniquely owned list (`rc == 1`) is updated in place,
+// so `push` in a loop is amortised O(1) as long as the old binding is not kept. Hold on to
+// the input as well and every `push` copies the whole list, which turns that loop
+// quadratic -- the one performance cliff in this module worth knowing about.
 
 @pure @native("neon_list_new") fn new[T]() -> List[T]
 // Preallocate capacity for `n` elements to avoid regrowth while building.
@@ -51,7 +54,7 @@ impl Mappable for List {
 @pure @native("neon_list_len") fn len[T](xs: List[T]) -> i64
 
 // The unchecked primitives. A native cannot build the tagged result a throwing function
-// returns, nor construct an `IndexError` — both are program-specific layouts codegen owns.
+// returns, nor construct an `IndexError` -- both are program-specific layouts codegen owns.
 // So the native does the unchecked operation and the check lives here, in the language,
 // where the error record is declared and its message can name the offending index.
 internal mod raw {
@@ -110,8 +113,9 @@ fn sort_by[T](xs: List[T], cmp: (T, T) -> Ordering) -> List[T] {
     }
 }
 
-// Merge two lists that are each already sorted by `cmp`. `sort_by`'s inner loop, and
-// useful on its own.
+// Merge two lists that are each already sorted by `cmp`. `sort_by`'s combining step,
+// exposed because it is useful on its own. Passing unsorted input is not an error and not
+// checked; it just gives you an unsorted result.
 fn merge[T](a: List[T], b: List[T], cmp: (T, T) -> Ordering) -> List[T] {
     let out: List[T] = [];
     let i = 0;
@@ -140,7 +144,8 @@ fn merge[T](a: List[T], b: List[T], cmp: (T, T) -> Ordering) -> List[T] {
 //
 // `contains` and `index_of` compare with `==`, which is structural on every type but a
 // closure and needs no bound (equality is total by design -- see docs/decisions.md), so
-// neither takes a `where`.
+// neither takes a `where`. Both walk the whole list even once the answer is settled: they
+// are O(n) on a hit as well as a miss.
 
 fn is_empty[T](xs: List[T]) -> bool {
     len(xs) == 0

@@ -1,4 +1,17 @@
 //! The Neon compiler: source -> C11.
+//!
+//! The pipeline runs front to back in the order the modules are listed below:
+//! `lexer` turns bytes into tokens plus a side table of trivia; `parser` turns
+//! tokens into `ast`; `expand` and `stdlib` supply and rewrite declarations;
+//! `typecheck` resolves and checks them; `ir` lowers to SSA, chooses
+//! representations and inserts reference counting; `backend` emits C11.
+//! `diagnostic` renders errors from any stage, and `format` is the one consumer
+//! that runs the front half for its own sake rather than to compile.
+//!
+//! `ops` sits outside that chain on purpose: it is the single operator
+//! precedence table, and both `parser` and `format` read it. Neither keeps a
+//! copy, because when they did the formatter reprinted `1 - (2 - 3)` as
+//! `1 - 2 - 3` — a silent change of meaning dressed up as a cosmetic one.
 
 pub mod ast;
 pub mod backend;
@@ -12,7 +25,8 @@ pub mod parser;
 pub mod stdlib;
 pub mod typecheck;
 
-/// Placeholder for the pipeline entry point.
+/// The crate version, baked in at compile time. Nothing in the workspace calls
+/// this yet; it exists so the CLI has a version to print once it wants one.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

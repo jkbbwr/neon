@@ -1,0 +1,50 @@
+// The counterpart to the two nullable-guard tests: `is` as a loop guard must
+// still SELECT, not merely stop. A tagged union's `is` picks the variant it
+// names, a concrete value's `is` answers by identity, and both re-evaluate each
+// iteration as the loop rebinds the scrutinee — so a state machine driven by
+// `while state is Running` visits every state exactly once.
+
+use std::io;
+use std::string;
+
+record Running { step: i64 }
+record Paused { step: i64 }
+record Done { total: i64 }
+
+type State = Running | Paused | Done
+
+fn advance(s: Running) -> State {
+    if s.step >= 3 { Done { total: s.step } } else { Running { step: s.step + 1 } }
+}
+
+fn main() {
+    // The union guard fires on each of the three Running states, then stops at Done.
+    let state: State = Running { step: 1 };
+    while state is Running {
+        let r = state as Running;
+        io::println(to_string(r.step));
+        state = advance(r);
+    };
+    io::println(to_string(state is Done));
+    io::println(to_string(state is Running));
+    io::println(to_string((state as Done).total));
+
+    // A variant the union never reached is still a real negative answer.
+    io::println(to_string(state is Paused));
+
+    // A value of one concrete record type is not some other record type.
+    let only: Running = Running { step: 7 };
+    io::println(to_string(only is Running));
+    io::println(to_string(only is Paused));
+
+    // A guard that is false on the first test runs the body zero times, and the
+    // scrutinee keeps its original variant.
+    let start: State = Paused { step: 0 };
+    let ran = 0;
+    while start is Running {
+        ran = ran + 1;
+        start = advance(start as Running);
+    };
+    io::println(to_string(ran));
+    io::println(to_string(start is Paused));
+}

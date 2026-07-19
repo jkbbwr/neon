@@ -1,5 +1,13 @@
-// Console output. Every function here bottoms out in the runtime; the bodies live
-// in libneon_rt, and these are the signatures the checker resolves against.
+// Console output. There are no bodies here: each `@native` names a symbol in libneon_rt,
+// and this file is only the signature the checker resolves against.
+//
+// Output is C stdio, so stdout is line-buffered to a terminal and block-buffered to a
+// pipe, while stderr is not. Redirect a program that uses both and its interleaving will
+// not match what the terminal showed you.
+//
+// Only `println` is implemented. `print` and `eprintln` name symbols libneon_rt does not
+// define, so a program that calls either fails at link time rather than at compile time --
+// the checker sees a well-formed native declaration and has nothing to object to.
 
 @native("neon_io_println") fn println(s: str)
 @native("neon_io_print") fn print(s: str)

@@ -1,3 +1,26 @@
+//! Everything the grammar ignores and the formatter must not lose.
+//!
+//! Comments and the file's line table live here as side tables keyed by byte
+//! offset, deliberately outside the token stream. That split is what lets the
+//! parser's alphabet be exactly the grammar's — no rule has to tolerate a
+//! comment appearing between any two symbols — while `neon fmt` still sees
+//! every one of them.
+//!
+//! Whitespace is *not* recorded. The formatter does not need to know where the
+//! spaces were, only where the author put line breaks, and that is recoverable
+//! from `line_starts` plus the spans it already has: `line_of` turns an offset
+//! into a line, `blank_lines_between` recovers the separation the author chose
+//! between two items, and the formatter's `is_broken` asks whether a construct
+//! spanned lines. Storing whitespace runs would be more data saying the same
+//! thing, and would have to be kept in sync with the spans.
+//!
+//! Attachment is decided by the formatter, not here: a `Trivia` knows its own
+//! extent and nothing about what it belongs to. The formatter walks the AST in
+//! source order and flushes every comment ending before the item it is about to
+//! print, which is why comments come out in the right place without anything
+//! ever computing an "owner" — and why nothing can be orphaned, since the final
+//! flush is unbounded.
+
 use super::token::Span;
 
 /// A comment. Trivia is everything the grammar ignores but the formatter must
@@ -39,6 +62,13 @@ pub struct Lexed {
 
 impl Lexed {
     /// 0-based line containing `offset`.
+    ///
+    /// The `i - 1` cannot underflow: `line_starts` always begins with 0, so an
+    /// insertion point of 0 would mean `offset` sorts before 0.
+    ///
+    /// An offset past the end of the file answers with the last line rather
+    /// than failing, which the formatter relies on — it asks about
+    /// `span.end`, one past the last byte, all over the place.
     pub fn line_of(&self, offset: usize) -> usize {
         match self.line_starts.binary_search(&offset) {
             Ok(i) => i,

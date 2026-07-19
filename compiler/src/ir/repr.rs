@@ -70,8 +70,17 @@ pub enum Repr {
     Union(Vec<Repr>),
     /// `T | null` where `T` is pointer-backed: a nullable pointer, `null` = null pointer.
     Nullable(Box<Repr>),
-    /// A rigid type variable, abstract until monomorphisation. A `repr_of` result of
-    /// `Var` in a fully monomorphic program is a bug the no-gaps test catches.
+    /// A rigid type variable, abstract until monomorphisation. A `Var` surviving into a
+    /// lowered program is always a substitution someone forgot, and two guards look for
+    /// it: `no_type_variable_survives_lowering` in `compiler/tests/ir_lower.rs`, which
+    /// scans every value's repr across the lowered corpus and names the offending function
+    /// and value, and `c_type`, which panics on a `Var` and so covers every compiled
+    /// program rather than only the corpus.
+    ///
+    /// Note what neither guard is: a check on `repr_of`. `repr_of` returning `Var` for a
+    /// type that still mentions a variable is correct and expected — that is what the
+    /// variant is for. The bugs were all downstream, in lowering calling `repr_of` where
+    /// it should have called `repr_of_ty`, so the test runs over the lowered IR instead.
     Var(String),
     /// A pointer to a heap-allocated recursive record, carried by its record *atom*. A
     /// record whose cycle closes entirely by value has no finite inline layout, so every
@@ -152,7 +161,14 @@ impl Repr {
     }
 }
 
-/// The representation of a type. Total: every `TyId` maps to a `Repr`.
+/// The representation of a type. Total: every `TyId` maps to a `Repr`, and the
+/// no-component case comes out as `Never` rather than as an absence a caller has to guess
+/// at — the absence is what the graveyard's `Erased` fallback grew out of.
+///
+/// Both cut sets are recomputed here on every call: two SCC passes over the whole type
+/// graph reachable from `ty`. They have to be, because both are properties of the graph
+/// rooted at this type rather than of the walk, and the results are identical for a given
+/// `ty` — so this is safe to call repeatedly, just not cheap in a hot loop.
 pub fn repr_of(t: &Types, ty: TyId) -> Repr {
     let cyclic = cycle_participants(t, ty);
     let boxed = boxed_atoms(t, ty);
@@ -398,6 +414,18 @@ fn value_atoms_of(t: &Types, ty: TyId, out: &mut Vec<u32>, seen: &mut HashSet<Ty
     }
 }
 
+/// Decompose a type into the reprs its constructors admit, then `combine` them.
+///
+/// The push order — scalars, tag, variable, records, tuples, arrows — is not incidental:
+/// it defines the canonical variant order of a union, and `variant_rank` exists only to
+/// reproduce it for reprs that arrive by substitution rather than from a `TyId`. Two
+/// orderings for one type mean two C structs the backend then refuses to assign between,
+/// so a new component belongs in both places at once.
+///
+/// This runs *below* the recursion cut: it calls `repr_rec` for every nested type, which
+/// is where a cyclic type becomes a back-edge. Calling `repr_of` for a nested type instead
+/// would restart the cut computation from a different root and produce a second, unequal
+/// repr for the same type.
 fn repr_components(t: &Types, ty: TyId, cyclic: &HashSet<TyId>, boxed: &HashSet<u32>) -> Repr {
     let d = t.data(ty);
 
@@ -528,6 +556,18 @@ fn record_intersection(t: &Types, atoms: &[u32], cyclic: &HashSet<TyId>, boxed: 
     Repr::Record { name, fields }
 }
 
+/// The layout of one record atom, in three tiers checked in order: a `@runtime`-backed
+/// type, then the two built-in containers, then an ordinary record laid out by its fields.
+///
+/// All three tiers dispatch on the atom's `#nominal` name. The first is table-driven —
+/// adding a runtime-backed type is a stdlib declaration, not a compiler edit — while
+/// `List` and `Map` are matched by literal name, so those two names are load-bearing here
+/// in a way no other type's is.
+///
+/// This never returns `BoxedRec`. Boxing is decided one level up, in `repr_components`,
+/// where the union path knows whether the atom is on a by-value cycle; here the atom is
+/// always laid out inline, which is exactly what `repr_shape` wants when it asks for a
+/// boxed record's pointee.
 fn record_repr(t: &Types, atom_idx: u32, cyclic: &HashSet<TyId>, boxed: &HashSet<u32>) -> Repr {
     let name = nominal_name(t, atom_idx);
 
@@ -585,6 +625,13 @@ fn nominal_name(t: &Types, atom_idx: u32) -> Option<String> {
     (!atoms.neg && atoms.names.len() == 1).then(|| t.name_str(atoms.names[0]).to_string())
 }
 
+/// One field of a record atom by literal name, for reading the reserved `#`-prefixed slots
+/// (`#0`, `#1`, `#inner`) that carry generic arguments and a newtype's payload.
+///
+/// `None` means the slot is absent, and callers treat that as `Repr::Never` rather than as
+/// an error — an uninstantiated `List` has no `#0`. `record_repr` also relies on the
+/// generic slots being numbered contiguously from `#0`, since it collects them with
+/// `map_while` and stops at the first gap.
 fn field_ty(t: &Types, atom_idx: u32, name: &str) -> Option<TyId> {
     t.rec_atoms[atom_idx as usize]
         .fields

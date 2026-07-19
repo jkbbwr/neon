@@ -1,0 +1,38 @@
+// The same guard shape over a nullable RECORD: `while cur is Node` walking a
+// linked list to its end. A `Node | null` is a nullable pointer exactly as
+// `str | null` is, so this is the case a `is <record name>` test has to get
+// right, and the one an intrusive list idiom depends on.
+
+use std::io;
+use std::string;
+
+record Node { value: i64, next: Node | null }
+
+fn main() {
+    let list: Node | null =
+        Node { value: 1, next: Node { value: 2, next: Node { value: 3, next: null } } };
+
+    let sum = 0;
+    let cur = list;
+    while cur is Node {
+        let node = cur as Node;
+        sum = sum + node.value;
+        cur = node.next;
+    };
+    io::println(to_string(sum));
+    io::println(to_string(cur is null));
+
+    // An empty chain runs the body zero times.
+    let empty: Node | null = null;
+    let count = 0;
+    while empty is Node {
+        count = count + 1;
+        empty = (empty as Node).next;
+    };
+    io::println(to_string(count));
+
+    // A nullable record holding a value is that record, and is not null.
+    let one: Node | null = Node { value: 9, next: null };
+    io::println(to_string(one is Node));
+    io::println(to_string(one is null));
+}

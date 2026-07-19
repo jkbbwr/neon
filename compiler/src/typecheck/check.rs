@@ -19,6 +19,9 @@ use super::types::TyId;
 use crate::ast::{self, BinOp, Expr, ExprKind, UnOp};
 use crate::lexer::Span;
 
+/// A single module at the root path. Only tests and callers with nothing else to check
+/// use this; a real compilation goes through `check_all` so the stdlib is checked into
+/// the same result.
 pub fn check_module(env: &mut Env, m: &ast::Module) -> (TypecheckResult, Vec<TypeError>) {
     check_all(env, &[(Vec::new(), m)])
 }
@@ -123,10 +126,16 @@ impl Checker<'_> {
         self.errors.push(TypeError { span, kind });
     }
 
+    /// A type as the user would write it, for a diagnostic. `&mut` because deciding
+    /// whether to print a type or its complement interns the complement.
     fn show(&mut self, t: TyId) -> String {
         print(&mut self.env.solver.t, t)
     }
 
+    /// The type an expression gets once it has already been reported on. It is a rigid
+    /// variable under an unwritable name, not `never` — `never` is below everything and
+    /// would check vacuously against whatever the expression flowed into, turning one
+    /// mistake into a soundness hole rather than one diagnostic.
     fn poison(&mut self) -> TyId {
         self.env.error_ty()
     }
@@ -152,6 +161,16 @@ impl Checker<'_> {
 
     // ---- declarations ----
 
+    /// Walk a module's declarations, checking every body there is one for. Signatures
+    /// themselves were resolved earlier, in `Env`'s declaration phase; nothing here
+    /// introduces a type, it only checks code against types already known. Nested `mod`s
+    /// recurse with the module path extended, because that path is what decides name
+    /// resolution and `internal`/`opaque` visibility for everything inside.
+    ///
+    /// A `test` block is checked as a function that may neither return nor throw: `ret`
+    /// and `throws` are both `never`, so a stray `return x` or an uncaught throw inside
+    /// one is a diagnostic rather than something with no enclosing signature to check
+    /// against.
     fn decls(&mut self, module: &[String], decls: &[ast::Decl]) {
         for d in decls {
             match &d.kind {
@@ -191,6 +210,20 @@ impl Checker<'_> {
         }
     }
 
+    /// Check one function body against its own signature.
+    ///
+    /// `outer` is the enclosing `impl`'s generics; they and the function's own are one
+    /// rigid set, because a method may mention either and neither is instantiated here.
+    /// Making them rigid rather than free is the point: inside the body `T` is opaque and
+    /// disjoint from every concrete type, which is what makes `x is i64` on a `T` a
+    /// reported mistake instead of a silently dead branch (see `narrow.rs`).
+    ///
+    /// The per-function state (`ret`, `throws`, `bounds`, `rigids`) is overwritten rather
+    /// than saved and restored, which is safe only because declarations do not nest —
+    /// a *lambda* is the case that does nest, and it saves and restores in `lambda`.
+    ///
+    /// A declaration with no body is a bare signature — a protocol method, say — and has
+    /// nothing to check.
     fn fn_body(&mut self, module: &[String], f: &ast::FnDecl, outer: &[String]) {
         let Some(body) = &f.body else { return };
 
@@ -230,7 +263,8 @@ impl Checker<'_> {
             })
             .collect();
 
-        // A body-less `-> ()` fn is a statement sequence; anything else must
+        // A fn returning `()` is a statement sequence -- its tail is whatever the last
+        // statement happened to be, and nothing may be required of it. Anything else must
         // produce its return type as the tail.
         let unit = self.env.solver.t.tuple(vec![]);
         let want = if ret == unit { None } else { Some(ret) };
@@ -240,12 +274,24 @@ impl Checker<'_> {
 
     // ---- scopes ----
 
+    /// Bind a name in the innermost frame. Shadowing is by push, not by replace: an
+    /// existing binding of the same name stays in place and `lookup` finds the newer one
+    /// because it scans each frame back to front. That is what lets a match arm rebind
+    /// the scrutinee to its narrowed type without losing the outer binding when the arm
+    /// ends.
+    ///
+    /// Silently does nothing when there is no frame, which only happens outside any
+    /// declaration.
     fn bind(&mut self, name: &str, t: TyId, span: Span) {
         if let Some(scope) = self.locals.last_mut() {
             scope.push((name.to_string(), t, span));
         }
     }
 
+    /// The nearest binding of `name`: innermost frame first, and within a frame the most
+    /// recent push. Locals only — a function of this name is `path`'s business, and the
+    /// order between the two is decided at each use site (`call` and `path` both try the
+    /// local first, so a local shadows a fn).
     fn lookup(&self, name: &str) -> Option<TyId> {
         self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(_, t, _)| *t)
     }
@@ -263,6 +309,13 @@ impl Checker<'_> {
 
     // ---- blocks and statements ----
 
+    /// A block's type is its tail's, or `()` when it has none. `expected` reaches only the
+    /// tail — the statements above it are checked on their own terms, since none of them
+    /// contributes to the value.
+    ///
+    /// The frame pushed here is what scopes `let`s to the block, and it is popped
+    /// unconditionally: nothing in the checker aborts a block early, so there is no path
+    /// that leaves a frame behind.
     fn block(&mut self, module: &[String], b: &ast::Block, expected: Option<TyId>) -> TyId {
         self.locals.push(vec![]);
         for s in &b.stmts {
@@ -276,10 +329,6 @@ impl Checker<'_> {
         t
     }
 
-    /// A bare `if` (no `else`) has no value, so it cannot fill a value position
-    /// whose expected type is unknown -- a binding without an annotation, or an
-    /// argument to a protocol method. Where the expected type is known, `if_expr`
-    /// rejects it against that type instead.
     /// True when `nt` is a newtype whose representation meets `other` -- so a cast
     /// between the two only wraps or unwraps. A newtype carries its representation as
     /// a hidden `#inner` field, a label no source can write, so its presence marks a
@@ -293,6 +342,11 @@ impl Checker<'_> {
         !self.env.solver.is_empty(meet)
     }
 
+    /// A bare `if` (no `else`) has no value, so it cannot fill a value position whose
+    /// expected type is unknown -- a binding without an annotation, or an argument to a
+    /// protocol method, where there is nothing yet to reject it against. Where the
+    /// expected type *is* known, `if_expr` rejects it against that type instead and this
+    /// is not called; calling both would report the same mistake twice.
     fn reject_bare_if(&mut self, e: &Expr) {
         if let ExprKind::If { else_: None, .. } = &e.kind {
             self.error(e.span.clone(), TypeErrorKind::IfWithoutElse);
@@ -306,6 +360,9 @@ impl Checker<'_> {
         Scope::new(module).with_rigid(self.env, &rigids)
     }
 
+    /// A statement produces no type; everything it does is bind names and emit
+    /// diagnostics. `ast::StmtKind::Error` is a parse error that already reported, and is
+    /// deliberately silent here so one bad statement costs one message.
     fn stmt(&mut self, module: &[String], s: &ast::Stmt) {
         match &s.kind {
             ast::StmtKind::Let { pat, ty, value } => {
@@ -354,6 +411,15 @@ impl Checker<'_> {
         }
     }
 
+    /// Bind whatever names a pattern introduces, given the type the subject already
+    /// narrowed to. This is binding only — the *test* a pattern performs is `arm_test`,
+    /// and by the time this runs the caller has already intersected the subject with it.
+    /// So `Is` and `Literal` bind nothing: they constrain, they do not name.
+    ///
+    /// Sub-patterns read through `project_field`/`project_elem` rather than the type
+    /// being deconstructed by hand, which is what makes destructuring a union work: the
+    /// projection takes the field over every variant that has it, and reports `Absent`
+    /// (never `never`) where none does.
     fn bind_pattern(&mut self, module: &[String], p: &ast::Pattern, t: TyId) {
         match &p.kind {
             ast::PatternKind::Bind(n) => self.bind(n, t, p.span.clone()),
@@ -416,6 +482,17 @@ impl Checker<'_> {
 
     // ---- expressions ----
 
+    /// The checking half of the bidirectional pair, and the only place `actual <:
+    /// expected` is enforced. Everything that wants a type checked goes through here
+    /// rather than calling `infer` directly, so no form can quietly skip the subtyping
+    /// rule; `check_record_fields` is the one exception, and it calls `infer` precisely
+    /// because it wants to report the mismatch as a *field* rather than as a bare type
+    /// pair.
+    ///
+    /// Because every expression is reached through here, it is also where the type is
+    /// recorded against the expression id for lowering to read back. `call` additionally
+    /// records the *callee's* type, which is not an expression `expr` ever visits when
+    /// the callee is a path.
     fn expr(&mut self, module: &[String], e: &Expr, expected: Option<TyId>) -> TyId {
         let t = self.infer(module, e, expected);
         if let Some(want) = expected {
@@ -449,6 +526,16 @@ impl Checker<'_> {
         t
     }
 
+    /// The synthesis half: what an expression's type is on its own terms.
+    ///
+    /// `expected` is passed in rather than only consulted afterwards because a handful of
+    /// forms genuinely need it to have a type at all — a lambda's unannotated parameters,
+    /// a list literal's element type, an empty list, a generic call's type arguments.
+    /// Everywhere else it is ignored here and the check happens in `expr`, which is why
+    /// this is not "inference" in the unifying sense: nothing is solved from a later use.
+    ///
+    /// Every arm returns a type. Where one cannot be worked out, the arm reports and
+    /// returns `poison`; there is no fallback type and no way to write one.
     fn infer(&mut self, module: &[String], e: &Expr, expected: Option<TyId>) -> TyId {
         match &e.kind {
             ExprKind::Int(_) => self.env.solver.t.i64(),
@@ -672,8 +759,6 @@ impl Checker<'_> {
 
             ExprKind::Lambda { params, body } => self.lambda(module, e, params, body, expected),
 
-            // Not yet: each needs something that does not exist. A guess here is
-            // exactly the fallback this design has no room for.
             ExprKind::RecordLit { path, fields, spread } => {
                 self.record_lit(module, e, path, fields, spread, expected)
             }
@@ -801,6 +886,20 @@ impl Checker<'_> {
         arrow
     }
 
+    /// A record literal, in one of three modes depending on what is known about it: named
+    /// (`Point { .. }`), anonymous against a known target, and anonymous with no target.
+    ///
+    /// Only the last synthesizes a structural type from the fields. The first two check
+    /// against a set of declared fields, and that is deliberate — the excess-field rule
+    /// (a field the target does not declare is an error) is only sound for a *fresh
+    /// literal*, where an unexpected name is a typo. The same record held in a variable
+    /// still widens by ordinary width subtyping, because there the extra field may be
+    /// exactly what its owner wanted. This is TypeScript's split, and it is why a literal
+    /// is not simply synthesized and then checked like everything else.
+    ///
+    /// A named path that fails to resolve, or resolves to something that is not a single
+    /// record, still walks the field values (so mistakes inside them are reported) and
+    /// then falls back to the expected type or poison rather than inventing a shape.
     fn record_lit(
         &mut self,
         module: &[String],
@@ -995,11 +1094,19 @@ impl Checker<'_> {
         self.env.solver.t.substitute(templated, &subst)
     }
 
+    /// What to call the target in a "no such field" diagnostic. By this point the target
+    /// is a bare field list with no name attached, so it is described by its labels --
+    /// `{x, y}` -- which is at least something the reader can match against what they
+    /// wrote. Not a printed type: the field *types* are noise in this message.
     fn record_name(&mut self, target: &[(String, TyId)]) -> String {
         let fs: Vec<String> = target.iter().map(|(n, _)| n.clone()).collect();
         format!("{{{}}}", fs.join(", "))
     }
 
+    /// Whether `null` is one of the values `ty` admits, and so whether a field of this
+    /// type may be left out of a literal. Read straight off the base bits rather than
+    /// asked as a subtyping question, which keeps it cheap and exact for the one thing it
+    /// is used for.
     fn is_nullable(&self, ty: TyId) -> bool {
         self.env.solver.t.data(ty).base & super::types::B_NULL != 0
     }
@@ -1091,6 +1198,17 @@ impl Checker<'_> {
         dispatch::resolve(self.env, "message", Some(proto), &[ty], None).is_ok()
     }
 
+    /// `try`, in all four shapes: with a `catch`, or as one of the propagate / soften /
+    /// assert forms.
+    ///
+    /// The sink is what makes this work. Pushing a frame onto `throw_sinks` means every
+    /// throwing call in the body lands here instead of being checked against the enclosing
+    /// function's clause, and the union of what landed is the error type. That union is
+    /// recorded against the expression id so lowering can give the handler a concrete
+    /// parameter rather than an erased one.
+    ///
+    /// A body that cannot fail leaves the sink empty and the bound error type `never`,
+    /// which is honest: there is no value for the catch to receive.
     fn try_expr(
         &mut self,
         module: &[String],
@@ -1175,14 +1293,41 @@ impl Checker<'_> {
     /// pattern; all of them land here. Holding and passing a value are deliberately not
     /// among them — opacity hides the contents, not the type.
     ///
-    /// Visible in the declaring module and its immediate parent, which is what
-    /// `RecordDecl::opaque` has always documented and what `std::fs`'s `internal mod raw`
-    /// depends on: the inner module declares the handle, the outer module implements the
-    /// API over it.
+    /// See `opacity_permits` for which modules count as inside.
     fn check_opaque_name(&mut self, module: &[String], span: Span, name: &str, what: &str) {
         let Some(owner) = self.env.opaque_record_named(module, name) else { return };
         let owner = owner.to_vec();
         self.report_opacity(module, span, name, what, owner);
+    }
+
+    /// Whether code in `module` may reach inside a record declared in `owner`.
+    ///
+    /// Three cases, and each is load-bearing:
+    ///
+    /// - the declaring module itself, obviously;
+    /// - **anything nested inside it**, because an `internal mod` is the implementation of
+    ///   the module around it and cannot implement a type it may not touch — `std::fs`
+    ///   builds its `File` inside `internal mod raw`;
+    /// - its **immediate parent**, for the mirror arrangement where the inner module
+    ///   declares the handle and the outer one implements the API over it.
+    ///
+    /// Only one level upward. Opacity that leaked to every ancestor would reach the root,
+    /// where every program's own module lives, and mean nothing.
+    ///
+    /// The root is not a container here, and that exception is the whole reason this is a
+    /// named function rather than an expression. The prelude's module path is `[]`, so
+    /// "nested inside the owner" is true of *every* module in the program — a
+    /// prelude-declared opaque record would be readable everywhere, which is the opposite
+    /// of what it asks for. The cost is that a record declared at a program's own root
+    /// cannot be reached from a module nested in it; the prelude and the user's root
+    /// currently share one path, so there is no way to permit the second without the
+    /// first. Giving the prelude a path of its own removes the exception.
+    fn opacity_permits(module: &[String], owner: &[String]) -> bool {
+        let nested_in_owner =
+            !owner.is_empty() && module.len() >= owner.len() && module[..owner.len()] == *owner;
+        let same = module == owner;
+        let immediate_parent = owner.len() == module.len() + 1 && owner[..module.len()] == *module;
+        same || nested_in_owner || immediate_parent
     }
 
     /// The same rule for a record the source *names*, where the written path resolves
@@ -1194,6 +1339,15 @@ impl Checker<'_> {
         self.report_opacity(module, span, &name, what, owner);
     }
 
+    /// The visibility rule itself, shared by both entry points so they cannot drift.
+    ///
+    /// `owner` is the module that declared the record. Access is allowed from that module
+    /// and from its immediate parent, and nowhere else — not from a sibling, and not from
+    /// a grandparent. The parent case is the one that carries weight: `std::fs`'s
+    /// `internal mod raw` declares the handle and the module above implements the public
+    /// API over it, which is only possible if the parent can see inside.
+    ///
+    /// An empty owner path is the prelude, which has no name to print.
     fn report_opacity(
         &mut self,
         module: &[String],
@@ -1202,9 +1356,7 @@ impl Checker<'_> {
         what: &str,
         owner: Vec<String>,
     ) {
-        let visible = module == owner.as_slice()
-            || (owner.len() == module.len() + 1 && owner[..module.len()] == *module);
-        if visible {
+        if Self::opacity_permits(module, &owner) {
             return;
         }
         let shown = if owner.is_empty() { "the prelude".to_string() } else { owner.join("::") };
@@ -1246,6 +1398,14 @@ impl Checker<'_> {
         }
     }
 
+    /// A name in value position, resolved local-then-function. A single-segment path may
+    /// be a local, and a local shadows a function of the same name; anything qualified
+    /// can only be a function.
+    ///
+    /// Note the order of the two failure paths: a name that exists but is `internal` to
+    /// another module reports *that*, before the generic "not in scope". Reporting the
+    /// generic one first sent people looking for a typo in a name they had spelled
+    /// correctly.
     fn path(&mut self, module: &[String], e: &Expr, p: &[String]) -> TyId {
         if let [one] = p {
             if let Some(t) = self.lookup(one) {
@@ -1268,6 +1428,14 @@ impl Checker<'_> {
         self.poison()
     }
 
+    /// Binary operators. Most of them are not really "binary" at the type level: `|>`
+    /// rewrites into a call, `and`/`or` demand `bool` on both sides, `orelse` performs a
+    /// set subtraction, and only the arithmetic and bitwise fallthrough treats the two
+    /// operands as the same type.
+    ///
+    /// That fallthrough accepts any pair where one side is assignable to the other and
+    /// yields the *left* type. It does not consult a numeric protocol, so `str + i64` is
+    /// caught only because the two are unrelated, not because addition was checked.
     fn binary(&mut self, module: &[String], e: &Expr, op: BinOp, lhs: &Expr, rhs: &Expr, expected: Option<TyId>) -> TyId {
         match op {
             BinOp::And | BinOp::Or => {
@@ -1276,9 +1444,6 @@ impl Checker<'_> {
                 self.expr(module, rhs, Some(b));
                 b
             }
-            // Equality is total: any two values may be compared, disjoint ones are
-            // simply not equal. `:ok == :err` is false, not an error, and that is
-            // what makes an atom union behave like a sum type.
             // Equality needs comparable operands: they overlap, or both are atoms
             // (which form one comparison domain). `:ok == :err` is false, but
             // `:ok == "ok"` compares an atom to a string, which is a mistake.
@@ -1360,6 +1525,14 @@ impl Checker<'_> {
         }
     }
 
+    /// An `if`. With both arms it is the union of them; with only a `then` it yields
+    /// `()`, and whether that is acceptable is decided against the expected type here
+    /// rather than by the caller.
+    ///
+    /// The expected type flows into *both* arms, not into their union afterwards. That is
+    /// what lets each arm use it — a lambda in one arm gets its parameter types — and it
+    /// means an arm is reported against what was asked for rather than against whatever
+    /// the other arm happened to produce.
     fn if_expr(
         &mut self,
         module: &[String],
@@ -1391,6 +1564,20 @@ impl Checker<'_> {
         self.union_branches(a, c)
     }
 
+    /// A `match`: narrowing, binding and exhaustiveness in one left-to-right pass.
+    ///
+    /// The whole thing turns on `remaining`, the residual of the subject after the arms
+    /// above have peeled off what they cover. An arm binds against `remaining ∧ its
+    /// test`, not against the full subject, which is why a bare binding following an
+    /// `is null` arm receives the non-null half; and exhaustiveness is not a separate
+    /// analysis but simply `remaining` having gone empty by the end, with whatever is
+    /// left over naming exactly the values no arm handled.
+    ///
+    /// Only an exact, unguarded arm subtracts anything — see `narrow::Test`. `bool` needs
+    /// a special case on top of that, because it is a single base bit rather than
+    /// `:true | :false`, so a `true` arm's type is the whole of `bool` and subtracting it
+    /// would wrongly exhaust the type after one arm. The two literals are tracked by hand
+    /// instead and `bool` is subtracted only once both have been seen unguarded.
     fn match_expr(
         &mut self,
         module: &[String],
@@ -1519,6 +1706,13 @@ impl Checker<'_> {
         f.pat.as_ref().is_none_or(Self::pat_irrefutable)
     }
 
+    /// Whether a pattern matches every value of the type it is applied to. A literal or
+    /// an `is` can reject, so anything containing one is refutable; a bind, a wildcard and
+    /// aggregates built only out of those cannot.
+    ///
+    /// This decides *exactness*, not well-typedness: a refutable arm still binds and still
+    /// checks, it just subtracts nothing from the fallthrough, so `Circle { r: 0 }` leaves
+    /// the other Circles to be handled.
     fn pat_irrefutable(p: &ast::Pattern) -> bool {
         match &p.kind {
             ast::PatternKind::Bind(_) | ast::PatternKind::Wildcard => true,
@@ -1528,6 +1722,25 @@ impl Checker<'_> {
         }
     }
 
+    /// A call. The callee decides which of four machines runs, and the order they are
+    /// tried in is the language's shadowing rule made concrete: a local shadows a module
+    /// function, which shadows protocol dispatch.
+    ///
+    /// - a non-path callee (a lambda, a parenthesised call, a field holding a function)
+    ///   is `apply`: callable iff its type is an arrow;
+    /// - a single-segment path bound as a local is `apply` too — a first-class function
+    ///   value being called, not a name in the fn table;
+    /// - a resolvable function name is `direct_call`, which knows about generics,
+    ///   `where` bounds and declared `throws`;
+    /// - anything left goes to protocol dispatch on the argument types.
+    ///
+    /// Arguments are checked in whichever branch is taken, so each is visited exactly
+    /// once — except in a generic direct call, which checks them twice by design and
+    /// relies on `check_all`'s deduplication to keep that from doubling diagnostics.
+    ///
+    /// The `x.f(..)` probe at the top exists because Neon has no method-call syntax. If
+    /// `f` is not a field of `x`, the user meant a method, and saying so beats letting it
+    /// fail as a missing field.
     fn call(
         &mut self,
         module: &[String],
@@ -1626,6 +1839,20 @@ impl Checker<'_> {
         }
     }
 
+    /// A call of a named function whose signature is already known.
+    ///
+    /// The non-generic case is simply flowing each parameter type down as the argument's
+    /// expected type, which is what makes `map(xs, (x) => x + 1)` give `x` a type.
+    ///
+    /// The generic case solves the type parameters first (`solve_generics`) and then
+    /// re-checks every argument under the substitution. Checking twice is the price of
+    /// having an expected type available for arguments that need one, and it is why
+    /// `check_all` deduplicates the finished error list — the alternative was threading a
+    /// "probing, stay quiet" mode through every expression form.
+    ///
+    /// An arity mismatch is reported and then *continues*: the surplus or missing
+    /// arguments are still checked with no expected type, so a wrong count does not
+    /// suppress the mistakes inside the arguments themselves.
     fn direct_call(
         &mut self,
         module: &[String],
@@ -1794,6 +2021,10 @@ impl Checker<'_> {
         arrow.ret
     }
 
+    /// A `DispatchError` as a user-facing diagnostic. `NoImpl`'s payload is a `TyId` and
+    /// so has to be printed here: it is the part of the receiver with no impl, which for
+    /// a union is the variants that were missed rather than the whole union, leaving the
+    /// reader nothing to work out.
     fn dispatch_error(&mut self, span: Span, err: DispatchError) {
         let kind = match err {
             DispatchError::UnknownMethod(n) => TypeErrorKind::UnknownName(n),

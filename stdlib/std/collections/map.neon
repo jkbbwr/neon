@@ -1,14 +1,23 @@
-// Immutable maps. Like lists, every operation returns a new map.
+// Immutable maps. Like lists, every operation returns a new map, and a uniquely owned one
+// is updated in place, so the copy is only paid for when the input is actually shared.
+//
+// Unordered. `keys` and `values` walk the table's slots, so their order is a function of
+// the hash, not of insertion, and it can change when a `set` grows the table. What does
+// hold is that the two agree: `keys(m)[i]` and `values(m)[i]` are the same entry. Sort the
+// keys if you need a stable order.
 
 @pure @native("neon_map_new") fn new[K, V]() -> Map[K, V]
 @pure @native("neon_map_len") fn len[K, V](m: Map[K, V]) -> i64
-// Checked lookup. A native can build neither the tagged result nor a `KeyError`, so the
-// check and the error live here; `m[k]` traps on a missing key, which the check rules out.
-// Thrown by `get`. Owned by the module that throws it rather than by the prelude.
+// Thrown by `get`. A native can build neither the tagged result a throwing function
+// returns nor the error record itself -- both are layouts codegen generates per program --
+// so the record and the check both live here.
 record KeyError { message: str }
 impl Display for KeyError { fn to_string(v: KeyError) -> str { v.message } }
 impl Error for KeyError { fn message(v: KeyError) -> str { v.message } }
 
+// The checked form of `m[k]`, which traps on a missing key rather than throwing. Two
+// lookups: the `contains` probe and then the index. `get_or` costs the same and needs no
+// `try` -- reach for it when absence is expected.
 fn get[K, V](m: Map[K, V], k: K) throws KeyError -> V {
     if !contains(m, k) {
         throw KeyError { message: "key not present" };

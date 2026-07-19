@@ -1,3 +1,44 @@
+//! Tokens to AST, with chumsky combinators.
+//!
+//! Four decisions account for most of what looks unusual below.
+//!
+//! **The grammar is built once.** Every rule takes the sub-parsers it needs as
+//! arguments rather than calling the constructor for them, and `module` is the
+//! single place they are made. A rule that called `type_spec()` would get a
+//! private copy of that entire grammar: before this, the expression grammar was
+//! being constructed five times over and the type grammar fourteen. `.boxed()`
+//! is on nearly every rule for the same reason — without it the combinator
+//! types nest structurally and compile time grows superlinearly.
+//!
+//! **Precedence is not written here.** `binary_ops` iterates
+//! `crate::ops::BINARY_OPS`; the levels, the operators at each level and their
+//! spellings all come from that one table, which the formatter reads too. When
+//! the formatter had its own ladder it printed `1 - (2 - 3)` as `1 - 2 - 3`.
+//!
+//! **The parser prefers a diagnostic to a parse failure.** Constructs that are
+//! not in the language but that people will nevertheless type — `enum`,
+//! `p.f = e`, `xs[i] = e`, `(x,)` — are *parsed* and then rejected with an error
+//! saying what to write instead. A grammar that simply had no rule for them
+//! would produce a cascade about an unexpected token, which explains nothing.
+//! Those forms are the reason several rules parse more than the language allows.
+//!
+//! **Ambiguity is resolved by position, not by guessing.** Two cases: a record
+//! literal is switched off in condition position, where `while a { }` would
+//! otherwise read `a { }` as an empty record and then find no body (hence the
+//! separate `cond` grammar); and a block-like expression at the *start* of a
+//! statement is a statement rather than a binary operand, or `if a { } else { }`
+//! followed by a line beginning `-1;` would silently become one subtraction.
+//! Both are Rust's rules, and both are escaped the same way, with parentheses.
+//!
+//! Recovery is per-declaration: a bad declaration becomes `DeclKind::Error`
+//! spanning what was skipped, and parsing resumes at the next declaration
+//! keyword, so one syntax error does not cost the rest of the file. The
+//! `Some(module)` and non-empty error list cases are independent — a module
+//! containing `Error` nodes is returned alongside its errors, which is what lets
+//! a later stage report more than one problem per run. Callers that need a
+//! sound tree must check the error list, not just the `Option`; `format::format`
+//! is the model, refusing unless the errors are empty.
+
 mod error;
 
 #[cfg(test)]
@@ -13,6 +54,13 @@ use chumsky::prelude::*;
 
 type Extra = extra::Err<ParseError>;
 
+/// Parse a token stream. `eoi` is the source's byte length, used as the span of
+/// end-of-input so an error there points past the last byte rather than at
+/// offset 0.
+///
+/// The two halves of the result are independent. A `Some` module may still have
+/// errors — recovery leaves `Error` nodes in place of what it skipped — so a
+/// caller that needs a sound tree must check the error list as well.
 pub fn parse(tokens: &[Spanned], eoi: usize) -> (Option<Module>, Vec<ParseError>) {
     let owned: Vec<(Token, Span)> = tokens
         .iter()
@@ -205,6 +253,10 @@ where
 /// Whether a *given* body-less fn is legal is a question about its annotations
 /// and its context, which the parser does not have; a later pass rejects the
 /// rest with something better than a syntax error.
+///
+/// `_body_required` is consequently unread. It is kept so the call sites still
+/// record which positions mean to require a body, for whenever that check finds
+/// a home; changing it changes nothing today.
 fn fn_like<'t, I>(
     ty: impl P<'t, I, TypeSpec> + 't,
     throws: impl P<'t, I, TypeSpec> + 't,

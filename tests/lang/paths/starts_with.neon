@@ -1,0 +1,52 @@
+// `path::starts_with` compares COMPONENTS, not bytes. That is the whole reason it
+// exists next to `string::starts_with`: "/foobar" starts with the bytes "/foo" but is
+// not inside the directory "/foo", and that difference is a sandbox escape.
+//
+// It compares the paths AS WRITTEN — `..` is not resolved on either side — so a caller
+// doing a containment check normalises both first. The empty prefix matches everything
+// (it has no components to fail on), and an absolute prefix only matches an absolute
+// path, because "/" is a component only absolute paths have.
+
+use std::io;
+use std::path;
+use std::string;
+
+fn show(p: str, prefix: str) {
+    io::println("#{p} <- #{prefix} = #{path::starts_with(p, prefix)}");
+}
+
+fn main() {
+    // The byte-wise trap.
+    show("/foo/bar", "/foo");
+    show("/foobar", "/foo");
+    io::println("bytes say #{string::starts_with("/foobar", "/foo")}");
+
+    show("a/b/c", "a/b");
+    show("a/b/c", "a/b/c");     // a path starts with itself
+    show("a/b", "a/b/c");       // a longer prefix cannot match
+    show("a/b/c", "");          // everything starts with nothing
+    show("", "");
+    show("", "a");
+
+    // Separator spelling does not matter: both sides go through `components`.
+    show("a//b///c", "a/b");
+    show("a/b/c", "a//b/");
+    show("./a/b", "a");
+
+    // Absolute and relative do not mix, because "/" is a component.
+    show("/a/b", "a");
+    show("a/b", "/a");
+    show("/a/b", "/");
+    show("a/b", "/");
+    show("/", "/");
+
+    // Compared as written: `..` is not resolved.
+    show("/a/../b", "/b");
+    show(path::normalize("/a/../b"), "/b");
+
+    // The containment check, spelled out: normalise both, then compare.
+    let base = path::normalize("/srv/data/");
+    io::println("#{path::starts_with(path::normalize(path::join(base, "sub/file")), base)}");
+    io::println("#{path::starts_with(path::normalize(path::join(base, "../other")), base)}");
+    io::println("#{path::starts_with(path::normalize(path::join(base, "/etc/shadow")), base)}");
+}

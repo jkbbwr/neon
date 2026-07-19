@@ -10,14 +10,34 @@
 use super::ssa::{Op, Program};
 use std::collections::{HashMap, HashSet};
 
-/// Whether a native symbol has an observable effect: I/O, or a panic/abort. Everything
-/// else the runtime exposes (arithmetic, string and collection queries) is a pure
-/// function of its arguments.
+/// Whether a native symbol has an observable effect. A native's body is opaque to the
+/// compiler, so this is not an analysis: it reports what the declaration *claimed*.
+/// `pure_natives` is the set of symbols whose `@native` declaration also carried `@pure`,
+/// and everything outside it is effectful.
+///
+/// The polarity is the load-bearing part. Silence means effectful, so forgetting `@pure`
+/// costs an optimisation and nothing else, while a wrong `@pure` licenses DCE to delete a
+/// call that mattered. The rule this replaced inferred purity from the symbol's spelling
+/// and deleted a resource construction along with the cleanup that construction existed to
+/// schedule; the test at the bottom of this file pins the direction.
 pub fn native_is_effectful(symbol: &str, pure_natives: &HashSet<String>) -> bool {
     !pure_natives.contains(symbol)
 }
 
-/// The set of functions proven pure, by name. A name absent from the set is effectful.
+/// Purity for every function in the program, keyed by name. A name that is *absent* is not
+/// "unknown" but effectful: `op_is_effectful` reads a missing entry as false-purity, which
+/// is how a call to something outside the lowered program — a native, an instance that has
+/// not been monomorphised yet — stays un-eliminable.
+///
+/// The fixpoint starts optimistic and only ever removes purity, which is what lets
+/// recursion terminate *and* be classified usefully: a self- or mutually-recursive
+/// function is provisionally pure while its own body is examined, so a pure recursive
+/// function stays pure instead of demoting itself on the first look at its own call.
+/// Starting pessimistic would be sound but would mark every cycle effectful.
+///
+/// Keying by name means the mangled names monomorphisation produces must be distinct. Two
+/// functions sharing one would share a verdict — the merge lands on effectful if either is,
+/// so the result stays safe, but a pure instance would be needlessly pinned.
 pub fn analyze(program: &Program) -> HashMap<String, bool> {
     // Start optimistic (every function pure), then knock out any that do something
     // effectful or reach one that does, to a fixpoint. Monotone, so it converges.
@@ -47,6 +67,14 @@ pub fn analyze(program: &Program) -> HashMap<String, bool> {
 /// Whether an op has an effect that must be preserved -- so DCE may not drop it even if
 /// its result is unused, and CSE may not share it. `pure` maps each function to whether
 /// it is pure.
+///
+/// The catch-all `false` arm is what makes this cheap and also what makes it a place to be
+/// careful: allocation, projection, arithmetic and the comparison ops are genuinely pure
+/// functions of their operands, and `Retain`/`Release` land here too. Those two are never
+/// at risk from DCE despite the verdict, because they have no result and DCE only
+/// considers instructions whose result is unused — and refcount insertion runs after the
+/// optimiser regardless. `throw` is a terminator, not an `Op`, so it has no arm here and
+/// is never a deletion candidate.
 pub fn op_is_effectful(
     op: &Op,
     pure: &HashMap<String, bool>,

@@ -53,14 +53,29 @@ struct Printer<'a> {
     /// The ids being rendered, outermost first. An id reached while it is here is a
     /// cycle, and its index is its `mu` name.
     stack: Vec<TyId>,
+    /// Parallel to `stack`: whether that frame's id was reached again from inside, and so
+    /// needs a `mu` binder wrapped around it. Only a cycle that was actually taken gets
+    /// named, so a type that merely *could* recur still prints plainly.
     used: Vec<bool>,
+    /// Remaining node budget, shared across the whole rendering rather than per branch.
+    /// Sharing is the point: a type graph with heavy reuse is exponential to print, and
+    /// a per-branch cap would not bound the total.
     budget: usize,
 }
 
+/// Parenthesise a rendered part iff its own precedence is looser than the position
+/// demands. Everything that composes two renderings goes through here, so a printed type
+/// re-parses to the same type by construction rather than by anyone remembering to add
+/// brackets.
 fn at(min: u8, (s, p): (String, u8)) -> String {
     if p < min { format!("({s})") } else { s }
 }
 
+/// An n-ary operator: each part parenthesised at `inner`, the result carrying `outer`.
+///
+/// A single part is returned untouched, precedence and all. Wrapping it as if it were an
+/// operator would parenthesise `!:ok` inside a union that has nothing to separate it
+/// from.
 fn join(parts: Vec<(String, u8)>, sep: &str, inner: u8, outer: u8) -> (String, u8) {
     if parts.len() == 1 {
         return parts.into_iter().next().expect("len 1");
@@ -83,11 +98,25 @@ fn intersect(parts: Vec<(String, u8)>) -> (String, u8) {
     join(parts, " & ", P_NEGATE, P_INTERSECT)
 }
 
+/// A `mu` binder's name, from its depth in the render stack. Depth rather than a counter
+/// so the name is stable under retries and so nested binders cannot collide.
 fn mu_name(k: usize) -> String {
     format!("A{k}")
 }
 
 impl Printer<'_> {
+    /// One type, with the four escapes from non-termination applied in the order that
+    /// makes each one reachable.
+    ///
+    /// A cycle is checked first, because an id on the stack must become its `mu` name
+    /// however it is otherwise nameable. A declared name comes next, and deliberately
+    /// *before* the depth and budget caps: a named type is a leaf, so it should never be
+    /// the thing that gets truncated. Only then does the walk descend, spending a node of
+    /// budget and cutting to `<...>` when either limit is reached.
+    ///
+    /// The `mu` binder is emitted on the way out rather than on the way in, because
+    /// whether the cycle was actually taken is not known until the body has been
+    /// rendered.
     fn render(&mut self, id: TyId) -> (String, u8) {
         if let Some(k) = self.stack.iter().position(|&x| x == id) {
             self.used[k] = true;
@@ -117,11 +146,17 @@ impl Printer<'_> {
         }
     }
 
+    /// `render` followed by `at`: a nested type already placed at the precedence its
+    /// position requires. Callers that build syntax with fixed delimiters around it — a
+    /// bracket, a brace, a comma — pass `P_ANY`, since the delimiters do the separating.
     fn ty(&mut self, id: TyId, min: u8) -> String {
         let r = self.render(id);
         at(min, r)
     }
 
+    /// The name a `type` declaration gave this id, if any — so a diagnostic can say
+    /// `Json` instead of the expansion. Also a cycle cut: a recursive alias closes on an
+    /// id that has a name, so the name is printed rather than the recursion followed.
     fn def_name(&self, id: TyId) -> Option<String> {
         // Hash-consing lets several names reach one id; the least is stable.
         self.t
@@ -133,6 +168,17 @@ impl Printer<'_> {
             .map(|n| self.t.name_str(n).to_string())
     }
 
+    /// A type's contents, once naming and cycle-cutting have been dealt with.
+    ///
+    /// The value part and the `undef` marker are rendered separately and unioned back
+    /// together. Doing it in one pass is not possible honestly: `any` is the top of the
+    /// *value* lattice and the marker sits outside it, so a type carrying both is `any |
+    /// <absent>` and not `any`. Splitting first is also what lets the complement
+    /// heuristic reason about a set of values rather than about a lattice with a
+    /// non-value element in it.
+    ///
+    /// An empty result is `never` — the design's word for ⊥, printed in preference to
+    /// nothing at all.
     fn body(&mut self, id: TyId) -> (String, u8) {
         let d = self.t.data(id);
         // The absent marker is not a value, so it is split off before anything asks
@@ -202,6 +248,10 @@ impl Printer<'_> {
             + bdd(&self.t.arrow_bdd, d.arrows)
     }
 
+    /// Every inhabited kind of the descriptor, as the parts of one union. The order is
+    /// fixed — primitives, atoms, vars, records, tuples, arrows — so that two types that
+    /// differ in one place read as differing in one place, which matters when the two are
+    /// printed side by side in an "expected/found" pair.
     fn positive(&mut self, d: TyData) -> Vec<(String, u8)> {
         let mut out = Vec::new();
         for (bit, name) in [
@@ -226,6 +276,9 @@ impl Printer<'_> {
         out
     }
 
+    /// An atom set or a var set. `colon` is the only difference between the two: `:ok`
+    /// against `T`. They share this because both are name sets that may be cofinite, and
+    /// the cofinite rendering is the part worth getting right once.
     fn names(&self, id: AtomSetId, all: &str, colon: bool) -> Vec<(String, u8)> {
         let a = self.t.atomset_of(id);
         let one = |n: &NameId| {
@@ -271,6 +324,10 @@ impl Printer<'_> {
 
     // ---- records ----
 
+    /// A record atom, as its declared name where it has one and as its fields otherwise.
+    /// The nominal form is tried first because it is both shorter and the form the user
+    /// wrote; falling back is not a defeat, since an anonymous record genuinely has no
+    /// other rendering.
     fn rec_atom(&mut self, i: u32) -> (String, u8) {
         let a = self.t.rec_atoms[i as usize].clone();
         match self.nominal(&a) {
@@ -302,6 +359,12 @@ impl Printer<'_> {
         Some((s, P_ATOM))
     }
 
+    /// The one atom `t` is, or `None` if it is anything else at all.
+    ///
+    /// Every other kind has to be checked empty, not just ignored: a `#nominal` field
+    /// holding `:Box | :Pair`, or `:Box` widened with something, is not a name this
+    /// printer may claim the record has. `struct_ty`'s "any tag or none" value fails here
+    /// for exactly that reason, which is what sends an anonymous record to `structural`.
     fn singleton(&self, t: TyId) -> Option<NameId> {
         let d = self.t.data(t);
         let a = self.t.atomset_of(d.atoms);
@@ -332,6 +395,13 @@ impl Printer<'_> {
         Some(args.into_iter().map(|a| a.1).collect())
     }
 
+    /// A record atom as `{label: T, ...}`.
+    ///
+    /// The `#nominal` field is dropped only when it holds exactly what `struct_ty` puts
+    /// there — "any tag, or none". Anything else in it is a real constraint on which
+    /// nominals qualify, and dropping it would print a supertype as though it were the
+    /// type. The same reasoning governs `rest`: it is elided only at the open value, and
+    /// printed as `..: T` whenever it says something.
     fn structural(&mut self, a: &RecordAtom) -> (String, u8) {
         let open = self.t.any_or_undef();
         let tag = self.struct_tag();
@@ -377,6 +447,8 @@ impl Printer<'_> {
 
     // ---- tuples and arrows ----
 
+    /// A tuple atom. The zero-tuple is `()`, which is also the unit type and reads
+    /// correctly as such; every arity but one has a surface form.
     fn tup_atom(&mut self, i: u32) -> (String, u8) {
         let elems = self.t.tup_atoms[i as usize].elems.clone();
         // `(T)` is a grouping and `(T,)` is a parse error, so a one-tuple has no
@@ -397,6 +469,13 @@ impl Printer<'_> {
         (s, P_ATOM)
     }
 
+    /// An arrow, rendered at `P_ANY` — the loosest precedence there is, so it
+    /// parenthesises anywhere but the top. That is what makes `(i64) -> ((i64) -> i64)`
+    /// and `((i64) -> i64) -> i64` distinguishable rather than both collapsing to the
+    /// right-associated reading.
+    ///
+    /// `throws` is rendered at `P_UNION`, so a union of error types needs no brackets
+    /// while an arrow in the clause does.
     fn arrow_atom(&mut self, i: u32) -> (String, u8) {
         let a = self.t.arrow_atoms[i as usize].clone();
         let never = self.t.never();

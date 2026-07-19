@@ -27,6 +27,9 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// A scope with no type variables. Take the module from wherever the syntax was
+    /// *written*, not from wherever it is being used: a record's field annotations mean
+    /// what they meant in the declaring module, however the record is later named.
     pub fn new(module: &[String]) -> Self {
         Scope { module: module.to_vec(), vars: vec![] }
     }
@@ -42,6 +45,9 @@ impl Scope {
         self
     }
 
+    /// Innermost binding wins — hence the reverse scan. `vars` is a stack because an
+    /// impl's own generics are pushed after the protocol subject, and a method's after
+    /// those, so a `T` at any level shadows the same name above it.
     fn find(&self, name: &str) -> Option<&ScopeVar> {
         self.vars.iter().rev().find(|v| v.name == name)
     }
@@ -58,6 +64,14 @@ fn spec_admits_null(spec: &TypeSpec) -> bool {
     }
 }
 
+/// Written syntax to a type. Total: every spec yields a `TyId`, and a spec that cannot
+/// be resolved yields `error_ty` after reporting, so a caller never has to handle
+/// failure and a broken annotation does not abort the rest of a declaration.
+///
+/// Structural forms are built bottom-up through `or_poison`, so poison in any part is
+/// the whole spec's answer. Only `Named` (unknown name, wrong arity) and `Struct`
+/// (duplicate field) fail on their own account; every other form fails solely by
+/// containing something that did.
 pub fn resolve(env: &mut Env, scope: &Scope, spec: &TypeSpec) -> TyId {
     match &spec.kind {
         TypeSpecKind::Any => env.solver.t.any(),
@@ -134,6 +148,9 @@ pub fn resolve(env: &mut Env, scope: &Scope, spec: &TypeSpec) -> TyId {
     }
 }
 
+/// Resolve every spec, unconditionally. Nothing short-circuits on the first failure:
+/// each part carries its own diagnostic, and a reader wants all the bad names in an
+/// annotation reported at once rather than one per recompile.
 fn resolve_all(env: &mut Env, scope: &Scope, specs: &[TypeSpec]) -> Vec<TyId> {
     specs.iter().map(|s| resolve(env, scope, s)).collect()
 }
@@ -147,6 +164,13 @@ fn or_poison(env: &mut Env, parts: &[TyId], f: impl FnOnce(&mut Env) -> TyId) ->
     f(env)
 }
 
+/// `Name` and `Name[args]`. Three things can answer, and the order is the shadowing
+/// rule: a type variable in scope, then a primitive, then a declaration reached through
+/// `Env::lookup`. A generic parameter named `str` therefore shadows the primitive, which
+/// is the only reading that makes a signature mean what it says locally.
+///
+/// A single-segment path is the only shape that can be a variable or a primitive —
+/// neither is ever qualified — which is why both checks sit under the `[only]` match.
 fn named(
     env: &mut Env,
     scope: &Scope,
@@ -199,6 +223,12 @@ fn named(
     or_poison(env, &ts, |e| e.instantiate(&key, ts.clone(), &spec.span))
 }
 
+/// The base types, answered here rather than declared in a prelude. Keeping them out of
+/// `Env::decls` means no program can redeclare `i64`, and a lookup for one cannot be
+/// diverted by a `use`.
+///
+/// `null`, `any` and the error type are absent because they have their own `TypeSpecKind`
+/// — they are syntax, not names, and so cannot be shadowed by a type variable either.
 fn primitive(env: &mut Env, name: &str) -> Option<TyId> {
     match name {
         "i64" => Some(env.solver.t.i64()),

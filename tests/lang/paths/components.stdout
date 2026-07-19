@@ -1,0 +1,17 @@
+[] abs=false
+[] abs=false
+[/] abs=true
+[/] abs=true
+[a] abs=false
+[a|b|c] abs=false
+[/|a|b|c] abs=true
+[a|b] abs=false
+[a|b] abs=false
+[a|b] abs=false
+[a|b] abs=false
+[..] abs=false
+[..|a] abs=false
+[/|a|..|b] abs=true
+[/|..] abs=true
+[a\b] abs=false
+[ ] abs=false

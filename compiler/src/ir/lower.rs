@@ -3,9 +3,16 @@
 //! turned into a `Repr`, and every dispatched call's decision is read from its
 //! `Resolution`. See `docs/design/ir.md`.
 //!
-//! This is a growing pass: the scalar, control-flow, call and binding core is here, and
-//! the richer forms (match, aggregates, closures, try) are layered on as the IR grows
-//! to cover the corpus.
+//! Lowering is also where monomorphisation happens. A generic function is never lowered
+//! from its declaration; each call site solves its type arguments, mangles a name from
+//! them, and queues an `InstanceJob`, so only the instances a program actually reaches
+//! are emitted. Lambdas work the same way through `LambdaJob`, and both worklists are
+//! drained to a fixpoint in `lower_module` — an instance can discover further lambdas and
+//! instances, so the loop keeps running until neither has anything left.
+//!
+//! A form that has no lowering yet does not abort the pass: `unhandled_note` emits a
+//! `<todo: ...>` string constant of the expected repr so the enclosing function still
+//! lowers and `compiler/tests/ir_lower.rs` can report what remains.
 
 use super::repr::{repr_of, Repr};
 use super::ssa::{Builder, BlockId, Func, Op, PrimOp, Program, Target, Term, Value};
@@ -191,13 +198,17 @@ fn repr_key(r: &Repr) -> String {
     }
 }
 
-/// Lower a whole module to a program of SSA functions. Lambdas are lowered as separate
-/// functions via a worklist: lowering a function may discover lambdas, which are queued
-/// and lowered in turn (and may discover more).
-/// Lower a program. `libs` are the modules the program was checked against — the stdlib —
-/// with their module paths: their function *bodies* must be lowered too, because the stdlib
-/// is no longer only `@native` signatures. A generic one lowers per instance as its call
-/// sites discover it; a concrete one is lowered outright.
+/// Lower a whole module to a program of SSA functions.
+///
+/// `libs` are the modules the program was checked against — the stdlib — with their module
+/// paths: their function *bodies* must be lowered too, because the stdlib is no longer only
+/// `@native` signatures. A concrete function is lowered outright; a generic one only per
+/// instance, as its call sites discover it.
+///
+/// Lambdas and generic instances are both worklists, drained after the concrete functions
+/// and impl methods are done, because lowering either can discover more of both. `lowered`
+/// deduplicates by mangled name, which is what stops a recursive generic (an instance whose
+/// body calls itself at the same type) from queueing itself forever.
 pub fn lower_module<'a>(
     env: &Env,
     result: &TypecheckResult,
@@ -307,6 +318,10 @@ pub fn lower_module<'a>(
     Program { funcs, recursive, boxed, pure_natives }
 }
 
+/// Index every bodied function by `(module path, name)`, descending into nested `mod`s.
+/// This is the table `lower_instance` looks a generic body up in, so it must cover the
+/// stdlib and every nested module, not just the ones with concrete functions to lower.
+/// Signature-only declarations (`@native`, protocol methods) have no body and are skipped.
 fn collect_all_fns(
     module: &[String],
     decls: &[Decl],
@@ -382,6 +397,9 @@ fn lower_instance(
     Some((lo.b.finish(params), l, i))
 }
 
+/// Every bodied function in declaration order, paired with the module path it sits in.
+/// The generic ones are filtered out by the caller, not here, so `all_fns` and this list
+/// stay the same shape.
 fn collect_fn_jobs<'a>(
     module: &[String],
     decls: &'a [Decl],
@@ -410,9 +428,10 @@ fn mangle(module: &[String], name: &str) -> String {
     }
 }
 
-/// The name of an impl method, agreed between the site that dispatches to it and the
-/// site that lowers it: protocol, target head, and method.
 /// The signature behind a `protocol$head$method` key, for lowering a generic impl instance.
+/// The key is split rather than carried structurally because it is the same string
+/// dispatch already mangles, so the two sides cannot drift apart; the cost is this linear
+/// scan over every impl in the environment.
 fn impl_method_sig(
     env: &Env,
     key: &str,
@@ -430,6 +449,10 @@ fn impl_method_sig(
     None
 }
 
+/// The name of an impl method, agreed between the site that dispatches to it and the site
+/// that lowers it: protocol, target head, and method. Both sides must derive the head the
+/// same way — `impl_head` from the checked `ImplDef`, `ast_head` from the syntax — or a
+/// dispatch emits a call to a function nothing ever defines and the link fails.
 fn mangle_impl(protocol: &str, head: &str, method: &str) -> String {
     format!("{protocol}${head}${method}")
 }
@@ -490,6 +513,9 @@ fn ast_head(ty: &ast::TypeSpec) -> String {
     }
 }
 
+/// Index every impl method that has a body under the same `protocol$head$method` key
+/// dispatch uses. The `ImplDef`s in the environment carry the types but not the code, and
+/// the AST carries the code but not the resolved types; this key is what correlates them.
 fn collect_impl_bodies<'a>(
     decls: &'a [Decl],
     out: &mut std::collections::HashMap<String, &'a ast::FnDecl>,
@@ -542,6 +568,13 @@ fn lower_method(
     (lo.b.finish(params), l, i)
 }
 
+/// Lower one non-generic top-level function. Its parameters are the entry block's
+/// parameters, and its types come from the checker's `FnSig` rather than the AST's
+/// annotations, so an inferred return or an elaborated union is what reaches the IR.
+///
+/// A body that falls off its end gets an implicit `Ret` of the tail value — except at
+/// `Unit`, where the terminator returns nothing, because a unit-returning function has no
+/// return value in the C ABI.
 fn lower_fn(
     env: &Env,
     result: &TypecheckResult,
@@ -638,6 +671,10 @@ fn lower_lambda_job(env: &Env, result: &TypecheckResult, job: LambdaJob) -> (Fun
     (lo.b.finish_lambda(params, env_repr), l, i)
 }
 
+/// The state of lowering one function body. There is one of these per emitted function —
+/// including per generic *instance*, which is why `subst` lives here rather than being
+/// threaded through every call: inside an instance, every type read out of the checker is
+/// the generic one and has to pass through `repr_of_ty` before it describes real memory.
 struct Lower<'a> {
     env: &'a Env,
     result: &'a TypecheckResult,
@@ -678,6 +715,8 @@ impl<'a> Lower<'a> {
         Self::with_subst(env, result, module, fn_name, ret, Default::default())
     }
 
+    /// As `new`, for a generic instance: `subst` binds the instance's type parameters and
+    /// is applied by `repr_of_ty` to every type this body reads out of the checker.
     fn with_subst(
         env: &'a Env,
         result: &'a TypecheckResult,
@@ -719,10 +758,18 @@ impl Lower<'_> {
         self.scope.last_mut().unwrap().push((name.to_string(), v));
     }
 
+    /// Resolve a name to its SSA value. Both iterations are reversed: frames innermost
+    /// first for ordinary shadowing, and *within* a frame latest first, because a rebind
+    /// (`StmtKind::Assign`) pushes a second entry under the same name rather than
+    /// replacing the first. Scanning a frame forwards would resolve every read after an
+    /// assignment back to the pre-assignment value.
     fn lookup(&self, name: &str) -> Option<Value> {
         self.scope.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, _)| n == name).map(|(_, v)| *v)
     }
 
+    /// The repr of an expression, as the checker typed it. An expression with no recorded
+    /// type is one the checker never reached (a form under an error); `Unit` keeps
+    /// lowering going rather than aborting the whole program over one bad subtree.
     fn repr(&self, e: &Expr) -> Repr {
         match self.result.ty(e.id) {
             Some(ty) => self.repr_of_ty(ty),
@@ -798,6 +845,9 @@ impl Lower<'_> {
         tail
     }
 
+    /// Lower one statement. Neither `let` nor an assignment allocates: a binding is just a
+    /// name pointing at an SSA value, and a rebind pushes a new name-to-value pair that
+    /// shadows the old one. Values never move, so nothing here has to be undone.
     fn lower_stmt(&mut self, s: &Stmt) {
         match &s.kind {
             StmtKind::Let { pat, value, .. } => {
@@ -857,6 +907,14 @@ impl Lower<'_> {
 
     // ---- expressions ----
 
+    /// Lower an expression to the value it produces. Every arm reads its repr and type from
+    /// the checker up front rather than deriving them from the operands, so lowering never
+    /// re-decides a type.
+    ///
+    /// The diverging forms — `break`, `continue`, `throw`, `return` — still have to return
+    /// a `Value` because they are expressions. They mint one at `Repr::Never` *without*
+    /// emitting an instruction and set `terminated`, so nothing downstream is lowered and
+    /// the value is never read.
     fn lower_expr(&mut self, e: &Expr) -> Value {
         let repr = self.repr(e);
         let ty = self.ty(e);
@@ -955,6 +1013,7 @@ impl Lower<'_> {
         }
     }
 
+    /// `[a, b, c]` — one `MakeList` with the elements already lowered, left to right.
     fn lower_list(&mut self, elems: &[ast::Elem], repr: Repr, ty: TyId) -> Value {
         // A spread (`..rest`) is a concatenation; not lowered yet, so mark it.
         if elems.iter().any(|e| matches!(e, ast::Elem::Spread(_))) {
@@ -970,6 +1029,9 @@ impl Lower<'_> {
         self.b.emit(Op::MakeList(vs), repr, ty)
     }
 
+    /// A record literal. The literal's *syntactic* field order is discarded: fields are
+    /// emitted in the order the repr lists them, so two literals of the same type build the
+    /// same struct however they were written.
     fn lower_record(
         &mut self,
         path: Option<&[String]>,
@@ -999,6 +1061,13 @@ impl Lower<'_> {
         self.b.emit(Op::MakeRecord { name, fields: built }, repr, ty)
     }
 
+    /// A string literal, or an interpolation. A single text part is a constant; anything
+    /// else is a left-to-right fold of `neon_str_concat`, so an n-hole interpolation costs
+    /// n-1 allocations.
+    ///
+    /// A hole prefers the `to_string` the checker resolved for it; `to_string_symbol` is
+    /// the fallback for the primitives, and a value with neither (already a `str`) is
+    /// concatenated as it is.
     fn lower_str(&mut self, parts: &[ast::StrPart], repr: Repr, ty: TyId) -> Value {
         if let [ast::StrPart::Text(s)] = parts {
             return self.b.emit(Op::ConstStr(s.clone()), repr.clone(), ty);
@@ -1045,6 +1114,10 @@ impl Lower<'_> {
         acc.unwrap_or_else(|| self.b.emit(Op::ConstStr(String::new()), repr, ty))
     }
 
+    /// A path in value position. A local wins over a function of the same name, since a
+    /// binding shadows. Everything reachable here is a *value* use of a function name, not
+    /// a call — `lower_call_vals` handles the call case before ever reaching this — so the
+    /// function becomes a closure with an empty environment.
     fn lower_path(&mut self, p: &[String], repr: Repr, ty: TyId) -> Value {
         if let [name] = p {
             if let Some(v) = self.lookup(name) {
@@ -1099,6 +1172,10 @@ impl Lower<'_> {
         used
     }
 
+    /// A binary operator. The arithmetic, comparison and bitwise ones are a single `Prim`
+    /// with both operands evaluated; the four that are not (`and`, `or`, `orelse`, `|>`)
+    /// need control flow or argument rearrangement and get their own lowering. Keeping the
+    /// split in `bin_prim` means the two lists cannot disagree about which is which.
     fn lower_binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, repr: Repr, ty: TyId) -> Value {
         if let Some(p) = bin_prim(op) {
             let l = self.lower_expr(lhs);
@@ -1201,6 +1278,9 @@ impl Lower<'_> {
         self.lower_call_vals(rhs.id, callee, generics, arg_vs, repr, ty)
     }
 
+    /// `f(a, b)` — arguments are lowered left to right, before anything is decided about
+    /// the callee, so evaluation order matches the source regardless of which of the four
+    /// call shapes `lower_call_vals` picks.
     fn lower_call(
         &mut self,
         id: crate::ast::ExprId,
@@ -1215,6 +1295,20 @@ impl Lower<'_> {
     }
 
     /// Lower a call whose arguments are already lowered (shared by `f(..)` and pipe).
+    ///
+    /// The callee is decided by a ladder, in this order: a resolution the checker recorded
+    /// for this expression id (protocol dispatch); a local of arrow type, which is a
+    /// closure call; a named module function, direct or `@native`; and otherwise an
+    /// arbitrary expression evaluated to a closure. The order matters — a local shadowing a
+    /// function name must call the local, and a dispatched method must not be mistaken for
+    /// a plain module function of the same name.
+    ///
+    /// A generic Neon function specialises here. Its type arguments come from the first
+    /// source that has them: the checker's solved arguments, then a turbofish, then
+    /// matching the declared parameter and return reprs against the concrete ones. The
+    /// checker's solution is preferred over the turbofish because `repr_from_typespec` only
+    /// recovers a nominal's *head* — enough to mangle a name, not enough to lay out the
+    /// instance's parameters and locals.
     fn lower_call_vals(
         &mut self,
         id: crate::ast::ExprId,
@@ -1337,9 +1431,16 @@ impl Lower<'_> {
         self.wrap_throwing_repr(result, err_repr, err_ty, repr, ty)
     }
 
-    /// Lower a call the checker resolved by protocol dispatch. A `Direct` to a native
-    /// impl (the primitives) becomes a native call; the rest — user impls, switches,
-    /// and generic bounds — are lowered in a later pass and marked for now.
+    /// Lower a call the checker resolved by protocol dispatch. There is no vtable: every
+    /// case ends in a direct call or a native symbol.
+    ///
+    /// A `Direct` to a native impl (the primitives) is a native call; to a user impl, a
+    /// call to the method's own lowered function under its `mangle_impl` name, specialised
+    /// per call site if the *method* is generic independently of the impl. A `Bound` is a
+    /// `where` clause discharged here rather than at the check: inside a monomorphic
+    /// instance the receiver is concrete, so its head names the impl the bound stood for.
+    /// `Switch` — a union receiver needing a runtime discriminant test — has no lowering
+    /// yet and is marked.
     fn lower_dispatch(
         &mut self,
         res: &crate::typecheck::dispatch::Resolution,
@@ -1438,6 +1539,13 @@ impl Lower<'_> {
         }
     }
 
+    /// `if cond { .. } else { .. }`. The join block's parameters are the merge: the `if`'s
+    /// own value first (only when it produces one), then one per reassigned variable, in a
+    /// fixed order both branches follow.
+    ///
+    /// `produces` requires an `else`. An `if` without one cannot yield a value on the
+    /// missing path, so the join takes no value parameter and the expression is unit —
+    /// while the mutated variables still merge, the else edge passing their pre-`if` values.
     fn lower_if(
         &mut self,
         cond: &Expr,
@@ -1793,6 +1901,10 @@ impl Lower<'_> {
         self.b.emit(Op::Prim(PrimOp::Eq, vec![subj, lv]), Repr::Bool, bty)
     }
 
+    /// Conjoin two pattern tests, with `None` meaning "no test so far". This is a plain
+    /// `Prim(And)`, not the short-circuiting `lower_and_or`: both operands are pure
+    /// projections and comparisons that have already been emitted, so there is nothing to
+    /// skip and no need for the extra blocks.
     fn and(&mut self, a: Option<Value>, b: Value) -> Value {
         match a {
             Some(a) => {
@@ -2093,8 +2205,12 @@ impl Lower<'_> {
     }
 
     /// The variables a loop body reassigns that are bound outside it — the loop-carried
-    /// state. Nested loops and lambdas manage their own, so the scan does not descend
-    /// into them.
+    /// state, which becomes the header block's parameters.
+    ///
+    /// The scan descends into nested loops: an inner loop reassigning an outer local makes
+    /// that local carried by *both*, and the inner loop's exit block hands the value back
+    /// for the outer back-edge to pass on. It does not descend into a lambda body, because
+    /// a closure cannot reassign a capture.
     fn carried_vars(&self, body: &Block) -> Vec<String> {
         let mut names = Vec::new();
         collect_assigns_block(body, &mut names);
@@ -2116,18 +2232,23 @@ impl Lower<'_> {
         self.b.emit(Op::ConstUnit, Repr::Unit, ty)
     }
 
-    /// A not-yet-lowered expression: emits a placeholder of the right repr so the rest
-    /// of the function still lowers, and panics loudly in tests via the note. During
-    /// bring-up these mark exactly what remains.
+    /// A not-yet-lowered expression, named by its `ExprKind`.
     fn unhandled(&mut self, e: &Expr, repr: Repr, ty: TyId) -> Value {
         self.unhandled_note(kind_name(&e.kind), repr, ty)
     }
 
+    /// The placeholder for a form with no lowering: a string constant carrying the note,
+    /// emitted at the repr the expression was *supposed* to have so the rest of the
+    /// function still lowers and the IR stays well-formed. `compiler/tests/ir_lower.rs`
+    /// scans dumps for these markers and reports what remains; it does not fail on them,
+    /// so a marker is a visible gap rather than a build break. The value itself is a lie
+    /// about its repr — a program that reaches one at runtime is undefined.
     fn unhandled_note(&mut self, what: &str, repr: Repr, ty: TyId) -> Value {
         self.b.emit(Op::ConstStr(format!("<todo: {what}>")), repr, ty)
     }
 }
 
+/// A short name for an expression form, used only in `<todo: ...>` markers.
 fn kind_name(k: &ExprKind) -> &'static str {
     match k {
         ExprKind::Match { .. } => "match",
@@ -2165,6 +2286,9 @@ fn set_throws(
     }
 }
 
+/// The type to attribute to a test or projection emitted against a match subject. Pattern
+/// syntax is not checked expressions, so none of it has a recorded type of its own; the
+/// subject's is the closest honest answer.
 fn subj_ty(b: &Builder, v: Value) -> TyId {
     b.value_ty(v)
 }
@@ -2183,6 +2307,8 @@ fn to_string_symbol(r: &Repr) -> Option<String> {
 
 // ---- scanning for a lambda's free variables ----
 
+/// Every name a pattern binds, so a scan can treat them as bound in whatever scope the
+/// pattern opens. A record field with no sub-pattern binds the field's own name.
 fn pattern_names(p: &ast::Pattern, out: &mut Vec<String>) {
     match &p.kind {
         ast::PatternKind::Bind(n) => out.push(n.clone()),
@@ -2199,6 +2325,10 @@ fn pattern_names(p: &ast::Pattern, out: &mut Vec<String>) {
     }
 }
 
+/// A block's free names. `bound` is threaded by `&mut` here, not cloned, because a `let`
+/// in a block scopes to the rest of that block — the statements after it must see the name
+/// as bound. Constructs whose bindings scope more narrowly (a lambda, a match arm, a `for`
+/// pattern, a `catch`) clone `bound` instead so their names do not leak to their siblings.
 fn collect_free(block: &Block, bound: &mut std::collections::HashSet<String>, used: &mut Vec<String>) {
     for s in &block.stmts {
         match &s.kind {
@@ -2218,6 +2348,9 @@ fn collect_free(block: &Block, bound: &mut std::collections::HashSet<String>, us
     }
 }
 
+/// An expression's free names, appended to `used` in first-use order and with duplicates
+/// left in — `free_vars` filters and dedups. Only a single-segment path counts as a
+/// variable use; a qualified path is a module item, which is not captured.
 fn collect_free_expr(
     e: &Expr,
     bound: &mut std::collections::HashSet<String>,
@@ -2319,6 +2452,9 @@ fn collect_free_expr(
 // Descends into every sub-expression except a lambda's body: a closure cannot reassign
 // a capture (captures are sealed), so it never contributes to a loop's carried set.
 
+/// Every name a block assigns to. A `let` is not an assignment — it introduces a new
+/// binding, so only its initialiser is scanned. Names bound *inside* the block are not
+/// filtered out here; `Lower::carried` drops them by checking what is actually in scope.
 fn collect_assigns_block(b: &Block, out: &mut Vec<String>) {
     for s in &b.stmts {
         match &s.kind {
@@ -2336,6 +2472,9 @@ fn collect_assigns_block(b: &Block, out: &mut Vec<String>) {
     }
 }
 
+/// The expression half of the assignment scan. Exhaustive over the forms that can contain
+/// a statement or a sub-expression; the catch-all arm covers the leaves (literals, paths,
+/// `break`/`return` with no value) and the one deliberate omission, a lambda body.
 fn collect_assigns_expr(e: &Expr, out: &mut Vec<String>) {
     match &e.kind {
         ExprKind::Unary { rhs, .. } => collect_assigns_expr(rhs, out),
@@ -2408,6 +2547,9 @@ fn collect_assigns_expr(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// The repr of a tuple element, read off the base's own repr rather than the checker.
+/// A tuple pattern's sub-positions are not checked expressions, so this is the only
+/// place the element layout is available.
 fn elem_repr(b: &Builder, base: Value, index: usize) -> Repr {
     match b.value_repr(base) {
         Repr::Tuple(rs) => rs.get(index).cloned().unwrap_or(Repr::Unit),
@@ -2415,6 +2557,10 @@ fn elem_repr(b: &Builder, base: Value, index: usize) -> Repr {
     }
 }
 
+/// The repr of a record field, searched through unions and nullables so a pattern can
+/// project out of a value the checker has not narrowed yet. The first variant carrying the
+/// field wins, so two variants with a same-named field of different layout would silently
+/// resolve to one of them.
 fn field_repr(b: &Builder, base: Value, field: &str) -> Repr {
     fn find(r: &Repr, field: &str) -> Option<Repr> {
         match r {
@@ -2447,6 +2593,9 @@ fn un_prim(op: UnOp) -> PrimOp {
     }
 }
 
+/// The `PrimOp` a binary operator maps to, or `None` for the four that are not a single
+/// instruction. This is the one place that split is decided; `lower_binary` reads it rather
+/// than keeping a second list that could disagree.
 fn bin_prim(op: BinOp) -> Option<PrimOp> {
     Some(match op {
         BinOp::Add => PrimOp::Add,

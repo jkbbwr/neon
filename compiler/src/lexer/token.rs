@@ -1,3 +1,21 @@
+//! The token alphabet, and the two tables that keep it honest.
+//!
+//! `Token::keyword` decides which words are reserved; `Display` decides how each
+//! token is named in a diagnostic. `Display` matches every variant with no
+//! catch-all arm, so a new token cannot be added without deciding how a user
+//! sees it. `keyword` deliberately does have a catch-all — most tokens are not
+//! words — which means the reserved-word list is the one place here that a new
+//! keyword must be entered by hand.
+//!
+//! Payload-carrying variants hold what the source *said*, not always what it
+//! meant. `Int` is a magnitude with no sign and `Float` is text rather than an
+//! `f64`; both are explained at their variants, and both exist because the
+//! obvious representation loses information the compiler later needs.
+//!
+//! Spans are byte offsets into the original source, half-open. Every token has
+//! one, and a token's span always slices back to the exact text that produced
+//! it — the formatter reprints literals by doing precisely that.
+
 use std::fmt;
 use std::ops::Range;
 

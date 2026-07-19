@@ -1,3 +1,26 @@
+//! Reduced ordered binary decision diagrams, one arena per type kind.
+//!
+//! A kind's component of a type (its records, its tuples, its arrows) is an arbitrary
+//! boolean combination of that kind's atoms, and this is where those combinations live.
+//! The arena keeps them in canonical form by two rules applied in `node`: a decision
+//! whose branches agree is dropped, and every surviving node is interned. Together those
+//! make `BddId` equality decide *logical* equivalence — `(x ∧ y)` and `(y ∧ x)` are one
+//! id — which is what lets `TyData` be `Copy`, hashable, and compared with `==`.
+//!
+//! Atom ids double as the variable order, so an arena's order is fixed by the order its
+//! caller interned atoms in. Nothing here reorders; correctness does not depend on the
+//! order being good, only on it being the same for every diagram in the arena, which
+//! holds because `Types` owns one arena per kind and hands out atom ids from one counter.
+//!
+//! The operations are memoized per arena. That is only sound because a kind's diagrams
+//! never mention another kind's atoms — an `i64` is never a record, so no kind's meaning
+//! leaks into another's, and a `(BddId, BddId)` key is a complete description of the
+//! query.
+//!
+//! Emptiness is deliberately not decided here. This layer is pure boolean algebra over
+//! opaque variables; `paths` hands the DNF to `empty.rs`, which knows what the atoms of
+//! each kind actually mean.
+
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -6,6 +29,9 @@ pub struct BddId(u32);
 pub const FALSE: BddId = BddId(0);
 pub const TRUE: BddId = BddId(1);
 
+/// A decision on one atom: `high` is the diagram when the atom holds, `low` when it does
+/// not. Both branches point at strictly higher atoms or at a terminal, which is the
+/// ordering invariant every operation below relies on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Node {
     atom: u32,
@@ -25,11 +51,17 @@ pub struct Bdd {
 
 impl Bdd {
     pub fn new() -> Self {
-        // 0 and 1 are the terminals; the entries are never read.
+        // 0 and 1 are the terminals; the entries are never read. Every site that indexes
+        // `nodes` rules terminals out first. `u32::MAX` is chosen anyway so that a
+        // terminal could never win the `min` that picks the next atom to split on.
         let dummy = Node { atom: u32::MAX, high: FALSE, low: FALSE };
         Bdd { nodes: vec![dummy, dummy], ..Default::default() }
     }
 
+    /// The single place a node is created, and therefore the single place canonicity is
+    /// enforced: a decision whose branches agree is not a decision, and an identical node
+    /// is never allocated twice. Skip this and build a `Node` by hand and `BddId`
+    /// equality stops meaning logical equality, which every other file assumes it does.
     fn node(&mut self, atom: u32, high: BddId, low: BddId) -> BddId {
         if high == low {
             return high;
@@ -44,6 +76,8 @@ impl Bdd {
         id
     }
 
+    /// The diagram for a bare atom. `atom` is an index into the owning kind's atom table
+    /// (`rec_atoms`, `tup_atoms`, `arrow_atoms`); this arena never learns what it means.
     pub fn atom(&mut self, atom: u32) -> BddId {
         self.node(atom, TRUE, FALSE)
     }
@@ -57,6 +91,11 @@ impl Bdd {
     }
 
     /// (high, low) cofactors of `b` with respect to `atom`.
+    ///
+    /// A diagram that does not decide on `atom` at its root is independent of it, so both
+    /// cofactors are `b` itself. That case is what lets `and`/`or` descend two diagrams
+    /// with different roots in lockstep: they split on the smaller of the two atoms, and
+    /// the one that has not reached it yet simply passes through unchanged.
     fn split(&self, b: BddId, atom: u32) -> (BddId, BddId) {
         if Self::is_terminal(b) || self.top(b) != atom {
             (b, b)
@@ -66,6 +105,13 @@ impl Bdd {
         }
     }
 
+    /// Conjunction, by the standard Shannon recursion: split both operands on the
+    /// smallest root atom, recurse on the two cofactor pairs, rebuild through `node`.
+    ///
+    /// The terminal cases above the memo lookup are not just a fast path — they are what
+    /// guarantees both operands are real nodes by the time `top` indexes `nodes`. The
+    /// memo key is sorted because conjunction is commutative, which halves the table and
+    /// makes `a ∧ b` hit the entry left by `b ∧ a`.
     pub fn and(&mut self, a: BddId, b: BddId) -> BddId {
         if a == FALSE || b == FALSE {
             return FALSE;
@@ -90,6 +136,9 @@ impl Bdd {
         r
     }
 
+    /// Disjunction, the dual of `and` and structured identically. It keeps its own memo:
+    /// the two tables must not be shared, since they answer different questions about the
+    /// same pair.
     pub fn or(&mut self, a: BddId, b: BddId) -> BddId {
         if a == TRUE || b == TRUE {
             return TRUE;
@@ -114,6 +163,11 @@ impl Bdd {
         r
     }
 
+    /// Complement, by swapping the terminals underneath every decision.
+    ///
+    /// This walks and rebuilds the whole diagram rather than using complement edges — an
+    /// id here always denotes a positive diagram, so nothing downstream has to know about
+    /// a sign bit riding on a `BddId`. The memo keeps the cost linear in nodes visited.
     pub fn not(&mut self, a: BddId) -> BddId {
         match a {
             FALSE => return TRUE,
@@ -131,6 +185,8 @@ impl Bdd {
         r
     }
 
+    /// `a ∖ b`, i.e. `a ∧ ¬b`. Set difference is the operation subtyping is phrased in,
+    /// so it gets a name here rather than being spelled out at every call site.
     pub fn diff(&mut self, a: BddId, b: BddId) -> BddId {
         let nb = self.not(b);
         self.and(a, nb)
@@ -141,6 +197,15 @@ impl Bdd {
     /// Emptiness of a kind is decided per path by the caller, because whether a path
     /// is satisfiable depends on that kind's atom semantics — which is the whole
     /// reason the kinds are separated.
+    ///
+    /// The cubes are pairwise disjoint: any two paths part at some node, so one takes the
+    /// atom positively and the other negatively. That is why the caller may decide each
+    /// path on its own and answer "empty" only if every one of them is — with overlapping
+    /// cubes that reasoning would not be available.
+    ///
+    /// Worst case this is exponential in the number of atoms, and nothing here caps it.
+    /// It stays tractable because a real program's type mentions a handful of record or
+    /// arrow shapes, not hundreds.
     pub fn paths(&self, b: BddId) -> Vec<(Vec<u32>, Vec<u32>)> {
         let mut out = Vec::new();
         let mut pos = Vec::new();
@@ -149,6 +214,10 @@ impl Bdd {
         out
     }
 
+    /// Depth-first accumulation for `paths`. `pos`/`neg` are the atoms decided so far on
+    /// the way down and are restored on the way back up, so they describe exactly the
+    /// current branch; a cube is cloned out only where the branch reaches TRUE. Branches
+    /// reaching FALSE contribute nothing, which is how the reduced diagram prunes.
     fn walk(
         &self,
         b: BddId,

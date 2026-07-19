@@ -34,12 +34,22 @@ pub enum Unit {
     Library,
 }
 
+/// One diagnostic. `span` is the primary label; `help` and `labels` below turn the
+/// kind into the rest of an ariadne report, so a message's wording lives in exactly
+/// one place and every consumer renders the same text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeError {
     pub span: Span,
     pub kind: TypeErrorKind,
 }
 
+/// Every way declaration and body checking can fail.
+///
+/// Payloads are already-rendered strings, never `TyId`s. `Display` here takes only
+/// `&self`, and printing a type needs `&mut Solver` to intern names, so the type has
+/// to be rendered at the point of failure or not at all. It also makes the variants
+/// comparable, which `contractivity` relies on to collapse one mistake reached by two
+/// paths into one diagnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeErrorKind {
     Unknown(String),
@@ -417,12 +427,20 @@ impl TypeError {
 
 // ---- what dispatch.rs consumes ----
 
+/// An index into `Env::protocols`. Assigned in declaration order during pass 1, so a
+/// protocol has an id before its own method signatures can be resolved — which is
+/// what lets a protocol's methods mention the protocol's own subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProtocolId(pub usize);
 
+/// An index into `Env::impls`. Dispatch hands one of these back so lowering can name
+/// the exact impl a call selected rather than repeating the search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ImplId(pub usize);
 
+/// A resolved function signature: a `fn` declaration, a protocol's required method,
+/// or an impl's method. All three share this shape so dispatch and lowering do not
+/// care which kind they are holding; `has_body` and `native` are what tell them apart.
 #[derive(Debug, Clone)]
 pub struct FnSig {
     pub name: String,
@@ -446,6 +464,8 @@ pub struct FnSig {
     pub span: Span,
 }
 
+/// A declared protocol. `methods` is empty until pass 3: the signatures name types,
+/// and no type can be resolved until every declaration exists.
 #[derive(Debug, Clone)]
 pub struct Protocol {
     pub name: String,
@@ -465,6 +485,11 @@ pub struct Protocol {
     pub is_marker: bool,
 }
 
+/// One `impl P for X`. Exactly one of `target` and `target_head` is set: a protocol
+/// whose subject is a constructor (`for C[_]`) is implemented for a *name*, which has
+/// no `TyId` because it is not a type until it is applied. Coherence and supertrait
+/// checking both work in `TyId`s, so they simply skip a head-only impl rather than
+/// inventing a type for it — dispatch decides those by name instead.
 #[derive(Debug, Clone)]
 pub struct ImplDef {
     pub protocol: ProtocolId,
@@ -483,6 +508,10 @@ pub struct ImplDef {
 
 // ---- declarations ----
 
+/// Which of the four type-declaration forms a name was declared with. The four differ
+/// only in how `instantiate` turns a body into a `TyId`, and every rule about
+/// recursion keys off this: `Alias` and `Newtype` inline and so must detect a cycle,
+/// `Record` and `Mu` reserve an id first and so a cycle is simply a cycle.
 #[derive(Debug, Clone)]
 enum Sort {
     Record(ast::RecordDecl),
@@ -491,6 +520,9 @@ enum Sort {
     Newtype(ast::AliasDecl),
 }
 
+/// A declared type, kept as unresolved syntax. Pass 1 stores these and stops; the body
+/// is only read when something instantiates the name, which is what makes declaration
+/// order irrelevant.
 #[derive(Debug, Clone)]
 struct TypeDecl {
     module: Vec<String>,
@@ -513,8 +545,15 @@ impl TypeDecl {
     }
 }
 
+/// Everything declared across the whole compilation, plus the `Solver` that owns the
+/// types those declarations denote. There is one `Env` per compilation, not one per
+/// module: names are keyed by their fully qualified path and modules are a lookup rule
+/// over that flat table, which is why the stdlib and the user's program can name each
+/// other freely.
 pub struct Env {
     pub solver: Solver,
+    /// Fully qualified name -> declaration. Flat, so `qualify` and `candidates` are the
+    /// only things that know what a module means.
     decls: HashMap<String, TypeDecl>,
     /// Module key -> (bound name, full path).
     uses: HashMap<String, Vec<(String, String)>>,
@@ -527,6 +566,11 @@ pub struct Env {
     fns: Vec<FnSig>,
     errors: Vec<TypeError>,
 
+    /// (declaration key, type arguments) -> the type it denotes. Memoising here is not
+    /// an optimisation: a record's id is inserted *before* its fields are read, so a
+    /// recursive record finds the reserved id and closes the cycle instead of expanding
+    /// forever. It also makes nominal identity stable — two mentions of `Pair[i64]`
+    /// must be the same `TyId`, not two structurally equal ones.
     inst: HashMap<(String, Vec<TyId>), TyId>,
     /// Alias and newtype expansions in progress. Those two inline, so a cycle
     /// through one does not terminate and has to be caught here; a record or a
@@ -536,8 +580,14 @@ pub struct Env {
     /// Modules declared `internal mod`. Their contents resolve only from the subtree
     /// rooted at the declaring parent — see `visible_from`.
     internal_modules: Vec<Vec<String>>,
-    /// `mu` declarations whose contractivity check failed.
+    /// `mu` declarations whose contractivity check failed. Instantiating one is refused
+    /// outright — an uncontractive `mu` has no fixed point, so unfolding it would not
+    /// terminate — and the declaration has already been reported, so uses stay silent.
     mu_bad: Vec<String>,
+    /// Nesting depth of `instantiate`, against `MAX_DEPTH`. Not the same guard as
+    /// `active`: that catches a cycle that returns to the same arguments, this catches
+    /// polymorphic recursion, which reaches *fresh* arguments every time and so never
+    /// repeats a key.
     depth: usize,
     error_ty: TyId,
     unit: Unit,
@@ -550,6 +600,8 @@ impl Default for Env {
 }
 
 impl Env {
+    /// An empty environment. Nothing is declared, not even the primitives — `resolve`
+    /// answers `i64` and friends directly, so they cannot be shadowed or redeclared.
     pub fn new() -> Self {
         let mut solver = Solver::new();
         // `#` is not an identifier character, so no source can name this.
@@ -575,10 +627,14 @@ impl Env {
         }
     }
 
+    /// One module at the root path, compiled as the root application. The convenience
+    /// form for tests and single-file programs; a real compilation goes through
+    /// `build_with` so the stdlib is present.
     pub fn build(module: &ast::Module) -> Self {
         Env::build_as(module, Unit::RootApplication)
     }
 
+    /// As `build`, but says whether `orphan impl` is permitted — see `Unit`.
     pub fn build_as(module: &ast::Module, unit: Unit) -> Self {
         Env::build_with(&[(Vec::new(), module)], unit)
     }
@@ -709,7 +765,9 @@ impl Env {
         }
     }
 
-    /// Add the checker's diagnostics to the declaration pass's.
+    /// Add the checker's diagnostics to the declaration pass's, so a caller reports
+    /// from one list and the two phases' errors interleave in source order rather than
+    /// arriving as two batches.
     pub fn extend_errors(&mut self, more: Vec<TypeError>) {
         self.errors.extend(more);
     }
@@ -722,6 +780,8 @@ impl Env {
         &self.protocols
     }
 
+    /// Panics on an id from a different `Env`. Ids are plain indices, so they are only
+    /// meaningful against the environment that issued them.
     pub fn protocol(&self, id: ProtocolId) -> &Protocol {
         &self.protocols[id.0]
     }
@@ -730,6 +790,9 @@ impl Env {
         &self.impls
     }
 
+    /// Every impl of one protocol, paired with its id. Order is declaration order, which
+    /// dispatch must not depend on: an impl is chosen by whether its target covers the
+    /// receiver, and coherence has already ruled out two that both could.
     pub fn impls_of(&self, p: ProtocolId) -> impl Iterator<Item = (ImplId, &ImplDef)> {
         self.impls
             .iter()
@@ -765,6 +828,10 @@ impl Env {
         None
     }
 
+    /// Every free function in the compilation, stdlib included. Impl and protocol
+    /// methods are *not* here — they live on their `ImplDef`/`Protocol`, because reaching
+    /// them is dispatch's job and putting them in one flat list would let a method be
+    /// called as a plain function.
     pub fn fns(&self) -> &[FnSig] {
         &self.fns
     }
@@ -786,27 +853,43 @@ impl Env {
         t == self.error_ty
     }
 
+    /// Errors are collected, never returned: the point is to report every mistake in a
+    /// file at once, so a failed resolution yields `error_ty` and carries on.
     pub fn error(&mut self, span: Span, kind: TypeErrorKind) {
         self.errors.push(TypeError { span, kind });
     }
 
-    /// Whether a declared type takes generic arguments -- a record literal for a
-    /// generic record needs its arguments inferred, which the checker does not do yet.
+    /// Whether a declared type takes generic arguments. `key` is a fully qualified name,
+    /// so this must be given the output of `lookup` and not a written path. An unknown
+    /// key answers `false` rather than erroring — the missing name has its own
+    /// diagnostic already.
     pub fn is_generic(&self, key: &str) -> bool {
         self.decls.get(key).is_some_and(|d| !d.generics().is_empty())
     }
 
-    /// The generic parameter names of a declared type, in order.
+    /// The generic parameter names of a declared type, in order. Position is the whole
+    /// meaning: the checker pairs these with the argument list, so anything reordering
+    /// them would silently substitute the wrong type.
     pub fn generic_names(&self, key: &str) -> Vec<String> {
         self.decls.get(key).map(|d| d.generics().to_vec()).unwrap_or_default()
     }
 
+    /// Resolve written syntax to a type. Takes `&mut self` because resolving may
+    /// instantiate a declaration for the first time, which mints types and can emit
+    /// diagnostics — it is not a pure query.
     pub fn resolve(&mut self, scope: &Scope, spec: &ast::TypeSpec) -> TyId {
         resolve::resolve(self, scope, spec)
     }
 
     // ---- pass 1: declare ----
 
+    /// Record every name in `decls` under `module`, recursing into nested `mod`s. No
+    /// body is read and no type is resolved: a declaration only needs its own name,
+    /// generics and sort here, which is exactly what makes forward and mutual reference
+    /// work without a dependency sort.
+    ///
+    /// `fn` and `impl` are deliberately absent — neither introduces a *type* name, so
+    /// nothing can need them before pass 3.
     fn declare(&mut self, module: &[String], decls: &[ast::Decl]) {
         for d in decls {
             match &d.kind {
@@ -873,6 +956,9 @@ impl Env {
         }
     }
 
+    /// Insert one type declaration, reporting a redeclaration. The *first* declaration
+    /// wins in the message but the *last* wins in the table; both readings name the same
+    /// duplicate, and the program is already rejected either way.
     fn declare_type(&mut self, module: &[String], span: Span, sort: Sort) {
         let d = TypeDecl { module: module.to_vec(), sort, span: span.clone() };
         let key = qualify(module, d.name());
@@ -884,6 +970,15 @@ impl Env {
 
     // ---- pass 2: contractivity ----
 
+    /// Check every `mu` declaration, before anything can instantiate one.
+    ///
+    /// Contractivity is pure syntax — it walks `TypeSpec`s, never `TyId`s — precisely so
+    /// it can run here, between declaring and resolving. An uncontractive `mu` has no
+    /// fixed point, so resolving its body would not terminate; catching it first is what
+    /// lets `instantiate` assume every `mu` it reaches is well-founded.
+    ///
+    /// A `mu` that never names itself is also an error: the binder is an assertion, and
+    /// silently accepting it would leave `type` and `mu type` interchangeable.
     fn check_contractivity(&mut self) {
         let mus: Vec<String> = self
             .decls
@@ -908,6 +1003,11 @@ impl Env {
 
     // ---- pass 3: bodies ----
 
+    /// Turn every declaration's syntax into types, now that every name is known.
+    ///
+    /// A `use` is not revisited: pass 1 already flattened it, and the tables it built are
+    /// what `candidates` reads. `Impl` and `Fn` appear only here, since both need to
+    /// resolve types and neither declares one.
     fn resolve_bodies(&mut self, module: &[String], decls: &[ast::Decl]) {
         for d in decls {
             match &d.kind {
@@ -958,6 +1058,13 @@ impl Env {
         }
     }
 
+    /// Resolve one function's signature. `extra` prepends scope variables the
+    /// declaration does not list: a protocol's subject, or an impl's subject bound to
+    /// the concrete target, so `fn area(s: T) -> f64` reads as the right thing in both.
+    ///
+    /// The body is not looked at at all — only `has_body`, which is what distinguishes a
+    /// protocol's requirement from a default. Bodies are `check.rs`'s job, and keeping
+    /// them out here is why a signature can mention a type declared later.
     fn fn_sig(
         &mut self,
         module: &[String],
@@ -1020,6 +1127,9 @@ impl Env {
         }
     }
 
+    /// Resolve one `impl` and record it. An unknown protocol drops the impl entirely
+    /// rather than registering a half-formed one, so coherence and completeness never
+    /// see an impl with no protocol to check it against.
     fn impl_def(&mut self, module: &[String], i: &ast::ImplDecl, span: &Span) {
         let Some(protocol) = self.lookup_protocol(module, &i.protocol) else {
             self.error(span.clone(), TypeErrorKind::UnknownProtocol(i.protocol.join("::")));
@@ -1066,16 +1176,6 @@ impl Env {
 
     // ---- name lookup ----
 
-    /// `path` as seen from `module`: an inner module's names shadow an outer's,
-    /// a `use` binds its last segment, and a fully qualified path always works.
-    /// The fully qualified names `path` could denote, seen from `module`, in priority
-    /// order: innermost scope first, and a `use` alias on the first segment before the
-    /// plain relative reading. Each caller keeps the first that its own table holds.
-    ///
-    /// This is what makes `io::println` work after `use std::io`: `io` is an alias for
-    /// `std::io`, so the first segment is rewritten and the rest appended. The single
-    /// case the old resolvers handled — `use std::io::println; println()` — is the same
-    /// rule with an empty tail.
     /// Whether a fully-qualified name resolves from `module`.
     ///
     /// A name inside an `internal mod` is reachable only from the subtree rooted at the
@@ -1111,12 +1211,26 @@ impl Env {
         true
     }
 
+    /// `path` as seen from `module`: an inner module's names shadow an outer's, a `use`
+    /// binds its last segment, and a fully qualified path always works. Anything the
+    /// caller may not reach is dropped here, so no lookup built on this can return an
+    /// `internal` name by accident — the filter is the enforcement, not a later check.
     fn candidates(&self, module: &[String], path: &[String]) -> Vec<String> {
         let mut out = self.candidates_raw(module, path);
         out.retain(|k| self.visible_from(module, k));
         out
     }
 
+    /// The fully qualified names `path` could denote, seen from `module`, in priority
+    /// order: innermost scope first, and a `use` alias on the first segment before the
+    /// plain relative reading, with globs last. Each caller keeps the first that its own
+    /// table holds — this proposes, it does not decide, which is how one rule serves
+    /// types, functions and protocols despite their living in three tables.
+    ///
+    /// Rewriting the first segment is what makes `io::println` work after `use std::io`:
+    /// `io` is an alias for `std::io`, so the head is replaced and the rest appended. The
+    /// single case the old resolvers handled — `use std::io::println; println()` — is the
+    /// same rule with an empty tail.
     fn candidates_raw(&self, module: &[String], path: &[String]) -> Vec<String> {
         let mut out = Vec::new();
         for n in (0..=module.len()).rev() {
@@ -1168,6 +1282,9 @@ impl Env {
         None
     }
 
+    /// The declared *type* `path` names, as seen from `module`, as a fully qualified key.
+    /// The key is what every other table is indexed by, so callers pass this on rather
+    /// than re-deriving a name from the written path.
     pub fn lookup(&self, module: &[String], path: &[String]) -> Option<String> {
         self.candidates(module, path).into_iter().find(|k| self.decls.contains_key(k))
     }
@@ -1178,12 +1295,6 @@ impl Env {
         self.candidates(module, path).into_iter().find_map(|k| self.protocol_ids.get(&k).copied())
     }
 
-    /// If a bare `name` was imported as a protocol method — `use M::P::method` — the
-    /// protocol it came from, so the call dispatches through `P` rather than searching
-    /// every protocol that declares `method`. Import as disambiguation.
-    /// Whether `ty` satisfies `protocol` -- has an impl covering it. For a
-    /// constructor-subject protocol the match is by head; otherwise `ty` must be a
-    /// subtype of the union of the protocol's impl targets.
     /// Whether `sub` is `want` or transitively requires it through supertraits, so a
     /// `where T: Ord` bound also satisfies a call needing `T: Eq`.
     pub fn protocol_extends(&self, sub: ProtocolId, want: ProtocolId) -> bool {
@@ -1200,6 +1311,10 @@ impl Env {
         false
     }
 
+    /// Whether `ty` satisfies `protocol` — has an impl covering it. For a
+    /// constructor-subject protocol the match is by head; otherwise `ty` must be a
+    /// subtype of the *union* of the protocol's impl targets, not a subtype of any one
+    /// of them, so a union type is satisfied when its arms are covered between them.
     pub fn type_satisfies(&mut self, ty: TyId, protocol: ProtocolId) -> bool {
         // A marker has no impls to search: it names a property the compiler can test, and
         // the type either has it or does not. `bound` is empty here because this is the
@@ -1275,6 +1390,17 @@ impl Env {
         matches!(name, "Ord")
     }
 
+    /// If a bare `name` was imported as a protocol method — `use M::P::method` — the
+    /// protocol it came from, so the call dispatches through `P` rather than searching
+    /// every protocol that declares `method`. Import as disambiguation: it is the answer
+    /// to `AmbiguousCall` that does not require writing `P::method` at each call.
+    ///
+    /// The protocol path is looked up from the root, not from `module`, because a `use`
+    /// is already absolute.
+    ///
+    /// Note the search stops at the first enclosing scope with no `use` table at all,
+    /// rather than continuing outwards: a module that imports nothing hides its parent's
+    /// imports from this query.
     pub fn imported_method(&self, module: &[String], name: &str) -> Option<ProtocolId> {
         for n in (0..=module.len()).rev() {
             let scope = module[..n].join("::");
@@ -1310,6 +1436,19 @@ impl Env {
         self.solver.t.defs.entry(n).or_insert(ty);
     }
 
+    /// Apply a declaration to type arguments, producing the type it denotes. Every path
+    /// from written syntax to a nominal type runs through here.
+    ///
+    /// The four sorts differ in exactly one way, and it is the important one. `Record`
+    /// and `Mu` **reserve** an id and memoise it *before* reading their body, so an
+    /// occurrence of the name inside that body finds the reserved id and the graph
+    /// closes; recursion through them is free. `Alias` and `Newtype` inline instead, so
+    /// there is no id to find and a cycle would expand forever — they push onto `active`
+    /// and report `RecursiveAlias`/`RecursiveNewtype` if they re-enter. That is the whole
+    /// reason `mu type` exists as a separate form.
+    ///
+    /// Failure always yields `error_ty` rather than a partly-built type, so one bad
+    /// declaration costs one diagnostic and everything downstream stays well-formed.
     pub fn instantiate(&mut self, key: &str, args: Vec<TyId>, span: &Span) -> TyId {
         let Some(decl) = self.decls.get(key) else {
             self.error(span.clone(), TypeErrorKind::Unknown(key.to_string()));
@@ -1400,6 +1539,12 @@ impl Env {
         ty
     }
 
+    /// The scope a declaration's body is read under: its own module — not the use site's
+    /// — with each generic parameter bound to the corresponding argument. Using the
+    /// declaring module is what makes a stdlib record's field types mean what they meant
+    /// where they were written, however the record is named from.
+    ///
+    /// Extra arguments are ignored; `instantiate` has already rejected a length mismatch.
     fn bind(&mut self, decl: &TypeDecl, args: &[TyId]) -> Scope {
         let mut scope = Scope::new(&decl.module);
         for (g, &a) in decl.generics().iter().zip(args) {
@@ -1408,6 +1553,13 @@ impl Env {
         scope
     }
 
+    /// A record's fields as a nominal type. `args` is carried into the nominal even
+    /// though the fields have already been substituted: it is what distinguishes
+    /// `Pair[i64]` from `Pair[str]` when they are compared or printed.
+    ///
+    /// Any poisoned field poisons the whole record. A record with one field missing would
+    /// otherwise go on to produce a `NoField` at every use of that field, burying the one
+    /// diagnostic that named the real problem.
     fn record_body(&mut self, r: &ast::RecordDecl, scope: &Scope, args: Vec<TyId>) -> TyId {
         let mut fields: Vec<(super::types::NameId, TyId)> = Vec::new();
         let mut poison = false;
@@ -1431,6 +1583,8 @@ impl Env {
 
 }
 
+/// The name a *type* declaration introduces. Everything else answers `""`, which never
+/// matches a real key — callers use this only after matching on the four type forms.
 fn decl_name(k: &ast::DeclKind) -> &str {
     match k {
         ast::DeclKind::Record(r) => &r.name,
@@ -1441,6 +1595,9 @@ fn decl_name(k: &ast::DeclKind) -> &str {
     }
 }
 
+/// The key a name is stored under. The single place a module path becomes a string, so
+/// the separator and the root-module case are decided once — `candidates` splits on the
+/// same `::` and would silently miss every name if the two disagreed.
 fn qualify(module: &[String], name: &str) -> String {
     if module.is_empty() {
         name.to_string()
@@ -1508,6 +1665,10 @@ struct Pos {
     contra: bool,
 }
 
+/// One `mu`'s contractivity walk. Holds `&Env` immutably on purpose: this runs between
+/// declaring and resolving, so there are no types to make yet and nothing here may
+/// instantiate anything. Errors are accumulated locally and handed back rather than
+/// pushed onto the env, which is what allows the caller to dedupe them.
 struct Contract<'a> {
     env: &'a Env,
     /// The declaration key being checked. `mu` binds itself: an occurrence of any
@@ -1520,6 +1681,10 @@ struct Contract<'a> {
     found: bool,
 }
 
+/// Walk one declaration's body looking for the recursive occurrence, returning the
+/// problems found and whether the name occurred at all. A non-`mu` declaration answers
+/// `(no errors, true)` — it has no obligation to recurse, and claiming it was not found
+/// would make the caller report `MuWithoutRecursion` against it.
 fn contractivity(env: &Env, key: &str) -> (Vec<TypeError>, bool) {
     let decl = &env.decls[key];
     let Sort::Mu(a) = &decl.sort else { return (vec![], true) };
@@ -1546,6 +1711,10 @@ fn contractivity(env: &Env, key: &str) -> (Vec<TypeError>, bool) {
 }
 
 impl Contract<'_> {
+    /// Walk a type expression, tracking the position the recursive variable would be in
+    /// if it turned up here. Union and intersection are *not* guards: `mu type T = T | i64`
+    /// unfolds to itself and never makes progress, so they pass `pos` through unchanged
+    /// while every genuine constructor sets `guarded`.
     fn walk(&mut self, spec: &ast::TypeSpec, ctx: &Rc<Ctx>, pos: Pos) {
         let under = Pos { guarded: true, ..pos };
         match &spec.kind {
@@ -1586,6 +1755,16 @@ impl Contract<'_> {
         }
     }
 
+    /// A name in the walk. Three outcomes: it is a generic parameter, so the walk
+    /// continues into whatever was substituted for it *under that argument's own
+    /// context*; it is this `mu` itself, which is the occurrence being judged; or it is
+    /// another declaration, which is followed according to its sort.
+    ///
+    /// Following other declarations is what makes the check see through aliases, and it
+    /// is bounded twice: `path` stops a revisit of the same (key, arguments) pair, and
+    /// `MAX_DEPTH` stops a chain that reaches fresh arguments forever. The second is
+    /// reported as `TooDeep` and marks `found`, so a `mu` too deep to judge is not also
+    /// accused of never recursing.
     fn named(
         &mut self,
         spec: &ast::TypeSpec,

@@ -6,11 +6,23 @@
 //! a `goto`, `return`, or `switch`, with block arguments assigned at the edge before the
 //! jump — which is how SSA-with-block-arguments lowers to C without φ-nodes.
 //!
-//! This is a growing emitter: scalars, strings, calls, control flow, and inline aggregates
-//! (records and tuples) are here; unions, the tagged-result calling convention, and the
-//! container runtime arrive with the pieces that back them.
+//! Three conventions run through the whole file and explain most of what looks odd:
+//!
+//! - a **throwing** function does not return its declared type. It returns the tagged
+//!   union `{ok, err}` that `Func::result_repr` builds, and `ret`/`throw` become an
+//!   injection into tag 0 or tag 1. Anything that computes a C return type has to go
+//!   through `fn_ret_type` for that reason, adapter thunks included.
+//! - a value crossing into a *wider* slot is **coerced**, never bit-copied: injected into
+//!   a union, boxed into `any`, or rebuilt field-by-field for width subtyping. Every flow
+//!   site — call argument, block argument, list element, record field, `return` — runs
+//!   `coerce`, because a value stored at its own narrow width in a wide slot is read
+//!   back past its end.
+//! - the runtime is generic over element types through **witnesses**: a size plus
+//!   retain/release/eq/cmp function pointers, emitted here per element repr, since the
+//!   runtime cannot know the layouts codegen invents. Natives that take an element
+//!   therefore take it by address rather than by value.
 
-use crate::backend::ctype::{field_name, fnv1a, type_tag, TypeTable};
+use crate::backend::ctype::{field_name, fnv1a, TypeTable};
 use crate::ir::repr::Repr;
 use crate::ir::ssa::{Block, Func, Op, PrimOp, Program, SwitchKey, Target, Term, Value};
 use std::fmt::Write;
@@ -19,7 +31,7 @@ use std::fmt::Write;
 pub fn emit(program: &Program) -> String {
     let types = TypeTable::build(program);
     let mut out = String::new();
-    out.push_str("#include \"rt.h\"\n\n");
+    out.push_str("#include \"libneon_rt.h\"\n\n");
 
     // Aggregate struct definitions, before any function that uses them.
     types.emit_defs(&mut out);
@@ -146,6 +158,12 @@ fn c_ret_type(types: &TypeTable, r: &Repr) -> String {
     }
 }
 
+/// One function body. Every SSA value is declared up front as a *function-scoped* local
+/// rather than at the instruction that defines it, so that a value defined in one block
+/// and read in another is in scope at both — blocks lower to labels and `goto`s, and some
+/// (a `switch` arm) sit inside braces that a declaration would not escape. Block
+/// parameters need this too: `emit_jump` assigns them on the edge, before the jump, which
+/// is only possible if the parameter's storage outlives the block that owns it.
 fn emit_fn(out: &mut String, types: &TypeTable, f: &Func) {
     let _ = writeln!(out, "{} {{", signature(types, f));
 
@@ -174,6 +192,10 @@ fn emit_fn(out: &mut String, types: &TypeTable, f: &Func) {
 }
 
 /// The values in a function that hold a throwing call's tagged result.
+///
+/// Currently unreferenced: the information it computes is obtained on demand instead, by
+/// asking `TypeTable::result_of` at the point a call is emitted, so nothing needs the
+/// whole-function map.
 fn throwing_call_results(
     types: &TypeTable,
     f: &Func,
@@ -191,6 +213,10 @@ fn throwing_call_results(
     out
 }
 
+/// One block: a label, its instructions, its terminator. The label is followed by an empty
+/// statement (`block0:;`) because C requires a label to precede a *statement*, and a block
+/// whose first line is a declaration — or which is empty but for its terminator's braces —
+/// would otherwise not compile.
 fn emit_block(out: &mut String, types: &TypeTable, f: &Func, b: &Block) {
     let _ = writeln!(out, "block{}:; ", b.id.0);
     for inst in &b.insts {
@@ -251,12 +277,16 @@ fn emit_inst(out: &mut String, types: &TypeTable, f: &Func, inst: &crate::ir::ss
     }
 }
 
-/// The element repr of a `List` result value.
 /// A value's list element repr, looking through a union it may be injected into.
+///
+/// Ices rather than falling back to `any`. A list builder's result *is* a list, so a miss
+/// means the repr was never pinned — and `any` was not a safe thing to guess: it has no
+/// interned value-witness, so the caller then emitted a null witness and the runtime lost
+/// the element size it copies slots by.
 fn list_elem(types: &TypeTable, f: &Func, v: Value) -> Repr {
     match list_variant(types, f.value_repr(v)) {
         Some(Repr::List(e)) => *e,
-        _ => Repr::Any,
+        _ => ice_repr(f.value_repr(v), "a list builder whose result is not a list"),
     }
 }
 
@@ -278,10 +308,16 @@ fn emit_make_list(out: &mut String, types: &TypeTable, f: &Func, result: Option<
     let Some(r) = result else { return };
     let target = types.resolve(f.value_repr(r)).clone();
     // What is built is always a list; the value's own repr may be a union it injects into.
-    let list = list_variant(types, &target).unwrap_or(Repr::List(Box::new(Repr::Any)));
+    // Both misses ice rather than defaulting to `List[any]`: the element repr chooses the
+    // witness the slots are sized and released by, so an `any` guessed here writes each
+    // element at the wrong width and hands the runtime a witness that does not exist.
+    let list = match list_variant(types, &target) {
+        Some(l) => l,
+        None => ice_repr(&target, "a list literal whose repr contains no list"),
+    };
     let elem = match &list {
         Repr::List(e) => (**e).clone(),
-        _ => Repr::Any,
+        other => ice_repr(other, "a list variant that is not a list"),
     };
     let ety = types.c_type(&elem);
     let n = elems.len();
@@ -322,8 +358,9 @@ fn emit_index(out: &mut String, types: &TypeTable, f: &Func, result: Option<Valu
     }
 }
 
-/// The list natives whose element crosses the ABI boundary (a witness for construction, a
-/// slot pointer for insertion) and so cannot use the plain by-value native call.
+/// The natives whose element or key crosses the ABI boundary (a witness for construction,
+/// a slot pointer for insertion) and so cannot use the plain by-value native call. Maps
+/// and `Resource` are here for the same reason lists are, despite the name.
 fn is_list_builder(symbol: &str) -> bool {
     matches!(
         symbol,
@@ -364,10 +401,15 @@ fn resource_drop_name(types: &TypeTable, t: &Repr, e: &Repr) -> String {
 }
 
 /// The key and value reprs of a `Map` value.
+///
+/// Ices rather than answering `(any, any)`. Both reprs are used to pick the witnesses a
+/// map hashes and sizes its slots by, and to coerce the key and value crossing the ABI —
+/// so guessing `any` here would size every slot as a box and copy the wrong width through
+/// a `void*`. Every caller is inside a `neon_map_*` arm whose result is a map.
 fn map_kv(f: &Func, v: Value) -> (Repr, Repr) {
     match f.value_repr(v) {
         Repr::Map(k, val) => ((**k).clone(), (**val).clone()),
-        _ => (Repr::Any, Repr::Any),
+        other => ice_repr(other, "a map native whose result is not a map"),
     }
 }
 
@@ -398,6 +440,9 @@ fn emit_native_out(
 ) {
     let Some(r) = result else { return };
     let Repr::Tuple(elems) = f.value_repr(r).clone() else { return };
+    // CORRECT DEFAULT: a native returning the empty tuple has no direct return and no
+    // out-parameters, so there is nothing to emit. `()` is `Repr::Unit`, not `Tuple([])`,
+    // so this is unreachable in practice as well.
     let Some((first, rest)) = elems.split_first() else { return };
 
     let mut call_args: Vec<String> = args.iter().map(|&v| prim_operand(f, v)).collect();
@@ -427,10 +472,29 @@ fn emit_native_out(
     let _ = writeln!(out, "}}");
 }
 
+/// The codegen-assisted call for each `is_list_builder` symbol.
+///
+/// These natives cannot use the ordinary by-value path because the runtime is generic over
+/// the element type and only the emitter knows it. Two things are therefore supplied here
+/// that no Neon signature mentions: the **witness** for the element (its size and its
+/// retain/release/eq/cmp), and the element itself **by address** so the container can copy
+/// `witness->size` bytes rather than a fixed-width scalar.
+///
+/// The element reprs come from the *result* value, not from the arguments: the argument
+/// may be narrower than the slot it is going into, and `addr_of` coerces it to the
+/// container's element repr first. Skipping that step is how a narrow value ends up read
+/// at the slot's wider size through a `void*`.
 fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Option<Value>, symbol: &str, args: &[Value]) {
     let Some(r) = result else { return };
-    let elem = list_elem(types, f, r);
-    let w = types.witness_ref(&elem);
+    // The element repr and its witness are computed *inside* the arms that use them, not
+    // once up front. Half the symbols here return a `Map` or a `Resource`, so asking a
+    // non-list for its element type is not a corner case, it is the common path — and
+    // hoisting it meant `list_elem` had to answer something for a `Map`. It answered `any`,
+    // whose witness does not exist, so `witness_ref` returned a null pointer that these
+    // arms then discarded unused. Harmless by luck, and it is what stopped both of those
+    // functions from being able to refuse.
+    let elem = || list_elem(types, f, r);
+    let w = || types.witness_ref(&elem());
     let rhs = match symbol {
         // A map's key crosses the boundary by address, like a list element, and its
         // witnesses come from the emitter — the runtime cannot know them.
@@ -472,19 +536,23 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
                 resource_drop_name(types, &t, &e)
             )
         }
-        "neon_list_new" => format!("neon_list_new({w})"),
-        "neon_list_new_with_capacity" => format!("neon_list_new_with_capacity({w}, {})", var(args[0])),
+        "neon_list_new" => format!("neon_list_new({})", w()),
+        "neon_list_new_with_capacity" => {
+            format!("neon_list_new_with_capacity({}, {})", w(), var(args[0]))
+        }
         // The element is passed by address; the list moves its bytes in through the witness.
         "neon_list_push" => {
-            format!("neon_list_push({}, {})", var(args[0]), addr_of(types, f, args[1], &elem))
+            format!("neon_list_push({}, {})", var(args[0]), addr_of(types, f, args[1], &elem()))
         }
         "neon_list_set" => format!(
             "neon_list_set({}, {}, {})",
             var(args[0]),
             var(args[1]),
-            addr_of(types, f, args[2], &elem)
+            addr_of(types, f, args[2], &elem())
         ),
-        _ => unreachable!(),
+        // `is_list_builder` is the only gate on reaching here, so the two lists must
+        // agree; a symbol added to one and not the other would otherwise emit nothing.
+        other => unreachable!("codegen: `{other}` is an is_list_builder with no emission"),
     };
     let _ = writeln!(out, "{} = {};", var(r), rhs);
 }
@@ -514,6 +582,11 @@ fn emit_resource_drops(out: &mut String, types: &TypeTable, program: &Program) {
                     continue;
                 }
                 let Op::Native { args, .. } = &inst.op else { continue };
+                // CORRECT DEFAULT here, and checked elsewhere: skipping emits no drop for
+                // this instantiation, but `emit_list_builder` reaches the same
+                // `cleanup_shape` for the same instruction and `expect`s it, so a `None`
+                // fails there with a message rather than silently shipping a resource whose
+                // cleanup never runs.
                 let Some((t, e, ret)) = cleanup_shape(f, args[1]) else { continue };
                 seen.insert(resource_drop_name(types, &t, &e), (t, e, ret));
             }
@@ -531,10 +604,14 @@ fn emit_resource_drops(out: &mut String, types: &TypeTable, program: &Program) {
         let retc = if throws { types.c_type(&tagged) } else { "void".to_string() };
         let _ = writeln!(out, "static void {name}(void* p) {{");
         let _ = writeln!(out, "    neon_resource* r = (neon_resource*)p;");
-        let _ = writeln!(out, "    if (r->armed) {{");
-        let _ = writeln!(out, "        r->armed = false;");
-        let _ = writeln!(out, "        {tc} pay;");
-        let _ = writeln!(out, "        memcpy(&pay, neon_resource_payload(r), sizeof pay);");
+        let _ = writeln!(out, "    {tc} pay;");
+        // `neon_resource_take` disarms and moves the payload out, zeroing the source. The
+        // zeroing matters: the closure below consumes the payload, and
+        // `neon_resource_finish` releases whatever is left in the slot, so bytes left
+        // behind are released twice. Keeping that in the runtime beside `disarm` is what
+        // stops the two paths drifting -- they did, and the drop path use-after-freed
+        // every refcounted payload while every `Resource[i64, E]` ran clean.
+        let _ = writeln!(out, "    if (neon_resource_take(r, &pay)) {{");
         let call = format!(
             "(({retc}(*)(neon_header*, {tc}))r->cleanup.fn)(r->cleanup.env, pay)"
         );
@@ -574,6 +651,9 @@ fn emit_thunks(out: &mut String, types: &TypeTable, program: &Program) {
         return;
     }
     for name in targets {
+        // CORRECT DEFAULT: `targets` is collected from `MakeClosure` ops, whose `func`
+        // always names a function in this program, so the miss cannot happen. If it did,
+        // the omitted thunk is an undefined symbol at link time — never a silent answer.
         let Some(target) = by_name.get(name) else { continue };
         let params: Vec<String> = target
             .params
@@ -650,7 +730,7 @@ fn emit_key_witnesses(out: &mut String, types: &TypeTable) {
         let _ = writeln!(
             out,
             "static uint64_t {name}_hash(const void* p) {{ const {ty}* e = (const {ty}*)p; return {}; }}",
-            hash_expr(repr, "(*e)"),
+            hash_expr(types, repr, "(*e)"),
         );
         let _ = writeln!(
             out,
@@ -670,18 +750,39 @@ fn emit_key_witnesses(out: &mut String, types: &TypeTable) {
 
 /// Hash a key by *content*. A string hashes its bytes, an aggregate mixes its fields, and
 /// anything flat hashes its representation.
-fn hash_expr(r: &Repr, e: &str) -> String {
+///
+/// **The invariant this function exists to keep is `eq_expr(a, b) => hash(a) == hash(b)`.**
+/// Break it and the key is simply not found: it hashes to a bucket nobody looks in, and
+/// the map answers `false` to a `contains` for a key it holds. There is no crash and no
+/// diagnostic, which is why every arm below is spelled out and the match has no catch-all.
+///
+/// The catch-all it replaces hashed the raw representation, and was reached by every shape
+/// `eq_expr` compares *structurally* through a pointer or a tag. `Map[str | null, V]` was
+/// the smallest case: `nkw0_eq` called `neon_str_eq` while `nkw0_hash` hashed the
+/// `{data, len, owner}` triple, so two equal strings at different addresses compared equal
+/// and hashed differently, and a 40-entry map found none of them.
+///
+/// Weak-but-correct beats wrong: where no content hash is expressible here (a `List`, a
+/// `Map`, a self-referencing record) this hashes a length or a constant, which collides
+/// more but always lets `eq` decide. Only a *disagreement* loses data.
+fn hash_expr(types: &TypeTable, r: &Repr, e: &str) -> String {
+    // Bound rather than matched on, for the same reason `eq_expr` binds it: the `Nullable`
+    // arm passes `r` to `null_test`, which must see the resolved shape.
+    let r = types.resolve(r);
     match r {
         Repr::Str => format!("neon_hash_bytes({e}.data, {e}.len)"),
         Repr::Record { fields, .. } => fields
             .iter()
-            .map(|(n, fr)| hash_expr(fr, &format!("{e}.{}", field_name(n))))
+            .map(|(n, fr)| hash_expr(types, fr, &format!("{e}.{}", field_name(n))))
             .reduce(|a, b| format!("neon_hash_mix({a}, {b})"))
+            // CORRECT DEFAULT: a fieldless record has no content to mix, so every value of
+            // it hashes alike — which is what `eq_expr` requires, since it answers `true`
+            // for any two of them.
             .unwrap_or_else(|| "0".into()),
         Repr::Tuple(elems) => elems
             .iter()
             .enumerate()
-            .map(|(i, er)| hash_expr(er, &format!("{e}._{i}")))
+            .map(|(i, er)| hash_expr(types, er, &format!("{e}._{i}")))
             .reduce(|a, b| format!("neon_hash_mix({a}, {b})"))
             .unwrap_or_else(|| "0".into()),
         // By length, not by address: `eq_expr` compares lists elementwise, and equal keys
@@ -691,7 +792,71 @@ fn hash_expr(r: &Repr, e: &str) -> String {
         // same-length lists degrades toward a linear probe, and buying more than that
         // means giving every element type a hash function.
         Repr::List(_) => format!("neon_hash_bytes(&{e}->len, sizeof {e}->len)"),
-        _ => format!("neon_hash_bytes(&{e}, sizeof {e})"),
+        // Same bargain as `List`, for the same reason: `eq_expr` calls `neon_map_eq`, which
+        // is content equality, so the address must not enter the hash. Entry count is the
+        // only content-derived number reachable from an expression.
+        Repr::Map(_, _) => format!("neon_hash_bytes(&{e}->len, sizeof {e}->len)"),
+        // `eq_expr` walks a self-referencing record through a generated recursive function;
+        // an expression cannot follow that walk, so every such key hashes alike and `eq`
+        // decides. Degenerate (a linear scan) but never wrong -- unlike hashing the
+        // pointer, which disagreed with an `eq` that reads through it.
+        Repr::BoxedRec(_) => "0".to_string(),
+        // Null-ness first, exactly as `eq_expr` tests it: all nulls share one hash, and a
+        // present payload hashes as itself. Hashing the pointer-or-`neon_str` whole is what
+        // broke `Map[str | null, V]`.
+        Repr::Nullable(inner) => {
+            format!("({} ? 0ULL : {})", null_test(r, e), hash_expr(types, inner, e))
+        }
+        // Tag first, then the payload that tag selects -- mirroring `eq_expr`, which
+        // requires equal tags. Hashing the payload union whole read the bytes past the live
+        // variant, which are never written.
+        Repr::Union(variants) => variants
+            .iter()
+            .enumerate()
+            .rev()
+            .fold("0ULL".to_string(), |rest, (i, v)| {
+                let h = hash_expr(types, v, &format!("{e}.u._{i}"));
+                format!("({e}.tag == {i} ? neon_hash_mix({i}ULL, {h}) : {rest})")
+            }),
+        // One inhabitant, so `eq_expr` answers `true` without reading anything and the hash
+        // must be a constant too. A `neon_unit` in a union payload is never written, so
+        // hashing its byte would hash uninitialised memory -- a key that does not reliably
+        // hash to the same bucket as itself.
+        Repr::Unit | Repr::Null => "0ULL".to_string(),
+        // Flat scalars, compared with `==`. `f64` inherits IEEE's two quirks here: `-0.0`
+        // and `+0.0` are `==` but hash differently, and a NaN key is never equal to itself.
+        // Both follow from structural comparison at the leaf (docs/decisions.md).
+        Repr::I64 | Repr::F64 | Repr::Bool | Repr::Tag => {
+            format!("neon_hash_bytes(&{e}, sizeof {e})")
+        }
+        // Identity, matching an `eq_expr` that is also identity: two handles are the same
+        // handle or they are not, and an erased value's box is compared by address.
+        Repr::Runtime { .. } | Repr::Any | Repr::Closure { .. } => {
+            format!("neon_hash_bytes(&{e}, sizeof {e})")
+        }
+        // Uninhabited: emitted as the dead arm of a union's tag chain, never evaluated.
+        Repr::Never => "0ULL".to_string(),
+        other => ice_repr(other, "hashing a map key"),
+    }
+}
+
+/// A repr the backend cannot lower. The counterpart of `ctype::ice`, for the emitters that
+/// live here; see that function's doc comment for why this panics rather than guessing.
+fn ice_repr(r: &Repr, what: &str) -> ! {
+    panic!("internal error: codegen reached {what}: {r:?}")
+}
+
+/// Whether `cmp_expr` can order this repr — the backend's half of the checker's
+/// `is_ordered`. A union has no order (ranking its arms would be an invention), and a
+/// closure, map or boxed recursive record has none either; an aggregate is ordered exactly
+/// when every part of it is.
+fn has_order(r: &Repr) -> bool {
+    match r {
+        Repr::I64 | Repr::F64 | Repr::Bool | Repr::Tag | Repr::Str | Repr::Unit | Repr::Null => true,
+        Repr::Record { fields, .. } => fields.iter().all(|(_, fr)| has_order(fr)),
+        Repr::Tuple(elems) => elems.iter().all(has_order),
+        Repr::List(e) => has_order(e),
+        _ => false,
     }
 }
 
@@ -707,20 +872,9 @@ fn hash_expr(r: &Repr, e: &str) -> String {
 /// arms fall through to `0`, reporting NaN equal to everything. That is the documented
 /// consequence of using IEEE semantics at the leaf — see "Comparison is structural" in
 /// docs/decisions.md — and it is why `sort` on a list holding NaN has no defined result.
-/// Whether `cmp_expr` can order this repr — the backend's half of the checker's
-/// `is_ordered`. A union has no order (ranking its arms would be an invention), and a
-/// closure, map or boxed recursive record has none either; an aggregate is ordered exactly
-/// when every part of it is.
-fn has_order(r: &Repr) -> bool {
-    match r {
-        Repr::I64 | Repr::F64 | Repr::Bool | Repr::Tag | Repr::Str | Repr::Unit | Repr::Null => true,
-        Repr::Record { fields, .. } => fields.iter().all(|(_, fr)| has_order(fr)),
-        Repr::Tuple(elems) => elems.iter().all(has_order),
-        Repr::List(e) => has_order(e),
-        _ => false,
-    }
-}
-
+///
+/// The final arm panics rather than falling back: `has_order` decides which reprs may
+/// reach here, and a repr arriving that it excludes means the two have drifted apart.
 fn cmp_expr(types: &TypeTable, r: &Repr, a: &str, b: &str) -> String {
     match r {
         Repr::Str => format!("neon_str_cmp({a}, {b})"),
@@ -766,6 +920,11 @@ fn lex_then(types: &TypeTable, r: &Repr, a: &str, b: &str, rest: &str) -> String
 /// Whether an expression of nullable repr `r` holds null, as a C condition. Mirrors
 /// `is_null`, which answers the same question for a `Value` rather than an expression.
 fn null_test(r: &Repr, e: &str) -> String {
+    // The catch-all is a pointer test, which is right for every nullable whose payload is
+    // pointer-backed — a list, a map, a boxed record, a runtime handle. `str` and closures
+    // are the two that are *not* bare pointers and so get their own arms above. A payload
+    // that is neither (an `i64 | null` is a `Repr::Union`, never a `Nullable`) would emit
+    // `struct == NULL`, which `cc` rejects: a loud failure, not a wrong answer.
     match r {
         Repr::Nullable(inner) if matches!(inner.as_ref(), Repr::Str) => format!("({e}.data == NULL)"),
         // A closure is a `{fn, env}` pair: a capture-less closure has a NULL env and is
@@ -778,7 +937,17 @@ fn null_test(r: &Repr, e: &str) -> String {
 }
 
 /// Content equality, matching `hash_expr`: equal keys must hash equal.
+///
+/// Exhaustive, and deliberately so. The `memcmp` catch-all this replaces was correct only
+/// for a repr with no padding and no indirection, and every arm added below was previously
+/// reached by it: a `Recursive` back-edge (never resolved, so a `mu` type compared as raw
+/// bytes), a `Closure`, an erased `any`, and the uninhabited error half of every
+/// non-throwing function's tagged result.
 fn eq_expr(types: &TypeTable, r: &Repr, a: &str, b: &str) -> String {
+    // Bound, not just matched on: the `Nullable` arm hands `r` to `null_test`, and an
+    // unresolved back-edge there missed the `Nullable(Closure)` case and emitted
+    // `neon_closure == NULL`, which C rejects outright.
+    let r = types.resolve(r);
     match r {
         Repr::Str => format!("neon_str_eq({a}, {b})"),
         Repr::Record { fields, .. } => fields
@@ -801,18 +970,19 @@ fn eq_expr(types: &TypeTable, r: &Repr, a: &str, b: &str) -> String {
         Repr::List(_) => format!("neon_list_eq({a}, {b})"),
         // Same keys with equal values, regardless of slot order.
         Repr::Map(_, _) => format!("neon_map_eq({a}, {b})"),
-        // A handle has no content to compare; two of them are the same file only when they
-        // are the same handle. `is_equatable` rejects it, so this is unreachable in a
-        // checked program and exists to keep the match honest.
         // Identity, not contents: two handles are the same handle or they are not.
         // The per-type entry that a uniform `Runtime` repr cannot derive.
         Repr::Runtime { .. } => format!("({a} == {b})"),
         // A self-referencing record is a pointer, and comparing it means walking through
         // that pointer -- which a nested expression cannot do, since the walk recurses.
         // `emit_boxed_eq` generates one function per boxed record for exactly this.
-        Repr::BoxedRec(_) => match types.boxed_shape(r) {
+        // A `false` here would be a plausible-looking answer to "are these two records
+        // equal" for a record whose wrapper was never registered -- so it ices instead.
+        // `emit_boxed_eq` generates one `_eq` per entry in the same table, so a miss means
+        // the two walked different tables.
+        boxed @ Repr::BoxedRec(_) => match types.boxed_shape(boxed) {
             Some((name, _)) => format!("{name}_eq({a}, {b})"),
-            None => "false".to_string(),
+            None => ice_repr(boxed, "comparing a boxed record with no registered wrapper"),
         },
         // One inhabitant: two of them are equal without reading anything. Reading would in
         // fact be wrong -- a `neon_unit` in a union payload is never written, so `memcmp`
@@ -837,7 +1007,26 @@ fn eq_expr(types: &TypeTable, r: &Repr, a: &str, b: &str) -> String {
             });
             format!("({a}.tag == {b}.tag && {arms})")
         }
-        _ => format!("(memcmp(&{a}, &{b}, sizeof {a}) == 0)"),
+        // No structural answer exists for a function, and `is_equatable` rejects `==` on
+        // one for exactly that reason -- but a value-witness is emitted for *every*
+        // element repr, used or not, so `List[fn]` still needs an `eq` that compiles.
+        // Identity is what that one means: the same `{fn, env}` pair or not.
+        Repr::Closure { .. } => {
+            format!("(({a}.fn == {b}.fn) && ({a}.env == {b}.env))")
+        }
+        // Same shape: `is_equatable` rejects `==` on `any`, and this exists only so a
+        // container of `any` has a witness. Box identity, matching `hash_expr`. Content
+        // equality through a box would need the runtime to dispatch on the stored tag.
+        Repr::Any => format!("({a} == {b})"),
+        // Uninhabited. This is emitted, and often: it is the error half of a *non*-throwing
+        // function's tagged result, so the union arm above walks it and a C expression has
+        // to appear. `true` is the answer for a variant no value can hold, and the tag test
+        // guarding it is never satisfied.
+        Repr::Never => "true".to_string(),
+        // A back-edge is resolved at the top of this match; reaching here means it names a
+        // type the table does not hold, and comparing it would compare a pointer to a
+        // structure this function is meant to walk.
+        other => ice_repr(other, "structural equality"),
     }
 }
 
@@ -871,7 +1060,11 @@ fn emit_boxed_eq(out: &mut String, types: &TypeTable) {
     }
 }
 
-/// Emit a value-witness (size plus in-place retain/release) for each container element type.
+/// Emit a value-witness for each container element type: its size, in-place retain and
+/// release, structural equality, and — only when `has_order` admits the repr — a compare.
+/// A null function pointer stands for "nothing to do": an element with no counted parts
+/// gets no retain or release, and an unordered one gets no `cmp`, so the runtime skips the
+/// work instead of calling a function that does nothing.
 fn emit_witnesses(out: &mut String, types: &TypeTable) {
     for (name, repr) in types.witnesses() {
         let ty = types.c_type(repr);
@@ -919,6 +1112,13 @@ fn emit_witness_fn(out: &mut String, types: &TypeTable, name: &str, repr: &Repr,
     fname
 }
 
+/// A block's terminator.
+///
+/// The `throws` arms come first and are what makes the calling convention real: in a
+/// throwing function *both* `ret` and `throw` are C `return` statements, differing only in
+/// which tag of the result union they inject into. A `throw` in a function that declares
+/// no `throws` has no such union to return through, so it can only panic — that is an
+/// error escaping `main`, not an unhandled case.
 fn emit_term(out: &mut String, types: &TypeTable, f: &Func, term: &Term) {
     match term {
         // A throwing function returns a tagged result: variant 0 is the value, 1 the error.
@@ -1004,9 +1204,17 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             let coerced: Vec<String> = args
                 .iter()
                 .enumerate()
+                // Passing the argument uncoerced is precisely the failure `coerce` exists
+                // to prevent: a narrow value written into a wider parameter slot, read back
+                // past its own end. A miss means either a call to a function not in the
+                // program or more arguments than parameters, neither of which the checker
+                // lets through — so it refuses rather than emitting the unchecked copy.
                 .map(|(i, &a)| match params.and_then(|p| p.get(i)) {
                     Some(t) => coerce(types, f, a, t),
-                    None => var(a),
+                    None => panic!(
+                        "internal error: codegen reached argument {i} of a call to `{func}` \
+                         with no parameter repr to coerce it into"
+                    ),
                 })
                 .collect();
             format!("{}({})", mangle(func), coerced.join(", "))
@@ -1017,6 +1225,9 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             format!("{symbol}({})", a.join(", "))
         }
         Op::CallClosure { callee, args } => {
+            // CORRECT DEFAULT: a closure call whose result is unused is a call for effect,
+            // and `c_ret_type` turns `Unit` into `void` — which is what the callee's own
+            // signature says for a unit-returning function, so the cast still matches.
             let ret = result.map(|v| f.value_repr(v)).cloned().unwrap_or(Repr::Unit);
             let params: Vec<String> =
                 std::iter::once("neon_header*".to_string())
@@ -1029,6 +1240,11 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             format!("(({fnty}){}.fn)({})", var(*callee), a.join(", "))
         }
         Op::MakeRecord { fields, .. } => {
+            // CORRECT DEFAULT, and inert. A `MakeRecord` whose result is dropped has no
+            // struct to name; `Unit` makes `c_type` spell `neon_unit`, and the initialiser
+            // list built below would then be `(neon_unit){.f_x = ..}` — rejected by `cc`,
+            // loudly, at the one place the mistake is visible. It is not a value that can
+            // be read back wrong, which is the property that matters here.
             let repr = result.map(|v| f.value_repr(v)).cloned().unwrap_or(Repr::Unit);
             // A recursive record lives on the heap, so what is built is its pointee shape;
             // the fields are read off that, not off the pointer.
@@ -1037,6 +1253,8 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
                 Some(s) => types.c_type(s),
                 None => types.c_type(&repr),
             };
+            // CORRECT DEFAULT: `boxed_shape` is `None` for everything that is not a boxed
+            // record, which is the ordinary case — the record is its own layout.
             let laid_out = shape.clone().unwrap_or_else(|| repr.clone());
             // Each field value is coerced into the field's declared repr (so a concrete
             // value flowing into a union or nullable field is injected).
@@ -1047,9 +1265,16 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             let inits: Vec<String> = fields
                 .iter()
                 .map(|(n, v)| {
+                    // Same reasoning as the call above: an uncoerced field initialiser is a
+                    // value stored at its own narrow width in the field's wider slot. The
+                    // fields being initialised come from the record being built, so a name
+                    // missing from that record's own layout is a codegen bug, not input.
                     let val = match field_repr(n) {
                         Some(t) => coerce(types, f, *v, &t),
-                        None => var(*v),
+                        None => panic!(
+                            "internal error: codegen reached record field `{n}`, which the \
+                             layout being built does not declare: {laid_out:?}"
+                        ),
                     };
                     format!(".{} = {}", field_name(n), val)
                 })
@@ -1063,8 +1288,7 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
                 let inner = format!("{}->value", var(*base));
                 return match shape {
                     Repr::Union(variants) => {
-                        let i =
-                            variants.iter().position(|v| record_has_field(v, field)).unwrap_or(0);
+                        let i = union_field_index(types, variants, field);
                         format!("{inner}.u._{i}.{}", field_name(field))
                     }
                     _ => format!("{inner}.{}", field_name(field)),
@@ -1073,13 +1297,15 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
             match brepr {
                 // Accessing a field of a union value: project to the variant that has it.
                 Repr::Union(variants) => {
-                    let i = variants.iter().position(|v| record_has_field(v, field)).unwrap_or(0);
+                    let i = union_field_index(types, variants, field);
                     format!("{}.u._{i}.{}", var(*base), field_name(field))
                 }
                 _ => format!("{}.{}", var(*base), field_name(field)),
             }
         }
         Op::MakeTuple(elems) => {
+            // As in `MakeRecord`: a discarded tuple has no struct to name, and `neon_unit`
+            // with element initialisers does not compile rather than miscompiling.
             let repr = result.map(|v| f.value_repr(v)).cloned().unwrap_or(Repr::Unit);
             let ty = types.c_type(&repr);
             let inits: Vec<String> =
@@ -1094,20 +1320,41 @@ fn op_rhs(types: &TypeTable, f: &Func, result: Option<Value>, op: &Op) -> String
         Op::UnwrapErr(v) => format!("{}.u._1", var(*v)),
         Op::IsNull(v) => is_null(f, *v),
         Op::IsVariant { value, variant } => match f.value_repr(*value) {
+            // A type the union does not contain is one the value cannot be, so the answer
+            // is `false` — not `tag == 0`. That fallback made `x is C` on an `A | B` come
+            // back *true* for every `A`, because variant 0 is `A` and `tag == 0` is the
+            // test for holding it. The checker allows the test (it is a legitimate question
+            // with a known answer), so this is reachable from ordinary source.
             Repr::Union(variants) => {
-                let i = variants
-                    .iter()
-                    .position(|v| variant_name(v).as_deref() == Some(variant.as_str()))
-                    .unwrap_or(0);
-                format!("({}.tag == {i})", var(*value))
+                match variants.iter().position(|v| names_variant(types, v, variant)) {
+                    Some(i) => format!("({}.tag == {i})", var(*value)),
+                    None => "false".into(),
+                }
             }
             // An erased value carries its concrete type as a tag in its box.
             Repr::Any => format!("(neon_box_tag({}) == {}ULL)", var(*value), fnv1a(variant)),
+            // A nullable is a two-variant union whose discriminant is the pointer itself,
+            // so `x is T` is a *runtime* null test, not a static answer. Falling through to
+            // the concrete arm below folded it to `true`, because `type_tag_name` names a
+            // `Nullable(T)` after its payload: a `while cur is str` on a `str | null` then
+            // looped forever with `cur` null inside the body.
+            Repr::Nullable(inner) => {
+                if variant == "null" {
+                    is_null(f, *value)
+                } else if names_variant(types, inner, variant) {
+                    format!("(!{})", is_null(f, *value))
+                } else {
+                    "false".into()
+                }
+            }
             // A value of one concrete type is that variant only if it *is* that type —
             // `r is Green` where `r` is a `Red` is false, not vacuously true.
-            other => (variant_name(other).as_deref() == Some(variant.as_str())).to_string(),
+            other => names_variant(types, other, variant).to_string(),
         },
         Op::Cast(v) => {
+            // CORRECT DEFAULT: a cast whose result is discarded has no target to move the
+            // value into. `Any` boxes it and the statement is then thrown away — the value
+            // never reaches a slot, so no reader can misread it.
             let target = result.map(|r| f.value_repr(r).clone()).unwrap_or(Repr::Any);
             cast_expr(types, &var(*v), f.value_repr(*v), &target)
         }
@@ -1157,10 +1404,14 @@ fn cast_expr(types: &TypeTable, expr: &str, src: &Repr, target: &Repr) -> String
 /// nullable pointer is null when the pointer (or a string's data) is NULL.
 fn is_null(f: &Func, v: Value) -> String {
     match f.value_repr(v) {
-        Repr::Union(variants) => {
-            let i = variants.iter().position(|r| matches!(r, Repr::Null)).unwrap_or(0);
-            format!("({}.tag == {i})", var(v))
-        }
+        // A union with no `null` arm can never be null, and saying so is the whole point:
+        // falling back to index 0 asked `tag == 0`, which is *true* whenever the value
+        // holds its first variant. `x == null` on an `i64 | str` would have answered yes
+        // for every `i64`.
+        Repr::Union(variants) => match variants.iter().position(|r| matches!(r, Repr::Null)) {
+            Some(i) => format!("({}.tag == {i})", var(v)),
+            None => "false".into(),
+        },
         Repr::Nullable(inner) if matches!(inner.as_ref(), Repr::Str) => {
             format!("({}.data == NULL)", var(v))
         }
@@ -1192,6 +1443,10 @@ fn newtype_inner(r: &Repr) -> Option<&Repr> {
 /// arithmetic or comparison on a narrowed nullable operates on.
 fn scalar_repr(r: &Repr) -> &Repr {
     match r {
+        // CORRECT DEFAULT: a union of nothing but `null` has no non-null variant to
+        // collapse to, and the union itself is the honest answer — `Null` is a `neon_unit`
+        // with one inhabitant, so every caller of this treats it as an aggregate and
+        // compares it with `eq_expr`, which answers without reading any bytes.
         Repr::Union(variants) => variants.iter().find(|v| !matches!(v, Repr::Null)).unwrap_or(r),
         _ => r,
     }
@@ -1226,6 +1481,8 @@ fn union_compare(types: &TypeTable, f: &Func, op: PrimOp, args: &[Value]) -> Opt
 fn prim_operand(f: &Func, v: Value) -> String {
     match f.value_repr(v) {
         Repr::Union(variants) => {
+            // CORRECT DEFAULT: reached only when every variant is `Null`, in which case
+            // index 0 *is* the null variant — the right slot, not a guess at one.
             let i = variants.iter().position(|r| !matches!(r, Repr::Null)).unwrap_or(0);
             format!("{}.u._{i}", var(v))
         }
@@ -1236,22 +1493,58 @@ fn prim_operand(f: &Func, v: Value) -> String {
 /// The name an `is Name` test asks for. A union's variants are not only records: a union
 /// of primitives (`i64 | str | bool`) is tested by type name, so this uses the same naming
 /// as the boxed type tag rather than recognising records alone.
-fn variant_name(r: &Repr) -> Option<String> {
+/// Whether `r` is the variant the source named in an `is` test.
+///
+/// A recursive record is a `BoxedRec` carrying an atom id, not a `Record`, so its own name
+/// is only reachable through the type table. Comparing without this resolution answered
+/// `record Node { next: Node | null }`'s `x is Node` with the *key* of a boxed repr, which
+/// never equals `Node`: every `is` against a recursive record was silently false, and the
+/// union arm's positional search fell back to variant 0.
+fn names_variant(types: &TypeTable, r: &Repr, variant: &str) -> bool {
+    let r = types.resolve(r);
+    if let Some((_, pointee)) = types.boxed_shape(r) {
+        return variant_name(types, pointee).as_deref() == Some(variant);
+    }
+    variant_name(types, r).as_deref() == Some(variant)
+}
+
+fn variant_name(types: &TypeTable, r: &Repr) -> Option<String> {
     match r {
         Repr::Record { name, .. } => name.clone(),
         Repr::Var(_) | Repr::Never | Repr::Any => None,
-        other => Some(crate::backend::ctype::type_tag_name(other)),
+        other => Some(types.type_tag_name(other)),
     }
 }
 
 /// Whether a variant is a record carrying the named field.
-fn record_has_field(r: &Repr, field: &str) -> bool {
+///
+/// Resolved through a back-edge and a box first, for the reason `names_variant` is: a
+/// self-referencing record reaches here as a `BoxedRec` atom id and a `mu` type as a
+/// `Recursive`, neither of which is a `Repr::Record`. Asking the bare repr answered "no"
+/// for every variant of `A | B` when `A` and `B` are recursive, and the caller's positional
+/// search then fell back to variant 0 -- reading the field at another variant's offset.
+fn record_has_field(types: &TypeTable, r: &Repr, field: &str) -> bool {
+    let r = types.resolve(r);
+    let r = types.boxed_shape(r).map_or(r, |(_, pointee)| pointee);
     matches!(r, Repr::Record { fields, .. } if fields.iter().any(|(n, _)| n == field))
 }
 
-/// Coerce a value into a target repr at a flow site. A concrete value flowing into a union
-/// is injected as `{tag, payload}`; `null` into a nullable pointer becomes NULL; a value
-/// whose repr already matches passes through.
+/// The index of the union variant carrying `field`.
+///
+/// Ices rather than defaulting. The `unwrap_or(0)` this replaces produced a *type-correct*
+/// C field access into the wrong arm of the payload union -- a read at whatever offset
+/// variant 0 puts that field name at, or at no valid offset at all. That is the exact
+/// shape of the `Op::IsVariant` bug: an answer where there should have been a refusal.
+fn union_field_index(types: &TypeTable, variants: &[Repr], field: &str) -> usize {
+    match variants.iter().position(|v| record_has_field(types, v, field)) {
+        Some(i) => i,
+        None => panic!(
+            "internal error: codegen reached a field access for `{field}`, which no variant \
+             of the union carries: {variants:?}"
+        ),
+    }
+}
+
 /// The address of a value as the container's slot type. A container copies
 /// `witness->size` bytes through this pointer, so a value that has not been injected into
 /// the slot's type first is read past its own end — a `1.0` handed to a `Map[str, Json]`
@@ -1265,10 +1558,26 @@ fn addr_of(types: &TypeTable, f: &Func, v: Value, target: &Repr) -> String {
     format!("({}[]){{{}}}", types.c_type(target), coerce(types, f, v, target))
 }
 
+/// Coerce a value into a target repr at a flow site: the `Value` form of `coerce_expr`.
 fn coerce(types: &TypeTable, f: &Func, v: Value, target: &Repr) -> String {
     coerce_expr(types, &var(v), f.value_repr(v), target)
 }
 
+/// Move a C expression from the repr it has to the repr its destination wants.
+///
+/// This is the widening direction only — injection into a union, boxing into `any`, width
+/// and covariant subtyping on records and tuples. Narrowing is `cast_expr`, which tries
+/// the projections first and then delegates here for everything that is not a projection.
+///
+/// It must be applied at *every* flow site, because the IR is typed more precisely than
+/// the slots values land in: the IR knows a literal is an `i64`, while the field it is
+/// being stored into is an `i64 | str` whose C struct is wider. Assigning without coercing
+/// compiles — C is happy to convert — and then the reader takes the tag from whatever
+/// happened to be in the adjacent bytes.
+///
+/// The `{0}` at the end is not a fallback for "shapes we did not handle". It is the arm of
+/// a branch the checker already proved dead, which still has to compile; if a live value
+/// reaches it, the bug is upstream, in whatever produced a repr pair that cannot convert.
 fn coerce_expr(types: &TypeTable, expr: &str, src: &Repr, target: &Repr) -> String {
     // Resolve back-edges first, or none of the shape tests below fire: injecting an atom
     // into `mu type A = :ok | List[A]` saw a `Recursive` rather than the union it names,
@@ -1287,12 +1596,35 @@ fn coerce_expr(types: &TypeTable, expr: &str, src: &Repr, target: &Repr) -> Stri
             "neon_box_new(({}[]){{{expr}}}, {}, {}ULL)",
             types.c_type(src),
             types.witness_ref(src),
-            type_tag(src),
+            types.type_tag(src),
         );
     }
     if let Repr::Union(variants) = target {
         if let Some(i) = variants.iter().position(|vr| vr == src) {
             return format!("({}){{ .tag = {i}, .u._{i} = {expr} }}", types.c_type(target));
+        }
+        // Widening one union into a larger one. The two carry independent tag numberings,
+        // so this is a *runtime* remap of the discriminant, not a reinterpretation: in
+        // `Running | Done` -> `Running | Paused | Done`, tag 1 means Done on the left and
+        // Paused on the right. Without this the coercion fell through to the zeroed
+        // literal at the end, which is how `fn f() -> A | B | C` whose branches only ever
+        // produce `A` or `C` returned a zeroed `A` — a wrong value, no diagnostic.
+        //
+        // `expr` repeats across the arms; every caller passes an SSA variable or a pure
+        // field/element projection of one, so re-evaluation is free of effects.
+        if let Repr::Union(from) = src {
+            let ty = types.c_type(target);
+            let mut out = format!("({ty}){{0}}");
+            for (i, sv) in from.iter().enumerate().rev() {
+                // CORRECT DEFAULT: a source variant absent from the target is one the
+                // widening cannot be carrying, so it gets no arm and falls through to the
+                // zeroed literal — the dead branch documented at the end of this function.
+                let Some(j) = variants.iter().position(|tv| tv == sv) else { continue };
+                out = format!(
+                    "({expr}.tag == {i} ? ({ty}){{ .tag = {j}, .u._{j} = {expr}.u._{i} }} : {out})"
+                );
+            }
+            return out;
         }
     }
     // Covariant/width subtyping: rebuild the target aggregate, coercing each field from the
@@ -1320,6 +1652,10 @@ fn coerce_expr(types: &TypeTable, expr: &str, src: &Repr, target: &Repr) -> Stri
             .iter()
             .enumerate()
             .map(|(i, tr)| {
+                // CORRECT DEFAULT only in the sense that it cannot mislead: a source tuple
+                // shorter than its target has no element `i` to widen, and coercing `tr` to
+                // itself emits `{expr}._{i}` — a member the source struct does not have, so
+                // `cc` rejects it. Width subtyping on tuples only ever drops from the right.
                 let sr = se.get(i).unwrap_or(tr);
                 format!("._{i} = {}", coerce_expr(types, &format!("{expr}._{i}"), sr, tr))
             })
@@ -1356,12 +1692,15 @@ fn rc_parts(types: &TypeTable, func: &str, repr: &Repr, expr: &str, out: &mut Ve
     rc_parts_rec(types, func, repr, expr, out, &mut Vec::new())
 }
 
-/// `seen` is the chain of back-edges currently being resolved. Re-entering one means the
-/// cycle closes entirely by value — `record Node { next: Node | null }` — with no pointer
-/// anywhere to terminate it. Such a type has no finite layout and cannot be counted in
-/// place; it needs heap-allocating, which is not implemented yet. Stopping here keeps the
-/// emitter from recursing until the stack dies, and `cc` then rejects the infinite struct
-/// with a diagnostic naming the type.
+/// `seen` is the chain of back-edges currently being resolved.
+///
+/// A recursive type normally terminates before the guard matters: either through a pointer
+/// (a `List`, a closure) or because the cycle was boxed, and the `is_boxed` check above
+/// counts the whole thing with a single `neon_retain` on its header without looking inside.
+/// Re-entering a back-edge means neither happened — a cycle that closes entirely by value
+/// with nothing to stop the walk. Such a type has no finite layout and cannot be counted in
+/// place at all, so stopping is the only option that does not recurse until the stack dies;
+/// `cc` then rejects the infinite struct with a diagnostic naming the type.
 fn rc_parts_rec(
     types: &TypeTable,
     func: &str,
@@ -1424,7 +1763,24 @@ fn rc_parts_rec(
                 rc_parts_rec(types, func, e, &format!("{expr}._{i}"), out, seen);
             }
         }
-        _ => {}
+        // Nothing counted, spelled out rather than left to a catch-all. A missing arm here
+        // does not fail to compile — it emits a value that is simply never retained or
+        // released, which is a leak or a use-after-free depending on the direction, and
+        // shows up nowhere until a sanitizer is pointed at it. Listing them makes adding a
+        // `Repr` variant a compile error at this site.
+        //
+        // Scalars own no memory. `Never` is uninhabited. `BoxedRec` and `Recursive` are
+        // handled above, before this match.
+        Repr::I64
+        | Repr::F64
+        | Repr::Bool
+        | Repr::Tag
+        | Repr::Unit
+        | Repr::Null
+        | Repr::Never
+        | Repr::BoxedRec(_)
+        | Repr::Recursive(_) => {}
+        Repr::Var(_) => ice_repr(repr, "refcounting a type variable"),
     }
 }
 
@@ -1440,6 +1796,20 @@ fn rel_op(op: PrimOp) -> &'static str {
     }
 }
 
+/// A primitive operation.
+///
+/// The bulk of the function is the equality/comparison prologue, not the operator table,
+/// because "compare these two values" in Neon is structural on every type while C's `==`
+/// works on scalars alone. Three cases have to be caught before the operands are projected
+/// to scalars, and each corresponds to a bug that shipped: a union against a bare variant
+/// (must test the tag, or a `null` payload of zero matches the literal `0`), a nullable
+/// against a literal `null` (the two sides have different reprs, so it is a null *test*,
+/// not a compare), and two whole unions (projecting both to their first variant compared
+/// an `i64` against a `bool` and made `1 == true` true).
+///
+/// Below that, integer arithmetic goes through `neon_i64_*` rather than C operators: signed
+/// overflow and division by zero are undefined behaviour in C and defined traps in Neon.
+/// Float arithmetic is plain, being IEEE in both languages.
 fn prim(types: &TypeTable, f: &Func, op: PrimOp, args: &[Value]) -> String {
     // Comparing a union against one of its variants must check the tag: a `null` value has
     // a zero-initialised payload, so a bare `payload == 0` would wrongly match `0`.
@@ -1482,6 +1852,9 @@ fn prim(types: &TypeTable, f: &Func, op: PrimOp, args: &[Value]) -> String {
     let scalar = |v: Value| scalar_repr(f.value_repr(v));
     let is_float = args.first().is_some_and(|&v| matches!(scalar(v), Repr::F64));
     let is_str = args.first().is_some_and(|&v| matches!(scalar(v), Repr::Str));
+    // CORRECT DEFAULT: `b` is absent for a unary primop (`Neg`, `Not`, `Bnot`), and every
+    // arm that reads it is binary. An empty `a` would mean a nullary primop, of which there
+    // are none — and it would produce syntactically invalid C, not a wrong answer.
     let a = args.first().map(|&v| prim_operand(f, v)).unwrap_or_default();
     let b = args.get(1).map(|&v| prim_operand(f, v)).unwrap_or_default();
 
@@ -1572,6 +1945,10 @@ fn mangle(name: &str) -> String {
     out
 }
 
+/// An SSA value's C local. The leading underscore keeps these out of the way of every
+/// other name the emitter invents: mangled functions are `nl_`-prefixed, struct and
+/// witness names carry their own prefixes, and record fields are `f_`-prefixed, so a
+/// user-chosen name can never collide with a value slot.
 fn var(v: Value) -> String {
     format!("_{}", v.0)
 }
@@ -1585,12 +1962,25 @@ fn c_i64(n: i64) -> String {
     }
 }
 
+/// A `switch` case label. Every key has to be an integer constant expression, which is why
+/// atoms switch on their FNV-1a hash rather than on a name.
+///
+/// `Nominal` has no integer key. It used to emit `0` for every variant, which is not a
+/// hole so much as a wrong answer: several `case 0:` labels in one `switch` do not even
+/// compile, and a single nominal case silently switched on the constant 0. Nothing in
+/// `ir/lower.rs` constructs a `SwitchKey::Nominal` today -- `ssa/print.rs` is its only
+/// other mention -- so this refuses rather than guessing, and whoever does start lowering
+/// nominal dispatch gets a panic naming the variant instead of a miscompile. Giving union
+/// variants dense tags is the fix.
 fn switch_key(k: &SwitchKey) -> String {
     match k {
         SwitchKey::Int(n) => c_i64(*n),
         SwitchKey::Bool(b) => (*b as i64).to_string(),
         SwitchKey::Atom(a) => atom_hash(a),
-        SwitchKey::Nominal(_) => "0".into(), // dense union tag assignment is future work
+        SwitchKey::Nominal(n) => panic!(
+            "internal error: codegen reached a nominal switch key `{n}` — union variants \
+             have no dense integer tags to switch on yet"
+        ),
     }
 }
 
@@ -1624,6 +2014,10 @@ fn atom_hash(name: &str) -> String {
     format!("{h}ULL")
 }
 
+/// A short name for an op, used only in the `unreachable!` that fires when `op_rhs` has no
+/// case for it. The named arms are all ops `op_rhs` or `emit_inst` does handle, so in
+/// practice the panic reports the `"op"` catch-all; naming the op that actually escaped
+/// means adding an arm here.
 fn op_name(op: &Op) -> &'static str {
     match op {
         Op::MakeList(_) => "list",

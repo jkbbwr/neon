@@ -10,6 +10,15 @@ use super::ssa::{BlockId, Func, Op, PrimOp, Program, Term, Value};
 use std::collections::{HashMap, HashSet};
 
 /// Optimise every function in the program to a fixpoint.
+///
+/// The purity analysis is run once, over the *unoptimised* program, and reused for every
+/// function. That is sound because the passes here only remove work: a function that was
+/// pure before cannot become effectful, and one that was effectful can only lose effects,
+/// so the answer stays conservative in the safe direction (see `effects`).
+///
+/// Each function is driven to its own fixpoint rather than each pass to the program's,
+/// because the passes feed one another: folding a branch condition orphans blocks, which
+/// makes a block single-predecessor, which exposes more constants.
 pub fn optimize(program: &mut Program) {
     let pure = effects::analyze(program);
     let pure_natives = program.pure_natives.clone();
@@ -61,6 +70,13 @@ fn const_fold(f: &mut Func) -> bool {
     changed
 }
 
+/// The constant, if both operands are known constants of one kind. Integers are tried
+/// before booleans, which is unambiguous only because no value is in both maps: a `Value`
+/// is defined once, by either a `ConstI64` or a `ConstBool`.
+///
+/// A missing entry means "not known constant", not "not foldable", so partially-constant
+/// ops fall through untouched and get another chance on the next fixpoint round once the
+/// other operand has folded.
 fn fold_prim(
     op: PrimOp,
     args: &[Value],
@@ -83,6 +99,17 @@ fn fold_prim(
     }
 }
 
+/// Fold an integer op, or decline.
+///
+/// The arithmetic arms use `checked_*` and propagate the `None` with `?`, which is the
+/// whole overflow and divide-by-zero policy: the compiler refuses to produce a constant it
+/// cannot produce faithfully, and the instruction survives to the runtime, where the
+/// trapping semantics apply. Folding with wrapping or panicking arithmetic would either
+/// invent a value the program never computes or abort the *compiler* on unreachable code.
+/// `checked_div`/`checked_rem` also cover `i64::MIN / -1`, not just a zero divisor.
+///
+/// `Neg` does not come through here: `fold_prim` handles it with `wrapping_neg`, so
+/// `-i64::MIN` folds to `i64::MIN` rather than declining like the binary arms would.
 fn fold_int(op: PrimOp, x: i64, y: i64) -> Option<Op> {
     Some(match op {
         PrimOp::Add => Op::ConstI64(x.checked_add(y)?),
@@ -103,6 +130,12 @@ fn fold_int(op: PrimOp, x: i64, y: i64) -> Option<Op> {
     })
 }
 
+/// Fold a boolean op, or decline.
+///
+/// `And`/`Or` here are the strict bitwise-style primitives on two already-computed
+/// operands. Source-level `and`/`or` short-circuit and are lowered to control flow, not to
+/// these, so folding both operands eagerly cannot evaluate something the program would
+/// have skipped.
 fn fold_bool(op: PrimOp, x: bool, y: bool) -> Option<Op> {
     Some(match op {
         PrimOp::And => Op::ConstBool(x && y),
@@ -151,6 +184,15 @@ fn used_values(f: &Func) -> HashSet<Value> {
     used
 }
 
+/// Call `f` on every value an op reads.
+///
+/// Deliberately exhaustive — the constant ops are spelled out instead of falling into a
+/// wildcard — because this is the input to DCE's liveness. An operand missing from here
+/// reads as unused, and a still-live pure instruction gets deleted out from under its
+/// consumer. A new `Op` should therefore fail to compile until it is listed.
+///
+/// `rewrite_op` walks the same shape for substitution but does have a wildcard, so the two
+/// are not interchangeable: adding an operand-carrying op needs both updated by hand.
 fn op_operands(op: &Op, f: &mut impl FnMut(&Value)) {
     match op {
         Op::Prim(_, vs) | Op::MakeTuple(vs) | Op::MakeList(vs) => vs.iter().for_each(f),
@@ -184,6 +226,12 @@ fn op_operands(op: &Op, f: &mut impl FnMut(&Value)) {
     }
 }
 
+/// Call `f` on every value a terminator reads: the returned or thrown value, a branch or
+/// switch scrutinee, and the arguments on every outgoing edge.
+///
+/// Block arguments count as uses even though the parameter they feed may itself be dead —
+/// dropping an argument would desynchronise the edge from the successor's parameter list,
+/// which is an arity mismatch rather than a missed optimisation.
 fn term_operands(term: &Term, f: &mut impl FnMut(&Value)) {
     match term {
         Term::Ret(Some(v)) | Term::Throw(v) => f(v),
@@ -323,6 +371,13 @@ fn merge_single_pred(f: &mut Func) -> bool {
     changed
 }
 
+/// How many CFG *edges* target each block — not how many distinct predecessors it has.
+///
+/// The distinction is what makes `merge_single_pred` safe. A `branch` or `switch` whose
+/// arms land on the same block has one predecessor but two or more edges; counting
+/// predecessors would call that block mergeable, and splicing it into a terminator that is
+/// not an unconditional jump would drop the other paths. A block with no
+/// in-edges is still present in the map, at 0, because the map is seeded from `f.blocks`.
 fn predecessor_counts(f: &Func) -> HashMap<BlockId, usize> {
     let mut count: HashMap<BlockId, usize> = f.blocks.iter().map(|b| (b.id, 0)).collect();
     for b in &f.blocks {
@@ -333,6 +388,10 @@ fn predecessor_counts(f: &Func) -> HashMap<BlockId, usize> {
     count
 }
 
+/// Every outgoing edge of a terminator, mutably — the write counterpart of `successors`,
+/// for passes that redirect an edge in place rather than rebuild the terminator. It yields
+/// one entry per edge, so a `branch` with both arms on one block appears twice and both
+/// copies get rewritten.
 fn targets_mut(term: &mut Term) -> Vec<&mut super::ssa::Target> {
     match term {
         Term::Jump(t) => vec![t],
@@ -344,6 +403,13 @@ fn targets_mut(term: &mut Term) -> Vec<&mut super::ssa::Target> {
     }
 }
 
+/// Substitute operands in place, for the parameter-to-argument mapping `merge_single_pred`
+/// builds. One pass, no chasing: `m` maps a merged block's parameters to the arguments
+/// that flowed in, and `merge_single_pred` applies it across the whole function before
+/// looking for the next merge, so a chain never needs a transitive lookup here.
+///
+/// Unlike `op_operands` this ends in a wildcard, so an `Op` added without an arm here is
+/// silently left unsubstituted rather than caught by the compiler.
 fn rewrite_op(op: &mut Op, m: &HashMap<Value, Value>) {
     let sub = |v: &mut Value| {
         if let Some(&nv) = m.get(v) {
@@ -376,6 +442,10 @@ fn rewrite_op(op: &mut Op, m: &HashMap<Value, Value>) {
     }
 }
 
+/// `rewrite_op`'s counterpart for terminators. Block arguments are substituted as well as
+/// the scrutinee: a merged block's parameter can be passed straight on down an edge, and
+/// leaving that reference behind is exactly the dangling-value bug `merge_single_pred`
+/// documents.
 fn rewrite_term(term: &mut Term, m: &HashMap<Value, Value>) {
     let sub = |v: &mut Value| {
         if let Some(&nv) = m.get(v) {
@@ -437,6 +507,9 @@ fn drop_unreachable_blocks(f: &mut Func) -> bool {
     true
 }
 
+/// The blocks a terminator can transfer to. `ret`, `throw` and `unreachable` have none,
+/// which is what bounds the reachability walk in `drop_unreachable_blocks`. Duplicates are
+/// not removed — `predecessor_counts` relies on one entry per edge.
 fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Jump(t) => vec![t.to],

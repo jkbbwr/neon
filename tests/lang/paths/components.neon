@@ -1,0 +1,38 @@
+// `path::components` is the primitive the rest of `std::path` is built on, so its
+// edge cases are the module's edge cases.
+//
+// Dropped, because none of them changes which file the path names: empty components
+// (so repeated separators collapse), a trailing separator, and `.`.
+//
+// Kept: `..`, which `components` does not resolve — that is `normalize`'s job.
+//
+// An absolute path gets `"/"` as its first component. Nothing else produces a `"/"`
+// component, so the root is a thing you can test for rather than a leading byte.
+
+use std::io;
+use std::path;
+use std::string;
+
+fn show(p: str) {
+    io::println("[#{string::join(path::components(p), "|")}] abs=#{path::is_absolute(p)}");
+}
+
+fn main() {
+    show("");             // nothing names nothing
+    show(".");            // a `.`-only path has no components either
+    show("/");            // just the root
+    show("///");          // repeated separators collapse to the same root
+    show("a");
+    show("a/b/c");
+    show("/a/b/c");
+    show("a//b");         // repeated separator in the middle
+    show("a/b/");         // trailing separator
+    show("a/b///");
+    show("./a/./b");      // `.` dropped wherever it appears
+    show("..");           // `..` kept
+    show("../a");
+    show("/a/../b");      // still not resolved
+    show("/..");
+    show("a\\b");         // a backslash is an ordinary byte: one component, not two
+    show(" ");            // a space is a perfectly good file name
+}

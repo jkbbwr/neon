@@ -3,7 +3,7 @@
 // `f64` keeps IEEE semantics here as everywhere else in the language: nothing traps and
 // nothing throws. `sqrt(-1.0)` is NaN, `1.0 / 0.0` is infinity, and a caller who cares
 // asks with `is_nan`/`is_infinite`. That is the same answer `==` and `<` already give for
-// NaN — see "Comparison is structural" in docs/decisions.md.
+// NaN -- see "Comparison is structural" in docs/decisions.md.
 //
 // `i64` is the opposite, and stays so: `abs(min_i64)` has no representable answer, so it
 // traps exactly as division by zero does. Two types, two contracts, each stated.

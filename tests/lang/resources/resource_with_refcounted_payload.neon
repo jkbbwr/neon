@@ -1,0 +1,53 @@
+// A resource whose payload is refcounted, rather than a scalar.
+//
+// This is the case that distinguishes two paths through a resource's payload. The explicit
+// path (`release`, `take`) goes through `neon_resource_disarm`, which moves the payload out
+// and zeroes the slot behind it. The automatic path -- the drop emitted per instantiation
+// -- has to do the same thing, because the cleanup closure *consumes* the payload it is
+// handed and `neon_resource_finish` afterwards releases whatever is still in the slot.
+//
+// Leaving the bytes behind releases them twice. Every other resource test holds an `i64`,
+// whose witness has no `release`, so the second release is a no-op and the bug is
+// invisible; with a `str` it is a use-after-free that ASan catches immediately. Both paths
+// now share one runtime function, so they cannot drift apart again.
+
+use std::io;
+use std::resource;
+use std::string;
+
+fn dropped_at_last_use() {
+    let name = string::concat("payload", "-one");
+    let r = resource::new(name, (s: str) => {
+        io::println(string::concat("drop cleanup: ", s));
+        null
+    });
+    io::println("after the resource");
+}
+
+fn released_explicitly() {
+    let name = string::concat("payload", "-two");
+    let r = resource::new(name, (s: str) => {
+        io::println(string::concat("release cleanup: ", s));
+        null
+    });
+    try resource::release(r) catch (e) { null };
+    io::println(to_string(resource::is_live(r)));
+}
+
+// `take` hands the payload over without running cleanup, so the caller owns it from then
+// on -- the string must still be intact to print.
+fn taken_out() {
+    let name = string::concat("payload", "-three");
+    let r = resource::new(name, (s: str) => {
+        io::println("MUST NOT RUN");
+        null
+    });
+    let got = resource::take(r);
+    io::println(string::concat("took: ", got orelse "nothing"));
+}
+
+fn main() {
+    dropped_at_last_use();
+    released_explicitly();
+    taken_out();
+}

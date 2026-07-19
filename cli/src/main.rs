@@ -161,7 +161,12 @@ enum Command {
         args: Vec<OsString>,
     },
     /// Print the resolved sysroot.
-    Sysroot,
+    Sysroot {
+        /// Print only the stdlib directory, as one bare path. For tools, not people —
+        /// this is how `neon-lsp` asks the toolchain where its stdlib is.
+        #[arg(long)]
+        stdlib: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -176,6 +181,6 @@ fn main() -> Result<()> {
         Command::Compile { file, output, build } => cmd::compile::run(&file, output, build.into()),
         Command::Build { build } => cmd::build::run(build.into()),
         Command::Run { path, build, args } => cmd::run::run(path, args, build.into()),
-        Command::Sysroot => cmd::sysroot::run(),
+        Command::Sysroot { stdlib } => cmd::sysroot::run(stdlib),
     }
 }

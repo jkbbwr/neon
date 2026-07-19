@@ -1,0 +1,5 @@
+drop cleanup: payload-one
+after the resource
+release cleanup: payload-two
+false
+took: payload-three

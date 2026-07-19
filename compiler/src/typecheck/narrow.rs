@@ -151,6 +151,12 @@ pub fn narrow_is(s: &mut Solver, subject: TyId, ty: TyId) -> Refined {
     refined(s, subject, then_ty, else_ty)
 }
 
+/// Narrowing by an arbitrary [`Test`], which is `narrow_is` only when the test is exact.
+///
+/// The inexact case is still worth running: the then-branch is genuinely refined, and an
+/// impossible test is still reported. `match c { 1 => .. }` on a record is
+/// [`Refined::NeverMatches`] even though a literal covers nothing — inexactness is about
+/// what an arm *removes*, not about whether it can run at all.
 pub fn narrow(s: &mut Solver, subject: TyId, test: Test) -> Refined {
     if test.exact {
         return narrow_is(s, subject, test.ty);
@@ -218,6 +224,11 @@ pub enum Projected {
 }
 
 impl Projected {
+    /// The one place the three cases are decided, so `Present`/`Partial` always carry an
+    /// inhabited type. `found` holds a contribution per inhabited leaf of the walk and
+    /// `lacks` says some leaf did not have the field at all; the union being empty means
+    /// no leaf had it, which is `Absent` — including the case where the subject is not a
+    /// record or tuple to begin with, since then there are no leaves to contribute.
     fn new(s: &mut Solver, found: Vec<TyId>, lacks: bool) -> Projected {
         let mut ty = s.t.never();
         for f in found {
@@ -296,6 +307,17 @@ fn rec_path_field(
     rec_neg_field(s, &labels, &map, neg, label, found, lacks);
 }
 
+/// Split the path's negative atoms out, one at a time, into the leaves where the
+/// negation actually bites.
+///
+/// `¬N` for a record atom `N` is a disjunction over its labels — a value fails to be an
+/// `N` by differing at *some* field — so each negative branches the walk once per label
+/// (plus `REST`, the stand-in for every label no atom on the path names), refining that
+/// one field by subtraction and leaving the others alone. Branches that refine to
+/// nothing are dropped, which is what stops the fan-out from exploding and what makes a
+/// negative that rules the path out entirely contribute no leaf at all.
+///
+/// Only leaves reached with every field inhabited get to say anything about `label`.
 fn rec_neg_field(
     s: &mut Solver,
     labels: &[NameId],
@@ -351,6 +373,13 @@ pub fn project_elem(s: &mut Solver, ty: TyId, index: usize) -> Projected {
     Projected::new(s, found, lacks)
 }
 
+/// One path of the tuple BDD. Arity does for tuples what labels do for records, and it
+/// is coarser: a tuple atom pins its arity exactly, so positives of differing arities
+/// intersect to nothing and the path contributes nothing.
+///
+/// Negatives of a different arity are dropped rather than walked. They cannot remove
+/// anything from a path already pinned to one arity, and carrying them would branch the
+/// walk over element slots they do not have.
 fn tup_path_elem(
     s: &mut Solver,
     pos: &[u32],
@@ -396,6 +425,10 @@ fn tup_path_elem(
     tup_neg_elem(s, &elems, &neg, index, found, lacks);
 }
 
+/// [`rec_neg_field`]'s counterpart for tuples: each negative branches once per element
+/// slot, since a value fails to be that tuple by differing at some element. Every
+/// negative here has already been filtered to the path's own arity, so the slots line up
+/// and `sa.elems[k]` is always in range.
 fn tup_neg_elem(
     s: &mut Solver,
     elems: &[TyId],
@@ -439,6 +472,9 @@ pub fn residual(s: &mut Solver, subject: TyId, covered: &[TyId]) -> TyId {
     s.t.diff(subject, c)
 }
 
+/// Whether [`residual`] came out empty. Kept apart from `residual` because a caller that
+/// is going to report needs the residual itself — the diagnostic names the missing
+/// values — and only a caller with nothing to say wants the bool.
 pub fn is_exhaustive(s: &mut Solver, subject: TyId, covered: &[TyId]) -> bool {
     let r = residual(s, subject, covered);
     s.is_empty(r)

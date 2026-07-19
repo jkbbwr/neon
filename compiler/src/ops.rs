@@ -103,7 +103,16 @@ impl BinOp {
     }
 }
 
-/// The operators at one level, loosest level first.
+/// The operators sharing a single precedence level, in table order.
+///
+/// The parser calls this once per level to build that level's alternatives, and
+/// uses it again to name them in the error when none matched.
+///
+/// `levels_are_contiguous` asserts no level in `MIN_PREC..=MAX_PREC` is empty.
+/// A gap is not itself a miscompile — the parser would build a layer matching
+/// nothing and pass through — but it means the table and the two constants have
+/// drifted apart, and those constants are what the formatter derives `P_UNARY`
+/// and everything above it from.
 pub fn ops_at(prec: u8) -> impl Iterator<Item = BinOp> {
     BINARY_OPS
         .iter()

@@ -3,10 +3,11 @@
 
 use crate::buildcfg::BuildConfig;
 use crate::frontend::Checked;
+use crate::sysroot::Sysroot;
 use color_eyre::eyre::{bail, eyre, Result};
 use neon_compiler::backend::c;
 use neon_compiler::ir::{self, Stage};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// Lower a checked program to an executable at `out`, writing a sibling `.c` file.
@@ -19,15 +20,30 @@ pub fn to_executable(checked: &Checked, out: &Path, cfg: &BuildConfig) -> Result
     let c_file = out.with_extension("c");
     std::fs::write(&c_file, &c_source).map_err(|e| eyre!("writing {}: {e}", c_file.display()))?;
 
-    let (include, rt_c) = runtime_sources()?;
+    // The runtime is a prebuilt archive, not a pile of `.c` files: one variant per build
+    // shape, built once by cmake (`runtime/CMakeLists.txt`). A build used to recompile
+    // all eleven runtime translation units every time, and a shipped toolchain would have
+    // had to ship the runtime's C source. `runtime_variant` decides which archive, and
+    // refuses rather than substituting one — see its doc comment for why a sanitized
+    // build may not link an uninstrumented runtime.
+    let sysroot = Sysroot::find()?;
+    let variant = cfg.runtime_variant()?;
+    let archive = sysroot.runtime_lib(variant)?;
+    // Asking for a strict subset of the sanitized archive's sanitizers links the full set
+    // instead — safe, but not something to do behind the user's back.
+    if let Some(note) = cfg.sanitizer_widening_note(variant) {
+        eprintln!("{note}");
+    }
     let mut cmd = Command::new(&cfg.cc);
-    cmd.args(cfg.cc_args())
+    cmd.args(cfg.cc_args(variant))
         .arg("-o")
         .arg(out)
         .arg(&c_file)
-        .arg(&rt_c)
+        // After the object that references it: a static archive only contributes the
+        // members that resolve symbols already seen.
+        .arg(&archive)
         .arg("-I")
-        .arg(&include);
+        .arg(sysroot.include());
     let status = cmd
         .status()
         .map_err(|e| eyre!("could not run the C compiler `{}`: {e}", cfg.cc))?;
@@ -35,23 +51,4 @@ pub fn to_executable(checked: &Checked, out: &Path, cfg: &BuildConfig) -> Result
         bail!("the C compiler failed on {}", c_file.display());
     }
     Ok(())
-}
-
-/// The runtime's include directory and `rt.c`, found under the sysroot.
-fn runtime_sources() -> Result<(PathBuf, PathBuf)> {
-    let root = match std::env::var_os("NEON_SYSROOT") {
-        Some(dir) => PathBuf::from(dir).join("runtime"),
-        None => {
-            let exe = std::env::current_exe()?;
-            exe.parent()
-                .ok_or_else(|| eyre!("the neon binary has no parent directory"))?
-                .join("../runtime")
-        }
-    };
-    let include = root.join("include");
-    let rt_c = root.join("src/rt.c");
-    if !rt_c.is_file() {
-        bail!("cannot find the runtime at {}", root.display());
-    }
-    Ok((include, rt_c))
 }

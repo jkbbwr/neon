@@ -41,6 +41,10 @@ pub struct Config {
 }
 
 impl Config {
+    /// There is no way to *unset* a key: the set is built once by the driver and read-only
+    /// thereafter, so every `@cfg` in a compilation sees the same answer for a key. A
+    /// condition that flipped mid-pass would drop one of two mutually exclusive branches
+    /// and keep neither.
     pub fn with(keys: impl IntoIterator<Item = String>) -> Self {
         Config { keys: keys.into_iter().collect() }
     }
@@ -57,6 +61,9 @@ pub enum Target<'a> {
 }
 
 impl Target<'_> {
+    /// The keyword, for the "`@x` is only for a `fn`, not a `record`" diagnostics. Every
+    /// processor that restricts its target phrases the error the same way through this, so
+    /// a new target kind cannot be described inconsistently in five places.
     fn what(&self) -> &'static str {
         match self {
             Target::Fn(_) => "fn",
@@ -75,6 +82,10 @@ enum Decision {
     Omit,
 }
 
+/// Everything a processor may touch. It gets the config to read, the metadata to add to,
+/// and the error list — but not the AST, which is why a processor can only decide `Keep`
+/// or `Omit` and never rewrite a node. That restriction is what keeps expansion from
+/// becoming a macro system.
 struct Context<'a> {
     config: &'a Config,
     meta: &'a mut Meta,
@@ -121,6 +132,10 @@ pub fn expand(module: Module, config: &Config) -> (Module, Meta, Vec<Error>) {
     (Module { decls }, meta, errors)
 }
 
+/// Expand a declaration list, dropping the ones no processor kept. Declarations are taken
+/// by value throughout this pass rather than mutated in place, because omission removes a
+/// node rather than blanking it — a `@cfg`-ed-out decl must leave no trace for name
+/// resolution to find.
 fn expand_decls(decls: Vec<Decl>, cx: &mut Context) -> Vec<Decl> {
     let mut out = Vec::new();
     for decl in decls {
@@ -131,6 +146,14 @@ fn expand_decls(decls: Vec<Decl>, cx: &mut Context) -> Vec<Decl> {
     out
 }
 
+/// One declaration, outside-in: a node's own annotations decide whether it survives
+/// *before* its children are visited.
+///
+/// The order is the point. A `@cfg`-omitted `mod` returns here without its body ever being
+/// walked, so annotations inside code the target does not want are never looked up and
+/// never reported as unknown — which is what lets a module written for another platform
+/// use annotations this build does not have. It also means metadata is not gathered from
+/// omitted code: a `@doc` inside a dropped branch does not reach the table.
 fn expand_decl(decl: Decl, cx: &mut Context) -> Option<Decl> {
     // A decl's own annotations decide whether it survives.
     let decision = match &decl.kind {
@@ -163,6 +186,13 @@ fn expand_decl(decl: Decl, cx: &mut Context) -> Option<Decl> {
     })
 }
 
+/// A protocol's or impl's methods. Filtering only — a method has no annotated children, so
+/// there is nothing below it to descend into, and a fn *body* is never expanded: `@cfg` is
+/// a declaration-level tool, not a statement-level one.
+///
+/// A `@cfg`-omitted method simply disappears from its impl, leaving the impl incomplete
+/// for this target — expansion does not check that against the protocol, so whatever
+/// diagnostic follows comes from the checker seeing a method that was never declared.
 fn expand_methods(methods: Vec<FnDecl>, cx: &mut Context) -> Vec<FnDecl> {
     methods
         .into_iter()
@@ -315,6 +345,16 @@ impl Processor for Cfg {
     }
 }
 
+/// The key `@doc` files its text under.
+///
+/// Not a resolved path — a bare declared name, so two same-named items in different modules
+/// collide in the table. That is tolerable only because `Meta::docs` is a `Vec` of pairs
+/// that nothing looks up by key yet; a doc tool that wants to index by name will need the
+/// module path threaded through here.
+///
+/// An `impl` has no name of its own, so one is synthesised from the protocol path and the
+/// target's `Debug` formatting. The result is a Rust-shaped string, not Neon source, and is
+/// not fit to show a user.
 fn target_name(target: &Target) -> String {
     match target {
         Target::Fn(f) => f.name.clone(),
@@ -339,6 +379,14 @@ fn eval_cfg(src: &str, config: &Config) -> Result<bool, String> {
     Ok(v)
 }
 
+/// Split a condition into words and punctuation. There are no operators, so a word is a
+/// run of alphanumerics, `_` and `-`; `-` is allowed because config keys are target-shaped
+/// (`x86_64-unknown-linux`) and splitting one on the hyphen would turn a key into a
+/// syntax error.
+///
+/// Anything else is rejected here rather than passed through as an unknown key, so a
+/// mistyped `@cfg("linux && macos")` is a diagnostic instead of a condition that quietly
+/// never holds.
 fn cfg_tokens(src: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut word = String::new();
@@ -389,6 +437,14 @@ impl CfgParser<'_> {
         }
     }
 
+    /// One condition. `all`/`any` fold over a comma-separated list, seeded with their
+    /// identity (`true` for `all`, `false` for `any`), and both require at least one
+    /// operand — the loop parses before it checks for a comma, so `all()` is an error
+    /// rather than a vacuous `true`.
+    ///
+    /// A bare word is a key lookup and is *always* well-formed: an unrecognised key is
+    /// false, not a diagnostic. There is no registry of legal keys to check against, and
+    /// asking about a key this build has never heard of is the normal case.
     fn cond(&mut self, config: &Config) -> Result<bool, String> {
         let head = self.bump().ok_or("empty condition")?.to_string();
         match head.as_str() {

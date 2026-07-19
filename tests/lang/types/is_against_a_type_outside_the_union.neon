@@ -1,0 +1,30 @@
+// `x is T` where `T` is not one of the union's variants is `false`, for every value
+// the union can hold. It is a legitimate question with a known answer, not an error.
+//
+// The backend used to look the tested name up among the variants and fall back to
+// index 0 when it found nothing, emitting `tag == 0` — the test for holding the
+// FIRST variant. So `x is C` on an `A | B` answered `true` for every `A` and
+// `false` for every `B`: a wrong answer that compiled, ran, and looked plausible.
+
+use std::io;
+
+record A { v: i64 }
+record B { v: i64 }
+record C { v: i64 }
+
+fn is_c(x: A | B) -> bool {
+    x is C
+}
+
+// The same question against the union's own first variant, so the test would fail
+// if `is` were broken in the other direction and always answered `false`.
+fn is_a(x: A | B) -> bool {
+    x is A
+}
+
+fn main() {
+    io::println("#{is_c(A { v: 1 })}");
+    io::println("#{is_c(B { v: 2 })}");
+    io::println("#{is_a(A { v: 1 })}");
+    io::println("#{is_a(B { v: 2 })}");
+}

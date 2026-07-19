@@ -1,0 +1,15 @@
+a + b = a/b
+a/ + b = a/b
+a/// + b = a/b
+/a + b = /a/b
+/ + b = /b
+/// + b = /b
+a + b/c = a/b/c
+a +  = a
+ + b = b
+ +  = 
+/etc + /tmp/x = /tmp/x
+a + /tmp/x = /tmp/x
+a + .. = a/..
+a + . = a/.
+REFUSED

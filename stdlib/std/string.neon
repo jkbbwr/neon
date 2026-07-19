@@ -4,7 +4,7 @@
 @pure @native("neon_str_byte_len") fn byte_len(s: str) -> i64
 @pure @native("neon_str_concat") fn concat(a: str, b: str) -> str
 // The unchecked primitives. A native can return neither a tagged result nor an
-// `i64 | null` — both are layouts codegen generates per program — so the check, the error
+// `i64 | null` -- both are layouts codegen generates per program -- so the check, the error
 // and the union all live here, where the types are declared.
 internal mod raw {
     @pure @native("neon_str_slice_unchecked") fn slice_unchecked(s: str, from: i64, to: i64) -> str
@@ -21,6 +21,9 @@ fn slice(s: str, from: i64, to: i64) throws IndexError -> str {
     raw::slice_unchecked(s, from, to)
 }
 
+// The single *byte* at `i`, as a one-byte `str`. Byte-oriented like the rest of this
+// module, so on a multi-byte character it hands back a fragment that is not valid UTF-8 on
+// its own.
 fn char_at(s: str, i: i64) throws IndexError -> str {
     if i < 0 or i >= byte_len(s) {
         throw IndexError { message: "index #{i} out of range" };
@@ -28,12 +31,16 @@ fn char_at(s: str, i: i64) throws IndexError -> str {
     raw::char_at_unchecked(s, i)
 }
 
-// Thrown by `to_int`. Declared here rather than in the prelude: the module that throws an
-// error is the one that owns it, and a name in the prelude is a name no program can use.
+// Thrown by `to_int`, which is the only thing here that parses.
 record ParseError { message: str }
 impl Display for ParseError { fn to_string(v: ParseError) -> str { v.message } }
 impl Error for ParseError { fn message(v: ParseError) -> str { v.message } }
 
+// An optional leading `+` or `-` and then digits, with nothing else allowed: no
+// whitespace, no underscores, no radix prefix, so `to_int(" 1")` throws rather than
+// trimming for you. A value too large for an `i64` wraps rather than throwing -- the
+// digits are accumulated modulo 2^64 -- so range-check separately if the input is
+// untrusted.
 fn to_int(s: str) throws ParseError -> i64 {
     if !raw::is_int(s) {
         throw ParseError { message: "not an integer" };
@@ -41,6 +48,8 @@ fn to_int(s: str) throws ParseError -> i64 {
     raw::parse_int(s)
 }
 @pure @native("neon_str_join") fn join(parts: List[str], sep: str) -> str
+// The byte offset of the first `needle`, or `null`. `null` rather than the C convention of
+// `-1`: a sentinel index is a value the type system cannot stop you indexing with.
 fn find(s: str, needle: str) -> i64 | null {
     let at = raw::index_of(s, needle);
     if at < 0 { null } else { at }
@@ -85,14 +94,15 @@ fn split(s: str, sep: str) -> List[str] {
 
 // Split on newlines, dropping a trailing `\r` so a CRLF file does not leave one on every
 // line. A trailing newline does not produce a final empty line: `"a\n"` is `["a"]`, which
-// is what reading a text file line by line should give.
+// is what reading a text file line by line should give. The empty string is no lines at
+// all, `[]`, rather than one empty line.
 fn lines(s: str) -> List[str] {
     let out: List[str] = [];
     if is_empty(s) {
         out
     } else {
-        // Drop one trailing newline before splitting, so `"a\n"` is `["a"]` rather than
-        // `["a", ""]`. Doing it here rather than after avoids depending on a list slice.
+        // Before the split rather than after: dropping the empty tail afterwards would
+        // need a list slice, and this needs nothing.
         let body = trim_end_of(s, "\n");
         for part in split(body, "\n") {
             out = std::collections::list::push(out, trim_end_of(part, "\r"));

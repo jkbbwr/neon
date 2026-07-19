@@ -1,3 +1,24 @@
+//! The parser's error type, and its integration with chumsky.
+//!
+//! Two kinds of error arrive here and they are treated differently. `Expected`
+//! is what the combinator machinery raises when nothing matched; every other
+//! variant is a diagnostic the grammar *chose* to emit, for a construct that
+//! parses but is not in the language. That distinction drives the `merge` rule
+//! below: when two errors land at the same position, a deliberate diagnostic
+//! always beats a generic "expected". Otherwise the message explaining that
+//! there is no field assignment would lose to whichever alternative happened to
+//! be tried last.
+//!
+//! Being a concrete enum rather than chumsky's `Rich` is what makes that
+//! possible at all, and it also lets a diagnostics pass match on a kind instead
+//! of pattern-matching prose. The `Display` messages here say what to write
+//! instead, not merely what is wrong — these are errors people will hit while
+//! carrying habits over from another language, and "unexpected token" would
+//! send them looking for a typo that is not there.
+//!
+//! `Expected` mirrors chumsky's `DefaultExpected` but owns its contents, so an
+//! error can outlive the borrow of the token stream it came from.
+
 use crate::lexer::Token;
 use chumsky::error::Error as ChumskyError;
 use chumsky::input::Input;
