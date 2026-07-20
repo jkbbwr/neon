@@ -13,7 +13,23 @@ neon_str neon_str_lit(const char* data, size_t len) {
 
 bool neon_str_eq(neon_str a, neon_str b) {
     size_t n = neon_str_len(&a);
-    return n == neon_str_len(&b) && memcmp(neon_str_data(&a), neon_str_data(&b), n) == 0;
+    if (n != neon_str_len(&b)) {
+        return false;
+    }
+    const char* pa = neon_str_data(&a);
+    const char* pb = neon_str_data(&b);
+    // The short path is the map-key path: every probe in `neon_map_slot` lands here, and on
+    // the word-frequency benchmark this call was 16.5% of the run to compare five bytes.
+    // See `NEON_STR_SHORT` for why the boundary is where it is.
+    if (n <= NEON_STR_SHORT) {
+        for (size_t i = 0; i < n; i++) {
+            if (pa[i] != pb[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return memcmp(pa, pb, n) == 0;
 }
 
 // Byte-lexicographic order: the shared prefix decides, and if one string is a prefix of
@@ -23,7 +39,23 @@ bool neon_str_eq(neon_str a, neon_str b) {
 int neon_str_cmp(neon_str a, neon_str b) {
     size_t la = neon_str_len(&a), lb = neon_str_len(&b);
     size_t n = la < lb ? la : lb;
-    int c = n ? memcmp(neon_str_data(&a), neon_str_data(&b), n) : 0;
+    const char* pa = neon_str_data(&a);
+    const char* pb = neon_str_data(&b);
+    // Same short-length fast path as `eq`, and the same reason. The three-way result is
+    // built from the first differing byte rather than from `memcmp`'s sign: compared as
+    // `unsigned char`, because plain `char` is signed here and a byte over 127 would
+    // otherwise order *before* an ASCII one and disagree with `memcmp` on UTF-8.
+    int c = 0;
+    if (n <= NEON_STR_SHORT) {
+        for (size_t i = 0; i < n; i++) {
+            if (pa[i] != pb[i]) {
+                c = (unsigned char)pa[i] < (unsigned char)pb[i] ? -1 : 1;
+                break;
+            }
+        }
+    } else {
+        c = memcmp(pa, pb, n);
+    }
     if (c != 0) {
         return c < 0 ? -1 : 1;
     }

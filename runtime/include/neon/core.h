@@ -35,6 +35,22 @@ typedef struct {
     neon_header* owner;
 } neon_str;
 
+// Below this many bytes, a plain loop beats calling into libc.
+//
+// `memcmp` and `memcpy` resolve through an ifunc to a vectorised implementation that is
+// superb on long buffers and, on short ones, spends most of its time being called. Measured
+// on this machine, byte-loop against `memcmp` at 60M iterations per length: the loop wins at
+// 4-6 bytes, ties at 7-8, and loses steadily after -- 0.136s against 0.101s by 12 bytes, and
+// far worse beyond. So the boundary is 6, not a round number chosen for looking tidy.
+//
+// This matters because short strings are not a corner case here: a map key, a formatted
+// integer and an interpolation fragment are all a handful of bytes, and on the
+// word-frequency benchmark `memcmp` called from `neon_map_slot` was 16.5% of the entire run
+// -- nearly all of it call overhead, comparing five bytes.
+//
+// Long strings keep the vectorised path. This is a fast path, not a replacement.
+#define NEON_STR_SHORT 6
+
 // ---- reaching inside a `neon_str` ----
 //
 // Nothing outside these four should touch `.data` or `.owner`. They are trivial today --

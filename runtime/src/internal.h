@@ -23,7 +23,16 @@ static inline void neon_str_drop(void* p) {
 static inline neon_str neon_str_new(const char* src, size_t len) {
     neon_header* h = neon_alloc(len, neon_str_drop);
     char* data = (char*)(h + 1);
-    if (len) {
+    // Worth about 1.7% on word-frequency on its own, where this is reached once per token
+    // to copy the four digits `neon_i64_to_string` just produced. Much less than the same
+    // trick is worth in `neon_str_eq`, despite `memcpy` being the larger share of that
+    // profile -- the copy sits beside an allocation that dwarfs it, while the compare sits
+    // in a probe loop with nothing else in it. Profile share is not recoverable time.
+    if (len <= NEON_STR_SHORT) {
+        for (size_t i = 0; i < len; i++) {
+            data[i] = src[i];
+        }
+    } else {
         memcpy(data, src, len);
     }
     neon_str s = {data, len, h};

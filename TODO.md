@@ -247,10 +247,24 @@ releasing 10M temporary five-byte keys. Two languages beat C on this bench and e
 a tell: Zig at 0.51× formats integers with generated code (no snprintf), LuaJIT at
 0.76× interns strings so table keys are nearly free.
 
-**Status after items 1 and 2: 0.67s → 0.35s, 1.69× C → 0.95×.** Neon is now faster than
-the C reference on this benchmark. Items 3 and 4 are unstarted, and the profile that
-ranked them is the *old* one — re-profile before building either, since the two largest
-costs it named have both been paid off.
+**Status: 1.69× C → 0.90×.** Neon is faster than the C reference on this benchmark.
+Items 1 and 2 are done; item 3 was **built and rejected** (see below); item 4 is unstarted
+and its premise has changed. Re-profile before building anything here — every cost the
+original profile named has now been paid off or disproved.
+
+Item 3, small-string optimisation, is **done and not merged**: it works, and it is neutral
+on word-frequency and 7.9% *worse* on brainfuck. `docs/design/small-strings.md` has the
+result and the reasoning error behind it; the implementation is on `sso-experiment`. The
+premise — "77% of the profile is `malloc`/`cfree`, so removing the allocation removes most
+of the run" — confused profile share with recoverable time. Do not re-propose it from that
+profile.
+
+What the SSO attempt *did* find, and what has since landed instead: the expensive thing
+about a five-byte string was never the allocation, it was **calling into libc to touch it**.
+Short-length fast paths in `neon_str_eq`, `neon_str_cmp` and `neon_str_new` are worth
+**-8.6% on word-frequency and -3.6% on brainfuck**, against a measured byte-loop/`memcmp`
+crossover at 7 bytes (`NEON_STR_SHORT`). That is more than SSO offered, at a fraction of the
+risk, and it needed no representation change at all.
 
 In order — each item stands alone, and the first two are runtime-only:
 
