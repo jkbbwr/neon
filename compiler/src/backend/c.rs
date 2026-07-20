@@ -383,7 +383,18 @@ fn emit_index(out: &mut String, types: &TypeTable, f: &Func, result: Option<Valu
     if matches!(f.value_repr(base), Repr::Map(_, _)) {
         let _ = writeln!(out, "{} = *({ety}*)neon_map_at({}, &{});", var(r), var(base), var(index));
     } else {
-        let _ = writeln!(out, "{} = *({ety}*)neon_list_at({}, {});", var(r), var(base), var(index));
+        // The width as a literal, so the index multiply folds into an addressing mode.
+        // `neon_list_at` reads it from the witness, which stays opaque to the C compiler
+        // even fully inlined, and the hot loop of a list walk paid an `imul` per read for
+        // it. The element's C type is the one being cast to on this very line, so the
+        // literal cannot disagree with the layout.
+        let _ = writeln!(
+            out,
+            "{} = *({ety}*)neon_list_at_scalar({}, {}, sizeof({ety}));",
+            var(r),
+            var(base),
+            var(index)
+        );
     }
     let mut parts = Vec::new();
     rc_parts(types, "neon_retain", &elem, &var(r), &mut parts);
