@@ -242,28 +242,6 @@ fn emit_fn(out: &mut String, types: &TypeTable, f: &Func) {
     out.push_str("}\n");
 }
 
-/// The values in a function that hold a throwing call's tagged result.
-///
-/// Currently unreferenced: the information it computes is obtained on demand instead, by
-/// asking `TypeTable::result_of` at the point a call is emitted, so nothing needs the
-/// whole-function map.
-fn throwing_call_results(
-    types: &TypeTable,
-    f: &Func,
-) -> std::collections::HashMap<Value, Repr> {
-    let mut out = std::collections::HashMap::new();
-    for b in &f.blocks {
-        for inst in &b.insts {
-            if let (Some(v), Op::Call { func, .. }) = (inst.result, &inst.op) {
-                if let Some(r) = types.result_of(func) {
-                    out.insert(v, r.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
 /// One block: a label, its instructions, its terminator. The label is followed by an empty
 /// statement (`block0:;`) because C requires a label to precede a *statement*, and a block
 /// whose first line is a declaration — or which is empty but for its terminator's braces —

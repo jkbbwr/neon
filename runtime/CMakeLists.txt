@@ -32,16 +32,36 @@ set(NEON_RT_SOURCES
 # Two deliberate differences from what `cc_args` would have produced when the runtime was
 # compiled from source alongside the program:
 #
-#   * No `-flto`. `cc_args` passes `-flto` from `release` up, and it used to cover the
-#     runtime too. A prebuilt archive cannot: an LTO archive carries compiler-version-
-#     specific bitcode, and the compiler that built the toolchain is not the `cc` that
-#     links a user's program. The user's own code is still LTO'd; the runtime's internal
-#     cross-TU inlining is what is lost.
+#   * `-flto` only as FAT objects, and only where the compiler supports them. The
+#     objection to a plain `-flto` archive stands: it carries compiler-version-specific
+#     bitcode and nothing else, and the compiler that built the toolchain is not the `cc`
+#     that links a user's program. `-ffat-lto-objects` emits both -- bitcode *and* real
+#     machine code -- so an LTO-capable matching `cc` inlines through the archive and any
+#     other compiler links the `.text` exactly as before. Verified on this archive: the
+#     objects carry `.gnu.lto_*` sections and a populated `.text`.
+#
+#     It is worth the archive size. The runtime's primitives are small and called from
+#     the innermost loops a program has -- `neon_list_at` is four lines and a bounds
+#     check -- so leaving them un-inlinable costs more than it sounds: on the brainfuck
+#     benchmark (10^8 ops) an un-inlinable runtime ran 3.66s against 1.08s for the same
+#     program compiled whole, and `neon_list_at` alone was 22% of the profile.
 #   * No `-march=native` (see the `OptRelease` note in `runtime_variant`): a prebuilt
 #     archive is built once, for an unknown target.
 #
 # Also: `cflags`/`-D` a user passes reach their program only. They no longer reach the
 # runtime, because the runtime is no longer compiled per build.
+# Fat LTO objects are a GCC spelling; clang has historically not accepted the flag. Probe
+# rather than assume, and fall back to no LTO at all rather than to a plain `-flto` -- a
+# bitcode-only archive is the thing that cannot be linked by a different compiler, which
+# is the whole reason this is conditional.
+include(CheckCCompilerFlag)
+check_c_compiler_flag("-flto -ffat-lto-objects" NEON_RT_HAS_FAT_LTO)
+if(NEON_RT_HAS_FAT_LTO)
+    set(NEON_RT_LTO -flto -ffat-lto-objects)
+else()
+    set(NEON_RT_LTO)
+endif()
+
 function(neon_rt_variant name)
     add_library(${name} STATIC ${NEON_RT_SOURCES})
     target_include_directories(${name} PUBLIC include)
@@ -53,7 +73,7 @@ endfunction()
 
 # `release`: what `Mode::Release` implies, minus `-flto` (above). Also what `OptRelease`
 # links.
-neon_rt_variant(neon_rt -O3)
+neon_rt_variant(neon_rt -O3 ${NEON_RT_LTO})
 # `debug`: `Mode::Debug`. `NEON_DEBUG` turns on the runtime's own assertions.
 neon_rt_variant(neon_rt_debug -O0 -g -DNEON_DEBUG)
 # `sanitized`: the only variant that carries instrumentation. ASan does not see a

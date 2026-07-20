@@ -31,7 +31,14 @@ fn main() {
     // the sanitized archive, without which `--sanitize address` must fail rather than
     // quietly link an uninstrumented runtime. Kept in step with `runtime/CMakeLists.txt`.
     for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
-        stage_file(&rt_root.join("lib").join(archive), &sysroot.join("lib").join(archive));
+        let from = rt_root.join("lib").join(archive);
+        // Re-stage when the archive itself changes, not only when its *path* does.
+        // `rerun-if-env-changed=DEP_NEON_RT_ROOT` alone leaves the staged sysroot stale
+        // whenever the runtime is rebuilt in place: edit runtime C, rebuild, and the
+        // program still links yesterday's archive. That cost an afternoon once -- a
+        // runtime change measured as having no effect, because it was never linked.
+        println!("cargo:rerun-if-changed={}", from.display());
+        stage_file(&from, &sysroot.join("lib").join(archive));
     }
     if stdlib_src.is_dir() {
         stage_tree(&stdlib_src, &sysroot.join("stdlib"));

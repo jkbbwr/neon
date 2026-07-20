@@ -47,8 +47,6 @@ pub struct TypeTable {
     lambdas: HashSet<String>,
     /// Function name → its parameter reprs, for coercing arguments at call sites.
     params: HashMap<String, Vec<Repr>>,
-    /// Function name → the tagged result it returns, for throwing functions only.
-    results: HashMap<String, Repr>,
     /// Structural key → key-witness name, for each type used as a map key.
     key_witness_names: HashMap<String, String>,
     key_witness_defs: Vec<(String, Repr)>,
@@ -90,11 +88,6 @@ impl TypeTable {
                 .collect(),
             key_witness_names: HashMap::new(),
             key_witness_defs: Vec::new(),
-            results: program
-                .funcs
-                .iter()
-                .filter_map(|f| f.result_repr().map(|r| (f.name.clone(), r)))
-                .collect(),
         };
         for f in &program.funcs {
             t.register(&f.ret);
@@ -315,12 +308,6 @@ impl TypeTable {
     /// Whether a function name is a lifted lambda (already has the closure ABI).
     pub fn is_lambda(&self, name: &str) -> bool {
         self.lambdas.contains(name)
-    }
-
-    /// The tagged result a function returns, if it throws. A call's result value is typed
-    /// by this rather than by its declared return.
-    pub fn result_of(&self, name: &str) -> Option<&Repr> {
-        self.results.get(name)
     }
 
     /// A function's parameter reprs, for coercing arguments at a call site.
