@@ -413,6 +413,10 @@ fn is_list_builder(symbol: &str) -> bool {
             | "neon_list_new_with_capacity"
             | "neon_list_push"
             | "neon_list_set"
+            // Emitted by `ir::unique`'s transformation, never by lowering: a write to a
+            // list already established as sole-owned, and the establishing call itself.
+            | "neon_list_set_inplace"
+            | "neon_list_ensure_unique"
             | "neon_map_new"
             | "neon_map_set"
             | "neon_map_contains"
@@ -598,6 +602,18 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
         // `is_counted` is the precondition that function states, asked of the repr codegen
         // already has. `sizeof` rather than a size computed here, so the literal cannot
         // disagree with the layout the emitter actually gave the type.
+        // The width as a literal for the same reason `neon_list_set` takes one, and no
+        // `is_counted` gate is needed at this arm: `ir::unique` only rewrites writes whose
+        // element is uncounted, so reaching here with a refcounted one is a bug in that
+        // pass rather than a case to handle.
+        "neon_list_set_inplace" => format!(
+            "neon_list_set_scalar_inplace({}, {}, {}, sizeof({}))",
+            var(args[0]),
+            var(args[1]),
+            addr_of(types, f, args[2], &elem()),
+            types.c_type(&elem())
+        ),
+        "neon_list_ensure_unique" => format!("neon_list_ensure_unique({})", var(args[0])),
         "neon_list_set" if !elem().is_counted() => format!(
             "neon_list_set_scalar({}, {}, {}, sizeof({}))",
             var(args[0]),

@@ -31,6 +31,14 @@ neon_list* neon_list_set(neon_list* l, int64_t i, const void* elem); // consumes
 // constant at the call site. Skips the witness entirely: no release of the overwritten
 // slot, and the copy folds to a store. Calling it for a refcounted element leaks.
 neon_list* neon_list_set_scalar(neon_list* l, int64_t i, const void* elem, size_t sz);
+// Establish sole ownership: returns `l` when it is already the only reference, and a
+// private copy otherwise (consuming the original). Called ONCE before a loop that then
+// writes in place, rather than per write.
+neon_list* neon_list_ensure_unique(neon_list* l);
+// A write to a list the caller has already established is sole-owned. Returns nothing:
+// the pointer cannot change, which is exactly what lets the caller keep `data` and its
+// bounds facts live across it. See the precondition on the definition.
+void neon_list_set_scalar_inplace(neon_list* l, int64_t i, const void* elem, size_t sz);
 
 // `neon_list_at` with the element width supplied by the caller instead of read from the
 // witness.

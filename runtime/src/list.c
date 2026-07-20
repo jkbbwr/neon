@@ -49,7 +49,7 @@ neon_list* neon_list_new_with_capacity(const neon_witness* w, int64_t cap) {
 
 
 // Copy a shared list before a mutation, retaining each element for the copy.
-static neon_list* neon_list_ensure_unique(neon_list* l) {
+neon_list* neon_list_ensure_unique(neon_list* l) {
     if (l->header.rc == 1) {
         return l;
     }
@@ -102,6 +102,26 @@ neon_list* neon_list_push(neon_list* l, const void* elem) {
 //
 // PRECONDITION, and it is codegen's to keep: the element type must not be refcounted.
 // Calling this for one that is leaks the value being overwritten.
+// `neon_list_set_scalar` for a list the caller has ALREADY established is sole-owned, so
+// there is no `rc` test and no possibility of a clone -- the list pointer is unchanged, and
+// the caller may keep everything it knew about it.
+//
+// That last part is the point. The generic write returns a list that *might* differ, so a C
+// compiler must discard `data`, `len` and every bounds fact across each call; on the
+// brainfuck interpreter loop that cost 14.7% in reloading `data` alone, plus bounds checks
+// that could not hoist. Returning nothing is what lets those stay in registers.
+//
+// PRECONDITION, and it is the optimiser's to keep: `l` must be sole-owned at this point,
+// which `ir::unique` establishes by calling `neon_list_ensure_unique` once before the loop
+// this is called from. Violating it mutates a list somebody else is holding -- silently,
+// with no output difference until the other holder is read.
+void neon_list_set_scalar_inplace(neon_list* l, int64_t i, const void* elem, size_t sz) {
+    if (i < 0 || (size_t)i >= l->len) {
+        neon_trap("list index out of range");
+    }
+    memcpy(l->data + (size_t)i * sz, elem, sz);
+}
+
 neon_list* neon_list_set_scalar(neon_list* l, int64_t i, const void* elem, size_t sz) {
     if (i < 0 || (size_t)i >= l->len) {
         neon_trap("list index out of range");
