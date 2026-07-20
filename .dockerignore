@@ -1,0 +1,6 @@
+# The build happens inside the image; never ship the host's build tree into the context.
+target/
+verify/target/
+runtime/build/
+**/_neon/
+.git/

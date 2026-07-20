@@ -4,6 +4,11 @@
   "description": "Syntax highlighting and language server support for the Neon programming language.",
   "version": "0.1.0",
   "publisher": "neon-lang",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jkbbwr/neon"
+  },
   "engines": {
     "vscode": "^1.82.0"
   },

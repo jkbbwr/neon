@@ -1,0 +1,52 @@
+name: CI
+
+# The compiler and the runtime, on every push to main and every pull request. The runtime
+# has no separate test binary — it is exercised end to end by the `backend_run` corpus,
+# which compiles each Neon program, links it against the (sanitized) runtime archive, runs
+# it, and checks its output. So one `cargo nextest run` covers both.
+#
+# fuzz/ and verify/ (the CBMC models live under runtime/models, driven from verify/) are
+# deliberately not here: both are detached workspaces needing their own toolchains
+# (cargo-fuzz wants nightly + sanitizers, Kani ships its own backend), and the root
+# workspace excludes them, so a plain `cargo build`/`nextest` never touches them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel an in-flight run when a newer commit lands on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches the cargo registry and the target directory keyed on the lockfile, so a
+      # green run reuses the previous one's compiled dependencies and runtime archives.
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # cmake + gcc drive the runtime's CMake build (via neon-runtime's build script) and
+      # link the corpus programs. Both are preinstalled on ubuntu-latest; assert it rather
+      # than discover it missing three minutes into a build.
+      - name: Check C toolchain
+        run: cc --version && cmake --version
+
+      # Builds the whole workspace, which builds the runtime archives as a side effect.
+      - name: Build
+        run: cargo build --workspace --locked
+
+      # The compiler's own tests plus the runtime-linking corpus.
+      - name: Test
+        run: cargo nextest run --workspace --locked
