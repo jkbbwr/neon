@@ -48,3 +48,21 @@ fn is_empty[K, V](m: Map[K, V]) -> bool {
 fn get_or[K, V](m: Map[K, V], k: K, fallback: V) -> V {
     if contains(m, k) { m[k] } else { fallback }
 }
+
+// `k` set to `f` of its current value, or of `fallback` when `k` is absent.
+//
+// This is the counting idiom, and the reason it is a primitive rather than something to
+// spell out at the call site. Written by hand it is
+//
+//     counts = map::set(counts, w, map::get_or(counts, w, 0) + 1)
+//
+// which walks the table three times for one increment -- `get_or` is `contains` and then
+// an index, and `set` probes again -- re-hashing `w` each time. `update` probes once:
+//
+//     counts = map::update(counts, w, 0, (v: i64) => v + 1)
+//
+// Nothing recovers the three-pass version automatically. Fusing it would mean proving the
+// two maps are the same value and that nothing observes it in between, and getting that
+// wrong is a miscompile; getting it *silently un-applied* is a 2x cliff with no diagnostic.
+// So the fast shape is one you ask for.
+@pure @native("neon_map_update") fn update[K, V](m: Map[K, V], k: K, fallback: V, f: (V) -> V) -> Map[K, V]

@@ -6,12 +6,19 @@
 " which is the complete punctuation alphabet. If a token is added there, add it
 " here. Nothing in this file is guessed from other languages.
 "
-" Three deliberate omissions:
+" This is the FALLBACK highlighter, and it is not deprecated. A tree-sitter grammar
+" for Neon lives at `extra/tree-sitter-neon` and is strictly better where it is
+" available -- but it has to be compiled first (`:TSInstall neon`, which needs a C
+" compiler), and a plain `set runtimepath+=` install has no build step at all. This
+" file is what colours the buffer until then, so it stays in step with the lexer.
+" `require('neon').setup{}` clears `syntax` on any buffer where the parser loads,
+" so the two never run at once.
+"
+" Two deliberate omissions:
 "   * `enum` is NOT a keyword. token.rs says so explicitly: sum types are unions of
 "     records, and `enum` lexes as an ordinary identifier. It is not highlighted.
 "   * `..=` does not exist. The only range-ish token is `..` (record/list spread);
 "     ranges are the function `range(a, b)`.
-"   * There is no Neon tree-sitter grammar. This regex syntax is the whole story.
 "
 " ORDERING: when two items match at the same position, the one defined LAST wins.
 " That is why comments are defined at the bottom -- the `/` operator would
@@ -65,11 +72,13 @@ syntax keyword neonPreludeType List Map Display Error Ord Ordering IndexError
 syntax match neonTypeName "\<\u\w*\>"
 
 " ---- annotations -------------------------------------------------------------
-" The complete registry is `lookup()` in compiler/src/expand.rs: exactly five.
+" The complete registry is `lookup()` in compiler/src/expand.rs: exactly six.
+" `@inline` is the sixth and was added after this file was first written -- it is
+" the one that goes stale, so check `lookup()` rather than this comment.
 " Anything else is a hard error from the compiler ("unknown annotation `@wat`"),
-" so the catch-all is defined first and the five valid names override it.
+" so the catch-all is defined first and the six valid names override it.
 syntax match neonAnnotationBad "@\w\+"
-syntax match neonAnnotation    "@\%(native\|cfg\|doc\|runtime\|pure\)\>"
+syntax match neonAnnotation    "@\%(native\|cfg\|doc\|runtime\|pure\|inline\)\>"
 
 " ---- atoms -------------------------------------------------------------------
 " `:name`. The lexer's rule (`atom_ahead`) is that a `:` opens an atom only when an

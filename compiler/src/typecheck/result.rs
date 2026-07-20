@@ -14,7 +14,35 @@
 use super::dispatch::Resolution;
 use super::types::TyId;
 use crate::ast::ExprId;
+use crate::lexer::Span;
 use std::collections::HashMap;
+
+/// What sort of thing a name turned out to name. Carried alongside the span so a
+/// consumer can label a jump without re-deriving the answer from the AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefKind {
+    /// A `let`, or a binding introduced by `for`, `case`, or a `try` handler.
+    Local,
+    /// A function parameter, including a lambda's.
+    Param,
+    /// A top-level or module-level `fn`.
+    Fn,
+}
+
+/// Where a name was defined: enough to open the right file at the right range.
+///
+/// `module` is here because a span alone is ambiguous. Spans are byte offsets into
+/// *some* source, and a compilation covers many — the user's module plus every stdlib
+/// file, all checked together so that one `TypecheckResult` spans them all. Recording
+/// which module a span belongs to is what makes the offset resolvable to a file; without
+/// it, a jump into `std::io` would land at the same byte offset in whatever file the
+/// editor happened to have open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefSite {
+    pub module: Vec<String>,
+    pub span: Span,
+    pub kind: DefKind,
+}
 
 /// What the checker learned, keyed by expression.
 ///
@@ -31,6 +59,18 @@ use std::collections::HashMap;
 pub struct TypecheckResult {
     expr_types: HashMap<ExprId, TyId>,
     resolved_calls: HashMap<ExprId, Resolution>,
+    /// Where each name-shaped expression's referent was defined.
+    ///
+    /// Nothing in the compiler reads this: lowering resolves names through the same
+    /// scope walk the checker did, and does not need the answer handed to it. It exists
+    /// for the editor, which cannot redo that walk — the checker is the only pass that
+    /// ever holds "this `x` is *that* `x`", and it held it for the duration of one
+    /// function call before dropping it on the floor. Every jump-to-definition,
+    /// find-references and rename is this map read forwards or backwards.
+    ///
+    /// Recorded at the single point where a path resolves (`check.rs::path`), so a name
+    /// the checker could not resolve is simply absent rather than wrong.
+    resolved_names: HashMap<ExprId, DefSite>,
     /// A lambda's inferred signature, as an arrow. Currently redundant: `check.rs`
     /// records the same arrow into `expr_types` for the lambda expression, and lowering
     /// reads it from there. Nothing reads this map.
@@ -84,6 +124,27 @@ impl TypecheckResult {
     /// the argument types the checker had.
     pub fn call(&self, e: ExprId) -> Option<&Resolution> {
         self.resolved_calls.get(&e)
+    }
+
+    /// Where the name this expression writes was defined, if it resolved to one.
+    ///
+    /// `None` covers two cases an editor must not confuse: the expression is not a name
+    /// at all, or it is a name that did not resolve. Both mean "no jump available", which
+    /// is the same answer, so neither is worth distinguishing here.
+    pub fn def(&self, e: ExprId) -> Option<&DefSite> {
+        self.resolved_names.get(&e)
+    }
+
+    /// Every resolved name. An editor builds its reverse index from this — find-references
+    /// is "which ids map to the site this one maps to", which needs the whole map, not a
+    /// lookup. Iteration order is a `HashMap`'s; sort before rendering.
+    pub fn defs(&self) -> impl Iterator<Item = (ExprId, &DefSite)> + '_ {
+        self.resolved_names.iter().map(|(&e, d)| (e, d))
+    }
+
+    /// Records what a path resolved to. See `resolved_names`.
+    pub(super) fn set_def(&mut self, e: ExprId, d: DefSite) {
+        self.resolved_names.insert(e, d);
     }
 
     /// See `resolved_lambdas`: nothing calls this, and the same arrow is available from

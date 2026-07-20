@@ -24,7 +24,7 @@ fn main() {
     while i < n {
         x = (x * 48271) % 2147483647;
         let word = "w#{x % 10000}";
-        counts = map::set(counts, word, map::get_or(counts, word, 0) + 1);
+        counts = map::update(counts, word, 0, (v: i64) => v + 1);
         i = i + 1;
     };
 

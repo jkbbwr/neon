@@ -27,32 +27,50 @@ def run_and_time(cmd):
 
 def compile_and_show_output(name, cmd, cwd=None):
     console = Console()
-    console.print(f"Compiling [cyan]{name}[/cyan]...")
+    import sys
+    hide_compilation = "--hide-compilation" in sys.argv
+
+    if not hide_compilation:
+        console.print(f"Compiling [cyan]{name}[/cyan]...")
+
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
-    
-    output_str = ""
-    if res.stdout:
-        output_str += res.stdout
-    if res.stderr:
-        output_str += res.stderr
-    
-    output_str = output_str.strip()
-    if not output_str:
-        output_str = "(No compiler output)"
+    is_ok = (res.returncode == 0)
+
+    if not is_ok:
+        if hide_compilation:
+            console.print(f"Compiling [cyan]{name}[/cyan]... [red]Failed[/red]")
         
-    border = "=" * 60
-    console.print(border)
-    console.print(f"Compiler output for {name}:")
-    console.print(output_str)
-    console.print(border)
-    
-    return res.returncode == 0
+        output_str = (res.stdout or "") + (res.stderr or "")
+        output_str = output_str.strip() or "(No compiler output)"
+        
+        border = "=" * 60
+        console.print(border)
+        console.print(f"Compiler output for {name}:")
+        console.print(output_str)
+        console.print(border)
+    else:
+        if hide_compilation:
+            console.print(f"Compiling [cyan]{name}[/cyan]... [green]OK[/green]")
+        else:
+            output_str = (res.stdout or "") + (res.stderr or "")
+            output_str = output_str.strip() or "(No compiler output)"
+            
+            border = "=" * 60
+            console.print(border)
+            console.print(f"Compiler output for {name}:")
+            console.print(output_str)
+            console.print(border)
+            
+    return is_ok
 
 def main():
     parser = argparse.ArgumentParser(description="Run word-frequency benchmarks.")
     parser.add_argument("--fast-only", action="store_true", help="Only run languages within 5x the performance of C (based on cache).")
     parser.add_argument("--clear-cache", action="store_true", help="Clear the benchmark cache.")
     parser.add_argument("--runs", type=int, default=1, help="Number of runs per language to average.")
+    parser.add_argument("--only", type=str, help="Comma-separated list of languages to run (fuzzy matched).")
+    parser.add_argument("--historic", action="store_true", help="Compare this run to the last run for each language.")
+    parser.add_argument("--hide-compilation", action="store_true", help="Hide compilation output unless there is an error.")
     args = parser.parse_args()
 
     # Make sure we are in the script's directory
@@ -71,14 +89,69 @@ def main():
         except Exception:
             pass
 
+    # Normalize cache to the new format internally
+    if isinstance(cache, dict) and "runs" not in cache:
+        if cache:
+            cache = {
+                "runs": [
+                    {
+                        "timestamp": "legacy",
+                        "results": cache
+                    }
+                ]
+            }
+        else:
+            cache = {"runs": []}
+
+    latest_cache = {}
+    if isinstance(cache, dict) and "runs" in cache:
+        for run in cache["runs"]:
+            if isinstance(run, dict) and "results" in run:
+                for k, v in run["results"].items():
+                    latest_cache[k] = v
+
+    only_patterns = []
+    if args.only:
+        only_patterns = [p.strip().lower() for p in args.only.split(",") if p.strip()]
+
+    def matches_only(name):
+        if not args.only:
+            return True
+        name_lower = name.lower()
+        import re
+        name_tokens = re.sub(r'[^a-z0-9+#]', ' ', name_lower).split()
+        name_clean = re.sub(r'[^a-z0-9+#]', '', name_lower)
+        
+        aliases = {
+            'cpp': 'c++',
+            'csharp': 'c#',
+        }
+        
+        for pattern in only_patterns:
+            pattern = aliases.get(pattern, pattern)
+            pattern_clean = re.sub(r'[^a-z0-9+#]', '', pattern)
+            
+            if pattern_clean == name_clean:
+                return True
+            if pattern in name_tokens or pattern_clean in name_tokens:
+                return True
+            if len(pattern_clean) >= 3:
+                if any(token.startswith(pattern_clean) for token in name_tokens):
+                    return True
+                if pattern_clean in name_clean:
+                    return True
+        return False
+
     def should_run(name):
+        if args.only and not matches_only(name):
+            return False
         if not args.fast_only:
             return True
         if name == "C":
             return True
-        if name not in cache or "C" not in cache:
+        if name not in latest_cache or "C" not in latest_cache:
             return True
-        return cache[name] <= 5.0 * cache["C"]
+        return latest_cache[name] <= 5.0 * latest_cache["C"]
 
     console = Console()
     console.print("[bold blue]Compiling binaries...[/bold blue]")
@@ -261,11 +334,16 @@ def main():
     table.add_column("Language", style="bold white", width=12)
     table.add_column("Time (s)", justify="right")
     table.add_column("Relative to C", justify="right")
+    if args.historic:
+        table.add_column("vs Last Run", justify="right")
     table.add_column("Status", justify="center")
 
     for name, elapsed in sorted_items:
         if elapsed is None:
-            table.add_row(name, "-", "-", "[red]Not Run[/red]")
+            if args.historic:
+                table.add_row(name, "-", "-", "-", "[red]Not Run[/red]")
+            else:
+                table.add_row(name, "-", "-", "[red]Not Run[/red]")
         else:
             if name == "C":
                 rel_str = "[bold green]1.00x (baseline)[/bold green]"
@@ -280,20 +358,46 @@ def main():
             else:
                 rel_str = "N/A"
             
-            table.add_row(name, f"{elapsed:.4f}s", rel_str, "[green]OK[/green]")
+            if args.historic:
+                old_time = latest_cache.get(name)
+                if old_time is not None:
+                    diff = elapsed - old_time
+                    pct = (diff / old_time) * 100
+                    if pct > 0:
+                        vs_last = f"[red]+{pct:.1f}%[/red]"
+                    elif pct < 0:
+                        vs_last = f"[green]{pct:.1f}%[/green]"
+                    else:
+                        vs_last = "[white]0.0%[/white]"
+                else:
+                    vs_last = "-"
+                table.add_row(name, f"{elapsed:.4f}s", rel_str, vs_last, "[green]OK[/green]")
+            else:
+                table.add_row(name, f"{elapsed:.4f}s", rel_str, "[green]OK[/green]")
 
     console.print("\n")
     console.print(table)
 
     # Save cache
+    new_run_results = {}
     for name, elapsed in results.items():
         if elapsed is not None:
-            cache[name] = elapsed
-    try:
-        with open(cache_file, "w") as f:
-            json.dump(cache, f, indent=2)
-    except Exception as e:
-        console.print(f"[red]Failed to save cache: {e}[/red]")
+            new_run_results[name] = elapsed
+            
+    if new_run_results:
+        import datetime
+        timestamp = datetime.datetime.now().isoformat(timespec='seconds')
+        if "runs" not in cache:
+            cache["runs"] = []
+        cache["runs"].append({
+            "timestamp": timestamp,
+            "results": new_run_results
+        })
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            console.print(f"[red]Failed to save cache: {e}[/red]")
 
     # Build artifacts are preserved after execution as requested.
 

@@ -44,6 +44,39 @@ impl LineIndex {
         let character = prefix.chars().map(char::len_utf16).sum::<usize>();
         Position { line: line as u32, character: character as u32 }
     }
+
+    /// The byte offset of a position — `position` run backwards.
+    ///
+    /// Every request that names a place in the document rather than reporting one arrives
+    /// this way round: hover, go-to-definition, completion and rename all say "line 12,
+    /// character 7" and mean a byte offset the compiler can compare against a span. The
+    /// UTF-16 walk is the same one `position` does, stopped when the budget runs out
+    /// instead of when the offset is reached.
+    ///
+    /// Out-of-range input clamps rather than failing. An editor can legitimately ask about
+    /// a position one past the end of a line (that is where the cursor sits after the last
+    /// character), and a client racing a document change can ask about a line that no
+    /// longer exists. Neither deserves an error response.
+    pub fn offset(&self, pos: Position) -> usize {
+        let Some(&line_start) = self.starts.get(pos.line as usize) else {
+            return self.text.len();
+        };
+        // The line's own text, so a character index past its end stops at the newline
+        // rather than running on into the next line.
+        let line_end = self
+            .starts
+            .get(pos.line as usize + 1)
+            .map_or(self.text.len(), |&next| next);
+
+        let mut units = 0usize;
+        for (i, c) in self.text[line_start..line_end].char_indices() {
+            if units >= pos.character as usize {
+                return line_start + i;
+            }
+            units += c.len_utf16();
+        }
+        line_end
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +104,39 @@ mod tests {
     fn an_offset_past_the_end_clamps() {
         let idx = LineIndex::new("ab\n");
         assert_eq!(idx.position(999), idx.position("ab\n".len()));
+    }
+
+    /// The property that matters for every position-taking request: asking for the
+    /// position of an offset and then the offset of that position gets back where it
+    /// started. A drift of one here puts hover on the character next to the cursor.
+    #[test]
+    fn offsets_and_positions_round_trip() {
+        let text = "fn f() {\n  let é = \"🙂\";\n  é\n}\n";
+        let idx = LineIndex::new(text);
+        for offset in text.char_indices().map(|(i, _)| i) {
+            assert_eq!(idx.offset(idx.position(offset)), offset, "offset {offset} drifted");
+        }
+    }
+
+    #[test]
+    fn a_character_index_counts_utf16_units_not_bytes() {
+        // Same fixture as the forward test: the emoji is two UTF-16 units, so character
+        // 3 is the `x` at byte 6. A byte-counting implementation would land mid-emoji.
+        let idx = LineIndex::new("é🙂x");
+        assert_eq!(idx.offset(Position { line: 0, character: 3 }), "é🙂".len());
+    }
+
+    #[test]
+    fn a_character_past_the_end_of_a_line_stops_at_the_line_end() {
+        // Where the cursor sits after the last character of a line. It must not run on
+        // into the next line, or hover at end-of-line would report the wrong statement.
+        let idx = LineIndex::new("ab\ncd");
+        assert_eq!(idx.offset(Position { line: 0, character: 99 }), 3);
+    }
+
+    #[test]
+    fn a_line_that_does_not_exist_clamps_to_the_end() {
+        let idx = LineIndex::new("ab\n");
+        assert_eq!(idx.offset(Position { line: 99, character: 0 }), 3);
     }
 }

@@ -1,7 +1,9 @@
 " Indentation for Neon.
 "
-" A deliberately small brace-matching heuristic rather than a real grammar. Neon has
-" no tree-sitter parser, and `cindent` gets Neon wrong in specific ways: it treats
+" A deliberately small brace-matching heuristic rather than a real grammar. It is the
+" fallback for buffers with no compiled tree-sitter parser -- `extra/tree-sitter-neon`
+" ships an `indents.scm`, and nvim-treesitter's indent module supersedes this file
+" wherever that parser is installed. `cindent` is not an option either way: it treats
 " `:` as a label (so `x: i64` and the atom `:ok` both throw off the indent) and it
 " special-cases `#` as a preprocessor line, which collides with `#{` interpolation.
 "

@@ -1,0 +1,1 @@
+../../../tree-sitter-neon/queries/indents.scm

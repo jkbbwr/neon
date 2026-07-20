@@ -1,0 +1,58 @@
+// `map::update` is the read-modify-write primitive: it computes a key's new value from
+// its current one in a single probe, where `set(m, k, get_or(m, k, 0) + 1)` walks the
+// table three times — `get_or` is `contains` and then an index, and `set` probes again.
+//
+// The cases that matter are all about *ownership*, because the closure consumes the value
+// it is handed and hands back an owned one. On the present path the slot's value goes in
+// (so it must not also be released) and the fallback is dropped unused; on the absent path
+// the fallback goes in and the key moves into the table. A `str` value exercises both,
+// since a leak or a double release there is visible rather than silent.
+//
+// The agreement check is the load-bearing one: it runs both spellings side by side over
+// enough keys to force the table to grow, and asserts the maps are equal.
+
+use std::io;
+use std::collections::map;
+
+fn main() {
+    // Absent: the fallback is what reaches the closure.
+    let m: Map[str, i64] = map::new();
+    m = map::update(m, "a", 0, (v: i64) => v + 1);
+    io::println("a=#{map::get_or(m, "a", -1)} len=#{map::len(m)}");
+
+    // Present: the stored value is what reaches the closure, and the fallback is ignored.
+    m = map::update(m, "a", 99, (v: i64) => v + 10);
+    io::println("a=#{map::get_or(m, "a", -1)} len=#{map::len(m)}");
+
+    // The two spellings agree, across a growth of the table.
+    let want: Map[str, i64] = map::new();
+    let got: Map[str, i64] = map::new();
+    let n = 0;
+    while n < 500 {
+        let k = "k#{n % 37}";
+        want = map::set(want, k, map::get_or(want, k, 0) + 1);
+        got = map::update(got, k, 0, (v: i64) => v + 1);
+        n = n + 1;
+    };
+    io::println("agree=#{want == got} distinct=#{map::len(got)}");
+
+    // A refcounted value, so the consume-and-return dance is actually exercised.
+    let s: Map[str, str] = map::new();
+    s = map::update(s, "x", "", (v: str) => v + "p");
+    s = map::update(s, "x", "", (v: str) => v + "q");
+    io::println("x=#{map::get_or(s, "x", "?")}");
+
+    // A capturing closure: the environment is heap-allocated and must be released once.
+    let bump = 7;
+    let c: Map[str, i64] = map::new();
+    c = map::update(c, "y", 100, (v: i64) => v + bump);
+    io::println("y=#{map::get_or(c, "y", -1)}");
+
+    // A shared map is copied before it is mutated, exactly as `set` does, so the alias
+    // still sees the old value.
+    let base: Map[str, i64] = map::new();
+    base = map::set(base, "s", 1);
+    let alias = base;
+    let derived = map::update(base, "s", 0, (v: i64) => v + 41);
+    io::println("alias=#{map::get_or(alias, "s", -1)} derived=#{map::get_or(derived, "s", -1)}");
+}

@@ -176,7 +176,9 @@ fn match_repr(template: &Repr, concrete: &Repr, subst: &mut std::collections::Ha
 ///
 /// Three arms are lossy:
 ///   * `Named` with args builds `Record { fields: vec![] }` — a generic record carries
+/// ```text
 ///     its arguments in its FIELDS, so `Box[i64]` and `Box[str]` become one repr.
+/// ```
 ///   * `path.last()` drops the module, so `a::Point` and `b::Point` agree.
 ///   * `_ => Repr::Any` sends every tuple and arrow typespec to one value.
 ///
@@ -186,6 +188,7 @@ fn match_repr(template: &Repr, concrete: &Repr, subst: &mut std::collections::Ha
 /// Reproducer — there is no corpus file because the ratchet has no known-bug marker and
 /// this program should eventually PASS, which `expected-pass.txt` cannot express:
 ///
+/// ```text
 ///     record Box[T] { item: T }
 ///     fn ident[T](x: T) -> T { x }
 ///     fn main() {
@@ -194,12 +197,15 @@ fn match_repr(template: &Repr, concrete: &Repr, subst: &mut std::collections::Ha
 ///         io::println("#{ident[Box[i64]](bi).item}");
 ///         io::println("#{ident[Box[str]](bs).item}");
 ///     }
+/// ```
 ///
 /// `neon ir` shows the collision directly — two call sites, one body:
 ///
+/// ```text
 ///     %9  = call @ident$Box(%4)      // the Box[i64] call site
 ///     %10 = call @ident$Box(%8)      // the Box[str] call site
 ///     fn @ident$Box(%0 Box{item: str}) -> Box{item: str}
+/// ```
 ///
 /// and it currently dies at `incompatible types when assigning to type 'nr0' from type
 /// 'nr1'`. gcc's nominal struct typing is the only thing standing between this and a
@@ -684,9 +690,11 @@ fn mangle_impl(protocol: &str, head: &str, method: &str) -> String {
 /// Reproducer — no corpus file, because the ratchet has no known-bug marker and this
 /// program should eventually PASS, which `expected-pass.txt` cannot express:
 ///
+/// ```text
 ///     protocol Show for T { fn show(v: T) -> str }
 ///     impl Show for (i64, i64) { fn show(v: (i64, i64)) -> str { "int tuple" } }
 ///     impl Show for (str, str) { fn show(v: (str, str)) -> str { "str tuple" } }
+/// ```
 ///
 /// Both impls become `Show$$show`, emitted as `nl_Show_S_Sshow`, and gcc reports
 /// `conflicting types for 'nl_Show_S_Sshow'; have 'neon_str(nt1)'` against a previous

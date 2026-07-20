@@ -915,3 +915,103 @@ fn a_supertrait_bound_satisfies_the_super_protocols_method() {
          fn same[T](a: T, b: T) -> bool where T: Ord { eq(a, b) }",
     );
 }
+
+// ---- resolved names ----
+//
+// The checker is the only pass that ever knows which binding a name means: the frame
+// holding it is popped when the block ends, and nothing downstream can reconstruct the
+// scope walk. These fix what it records, because the editor's jump-to-definition,
+// find-references and rename are all this one map read forwards or backwards.
+
+/// Parse, number, and check — numbering matters here in a way it does not for the
+/// diagnostic tests, since an unnumbered module gives every expression the same id and
+/// a map keyed by `ExprId` would collapse to one entry.
+fn defs(src: &str) -> Vec<(String, super::result::DefSite)> {
+    let mut m = parse(src);
+    crate::ast::number_exprs(&mut m);
+    let mut env = Env::build(&m);
+    assert!(env.errors().is_empty(), "the fixture's declarations do not check: {:?}", env.errors());
+    let (r, errs) = check_module(&mut env, &m);
+    assert!(errs.is_empty(), "expected no errors, got {errs:?}");
+
+    // Key by the source text the name was written as, not by `ExprId`: the ids are an
+    // allocation order the test should not be pinned to.
+    let mut out: Vec<_> = r
+        .defs()
+        .map(|(e, d)| {
+            let span = span_of(&m, e).expect("every resolved name has a span");
+            (src[span].to_string(), d.clone())
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.span.start.cmp(&b.1.span.start)));
+    out
+}
+
+/// The span of one expression. The AST has no id-to-span index — nothing in the
+/// compiler needs one — so the test builds the lookup it needs.
+fn span_of(m: &ast::Module, want: crate::ast::ExprId) -> Option<std::ops::Range<usize>> {
+    let mut found = None;
+    ast::visit::each_expr(m, |e| {
+        if e.id == want {
+            found = Some(e.span.clone());
+        }
+    });
+    found
+}
+
+#[test]
+fn a_local_resolves_to_the_let_that_bound_it() {
+    let d = defs("fn main() { let x = 1; let y = x; }");
+    let (name, site) = d.iter().find(|(n, _)| n == "x").expect("`x` resolved");
+    assert_eq!(name, "x");
+    assert_eq!(site.kind, super::result::DefKind::Local);
+    // The binding, not the use.
+    assert_eq!(site.span.start, "fn main() { let ".len());
+}
+
+#[test]
+fn a_parameter_is_distinguished_from_a_let() {
+    let d = defs("fn f(n: i64) -> i64 { n }");
+    let (_, site) = d.iter().find(|(n, _)| n == "n").expect("`n` resolved");
+    assert_eq!(site.kind, super::result::DefKind::Param);
+}
+
+#[test]
+fn the_inner_binding_wins() {
+    // Two bindings of `x`; the use must resolve to the nearer one. This is the case a
+    // naive by-name index gets wrong, and getting it wrong means rename edits the
+    // wrong occurrences.
+    let src = "fn main() { let x = 1; { let x = 2; let y = x; } }";
+    let d = defs(src);
+    let (_, site) = d.iter().find(|(n, _)| n == "x").expect("`x` resolved");
+    assert_eq!(site.span.start, src.find("x = 2").expect("the inner binding is in the fixture"));
+}
+
+#[test]
+fn a_call_resolves_to_the_function_it_names() {
+    let d = defs("fn helper() -> i64 { 1 }\nfn main() { let n = helper(); }");
+    let (_, site) = d.iter().find(|(n, _)| n == "helper").expect("`helper` resolved");
+    assert_eq!(site.kind, super::result::DefKind::Fn);
+}
+
+#[test]
+fn a_local_shadows_a_function_of_the_same_name() {
+    // `path` tries the local first, so the recorded site must agree with the type the
+    // same lookup produced. A jump that disagreed with hover would be worse than none.
+    let src = "fn v() -> i64 { 1 }\nfn main() { let v = 2; let n = v; }";
+    let d = defs(src);
+    let (_, site) = d.iter().find(|(n, _)| n == "v").expect("`v` resolved");
+    assert_eq!(site.kind, super::result::DefKind::Local);
+}
+
+#[test]
+fn an_unresolved_name_records_nothing() {
+    // Absent rather than wrong: an editor offering a jump to a name that does not
+    // resolve would be pointing at whatever the last successful lookup found.
+    let mut m = parse("fn main() { let n = nope; }");
+    crate::ast::number_exprs(&mut m);
+    let mut env = Env::build(&m);
+    let (r, errs) = check_module(&mut env, &m);
+    assert!(!errs.is_empty(), "the fixture is supposed to fail");
+    assert!(r.defs().all(|(_, d)| d.kind != super::result::DefKind::Local));
+}

@@ -3,29 +3,61 @@
 Syntax highlighting for `.neon` files, plus a client for the `neon-lsp` language
 server.
 
-**Status: unpublished and unverified.** Nothing in this directory has been run.
-The files were written against the compiler and server sources in this repo —
-`compiler/src/lexer/token.rs` for the keyword and operator list,
-`compiler/src/lexer/mod.rs` for literals and comments, `compiler/src/expand.rs`
-for the annotation names, and `lsp/src/main.rs` for the server's capabilities —
-but no one has installed the extension, opened a file with it, or observed a
-diagnostic arrive. Treat the first run as a debugging session, not an install.
+**Status: unpublished. The extension has never been run; the grammar has.**
+
+Nobody has installed this extension, opened a file with it, or watched a
+diagnostic arrive — no VS Code instance has loaded `client/extension.js`. Treat
+the first run as a debugging session, not an install.
+
+The **TextMate grammar** is a different matter and is no longer unverified. It
+was tokenized with the real engine — `vscode-textmate` over `vscode-oniguruma`,
+the same pair VS Code itself uses — across all 310 `.neon` files in `tests/lang/`
+and `stdlib/`: 82,392 tokens, no exception, and exactly one file left inside an
+unclosed rule, `strings/interpolation_unterminated_fails.neon`, a `//@ compile-fail`
+fixture whose interpolation is deliberately unterminated. Scope counts before and
+after each change were diffed against the corpus, which is how the `orelse`
+(83 occurrences), `@inline` (5) and integer-scoped-as-float (1,686) bugs were
+each confirmed fixed rather than assumed.
+
+Everything is written against the sources in this repo rather than from memory:
+`compiler/src/lexer/token.rs` for the keywords and punctuation,
+`compiler/src/lexer/mod.rs` for literals and comments, `compiler/src/ops.rs` for
+which words are operators, `compiler/src/expand.rs` (`lookup`) for the annotation
+names, and `lsp/src/main.rs` for the server's capabilities.
 
 ## What it does
-
-Two things, because the server does two things.
 
 - **Diagnostics.** Lexer, parser and type errors, published as you type.
 - **Formatting.** Whole-document formatting, backed by `neon fmt`'s formatter.
   A file that does not parse is left alone — the formatter reprints from the
   AST, so there is nothing to reprint, and the server returns no edits rather
   than an error. Format-on-save while a line is half-written is therefore quiet.
+- **Hover.** The type or signature of the symbol under the cursor, plus its
+  `///` doc comment. Works on stdlib symbols.
+- **Go to definition** (<kbd>F12</kbd>), including into stdlib files.
+- **Find all references** (<kbd>Shift</kbd>+<kbd>F12</kbd>), shadowing-correct.
+- **Rename** (<kbd>F2</kbd>). Declines a symbol whose definition is in another
+  file and returns an LSP error rather than a partial edit — a rename that
+  silently missed the definition would be worse than one that refused.
+- **Completion**, triggered on `:` as well as on typing. Locals plus every
+  visible `fn`, with signatures and docs. `.` is deliberately not a trigger:
+  Neon has no method-call syntax, so a dot is field access on a record whose
+  fields the identifier path already offers.
+- **Signature help**, triggered on `(` and `,`.
+- **Outline and breadcrumbs**, nested — `mod` and `impl` group their children.
+- **Inlay hints**: inferred types on `let`s that have no annotation.
 
-The server advertises nothing else. There is no hover, no completion, no
-go-to-definition and no rename, and this extension does not ask for any of them.
-Highlighting is TextMate-only; there are no semantic tokens, so anything the
-grammar cannot decide from a regex — which type a name refers to, most of all —
-is a heuristic.
+None of that is declared in `package.json`, and nothing needs to be.
+`vscode-languageclient` reads the server's capabilities off the `initialize`
+response and registers the matching providers itself, so the authoritative list
+is the `ServerCapabilities` literal in `lsp/src/main.rs` — not this README, and
+not any file in this directory. The one capability the server still does not
+advertise is `codeActionProvider`, so there are no quick fixes.
+
+Highlighting is TextMate-only. There are no semantic tokens either (`neon-lsp`
+does not advertise `semanticTokensProvider`), so anything the grammar cannot
+decide from a regex — which type a name refers to, most of all — is a heuristic.
+See [Grammar notes](#grammar-notes).
 
 ## Requirements
 
@@ -102,6 +134,19 @@ regardless, so `node_modules` must still be present.)
 | `neon.sysroot` | `""` | Directory containing `stdlib/`. Passed to the server as `NEON_SYSROOT`. |
 | `neon.trace.server` | `"off"` | `off`, `messages` or `verbose`. Logs JSON-RPC traffic to the **Neon Language Server** output channel. |
 
+There is deliberately **no `neon.inlayHints.enable`**, and no per-feature toggle
+of any kind. VS Code already scopes its own settings by language, and a setting
+here would be a second switch that the client would have to be taught to honour:
+
+```json
+{
+  "[neon]": {
+    "editor.inlayHints.enabled": "off",
+    "editor.formatOnSave": true
+  }
+}
+```
+
 `neon.server.path` and `neon.sysroot` both expand `${workspaceFolder}` (the
 first workspace folder) and `${userHome}`. VS Code does not substitute these in
 ordinary settings values — only in tasks and launch configurations — so the
@@ -165,12 +210,38 @@ derived from `compiler/src/lexer/mod.rs`:
 - **`enum`.** Not a keyword — sum types are unions of records, and `enum` is an
   ordinary identifier. The grammar flags `enum Name` as invalid, matching the
   dedicated parser diagnostic, but leaves `enum` used as a plain name alone.
-- **Annotations.** `@native`, `@cfg`, `@doc`, `@runtime` and `@pure` are the
-  five the compiler recognises. Any other `@name` is highlighted as invalid,
-  since the compiler rejects it.
+- **Annotations.** `@native`, `@cfg`, `@doc`, `@runtime`, `@pure` and `@inline`
+  are the **six** the compiler recognises — `lookup()` in `compiler/src/expand.rs`
+  is the registry. Any other `@name` is highlighted as invalid, since the
+  compiler rejects it. `@inline` was added to the compiler after this grammar
+  was written and was, until recently, flagged as invalid here; it occurs five
+  times in `stdlib/`, all of them wrongly reddened.
+- **`orelse` is an operator, not exception control flow.** It reads like `catch`,
+  but `compiler/src/ops.rs` has it as a binary operator on the lowest rung of the
+  precedence ladder — below `or`. It is scoped `keyword.operator.word`, not
+  `keyword.control.exception`.
+- **`orphan` is contextual.** `orphan impl P for T` marks an impl the author owns
+  neither side of, but `orphan` is absent from `Token::keyword`; the parser
+  matches it as a plain identifier that happens to sit before `impl`. So the
+  grammar matches it with that lookahead rather than adding it to the keyword
+  list — `let orphan = 1` is legal Neon and stays a variable.
 - **Type names.** Highlighting an initial capital as a type is a heuristic and
   nothing more. The server does not provide semantic tokens, so this is as far
   as it can honestly go.
+
+### What the grammar cannot do
+
+This is a regular expression pretending to be a parser, and
+[`extra/tree-sitter-neon`](../tree-sitter-neon) is an actual one. The gap is
+listed in full in `information_for_contributors` at the top of
+`syntaxes/neon.tmLanguage.json`; the short version is that no amount of regex
+effort will let this file tell a type from a value, a record literal from a
+block, or type parameters from a turbofish from an index, and it can resolve no
+name to its binding. Where a *declaration keyword* pins the position — inside a
+`fn`, `record`, `protocol`, `newtype`, `type`, `marker` or `impl` head — it does
+now scope parameters (`variable.parameter`) and type parameters
+(`entity.name.type.parameter`) correctly, because there the answer is local.
+Everywhere else it guesses, and says so by guessing the same way every time.
 
 ## Troubleshooting
 

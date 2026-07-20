@@ -70,6 +70,7 @@ fn emit_with(program: &Program, tests: Option<&[crate::ir::lower::TestEntry]>) -
     // Adapter thunks give ordinary functions used as closure values the closure ABI.
     emit_thunks(&mut out, &types, program);
     emit_resource_drops(&mut out, &types, program);
+    emit_map_updaters(&mut out, &types, program);
 
     for f in &program.funcs {
         emit_fn(&mut out, &types, f, program.inlined.contains(&f.name));
@@ -421,6 +422,7 @@ fn is_list_builder(symbol: &str) -> bool {
             | "neon_map_set"
             | "neon_map_contains"
             | "neon_map_remove"
+            | "neon_map_update"
             | "neon_map_keys"
             | "neon_map_values"
             | "neon_resource_new"
@@ -449,6 +451,12 @@ fn resource_drop_name(types: &TypeTable, t: &Repr, e: &Repr) -> String {
         + &format!("_{}", types.witness_ref(e).trim_start_matches('&'))
 }
 
+/// The updater shim for a `map::update` over values of repr `v`. One per value repr, since
+/// that is all the shim's body depends on.
+fn map_updater_name(types: &TypeTable, v: &Repr) -> String {
+    format!("nmap_upd_{}", types.witness_ref(v).trim_start_matches('&'))
+}
+
 /// The key and value reprs of a `Map` value.
 ///
 /// Ices rather than answering `(any, any)`. Both reprs are used to pick the witnesses a
@@ -472,8 +480,10 @@ fn map_kv(f: &Func, v: Value) -> (Repr, Repr) {
 /// The fix is a calling convention rather than a language feature. A `@native` whose Neon
 /// return type is a tuple takes the tail of that tuple as C out-parameters:
 ///
+/// ```text
 ///     @native("neon_io_read_all") fn read_all(fd: i64) -> (str, i64)
 ///     // calls: neon_str neon_io_read_all(int64_t fd, int64_t* out_1)
+/// ```
 ///
 /// Nothing new appears in the language: the caller sees an ordinary tuple and destructures
 /// it. No annotation is needed either, and that is not a heuristic -- a native can never
@@ -580,6 +590,20 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
                 var(args[0]),
                 addr_of(types, f, args[1], &k),
                 addr_of(types, f, args[2], &v)
+            )
+        }
+        // Key, fallback and the closure cross by the usual routes; the fifth argument is
+        // this instantiation's updater shim -- the only code that knows `V`'s C type and so
+        // the only code that can perform the call.
+        "neon_map_update" => {
+            let (k, v) = map_kv(f, r);
+            format!(
+                "neon_map_update({}, {}, {}, {}, {})",
+                var(args[0]),
+                addr_of(types, f, args[1], &k),
+                addr_of(types, f, args[2], &v),
+                var(args[3]),
+                map_updater_name(types, &v)
             )
         }
         "neon_map_contains" => format!("neon_map_contains({}, &{})", var(args[0]), var(args[1])),
@@ -718,6 +742,47 @@ fn emit_resource_drops(out: &mut String, types: &TypeTable, program: &Program) {
     out.push('\n');
 }
 
+/// Emit the updater shim `neon_map_update` calls back through, one per value repr in the
+/// program's `map::update` instantiations.
+///
+/// The runtime holds the value only as bytes behind a `void*`, so it cannot perform the
+/// `(V) -> V` call itself — the C signature of that call is a function of `V`. This shim is
+/// the piece that knows `V`, exactly as `nres_drop_*` is for a resource's cleanup.
+///
+/// Reading `in` into a local before storing to `out` is not incidental: `update` passes the
+/// same slot as both on the key-present path, and `neon_map_updater` documents that the
+/// read must complete first.
+fn emit_map_updaters(out: &mut String, types: &TypeTable, program: &Program) {
+    let mut seen: std::collections::BTreeMap<String, Repr> = std::collections::BTreeMap::new();
+    for f in &program.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Op::Native { symbol, .. } = &inst.op else { continue };
+                if symbol != "neon_map_update" {
+                    continue;
+                }
+                // The result is the updated map, so its value repr is the one the closure
+                // maps over. `map_kv` ices on a non-map, which is the same guarantee the
+                // call arm relies on.
+                let Some(r) = inst.result else { continue };
+                let (_, v) = map_kv(f, r);
+                seen.insert(map_updater_name(types, &v), v);
+            }
+        }
+    }
+    if seen.is_empty() {
+        return;
+    }
+    for (name, v) in seen {
+        let vc = types.c_type(&v);
+        let _ = writeln!(
+            out,
+            "static void {name}(neon_closure f, const void* in, void* out) {{ {vc} v = *(const {vc}*)in; *({vc}*)out = (({vc}(*)(neon_header*, {vc}))f.fn)(f.env, v); }}",
+        );
+    }
+    out.push('\n');
+}
+
 /// Emit an adapter thunk for every ordinary function used as a closure value: it takes the
 /// closure ABI's leading (ignored) environment, then forwards to the real function.
 fn emit_thunks(out: &mut String, types: &TypeTable, program: &Program) {
@@ -817,12 +882,12 @@ fn emit_key_witnesses(out: &mut String, types: &TypeTable) {
         let ty = types.c_type(repr);
         let _ = writeln!(
             out,
-            "static uint64_t {name}_hash(const void* p) {{ const {ty}* e = (const {ty}*)p; return {}; }}",
+            "static uint64_t {name}_hash(const void* p) {{ {ty} const* e = ({ty} const*)p; return {}; }}",
             hash_expr(types, repr, "(*e)"),
         );
         let _ = writeln!(
             out,
-            "static bool {name}_eq(const void* pa, const void* pb) {{ const {ty}* a = (const {ty}*)pa; const {ty}* b = (const {ty}*)pb; return {}; }}",
+            "static bool {name}_eq(const void* pa, const void* pb) {{ {ty} const* a = ({ty} const*)pa; {ty} const* b = ({ty} const*)pb; return {}; }}",
             eq_expr(types, repr, "(*a)", "(*b)"),
         );
         let _ = writeln!(
@@ -1160,7 +1225,12 @@ fn emit_witnesses(out: &mut String, types: &TypeTable) {
         let release = emit_witness_fn(out, types, name, repr, "release", "neon_release");
         // Structural comparison, so `==` and `<` on a list can walk its elements. `eq`
         // always exists; `cmp` only for an element that has an order.
-        let cast = format!("const {ty}* a = (const {ty}*)pa; const {ty}* b = (const {ty}*)pb;");
+        // `{ty} const*`, not `const {ty}*`. The two are the same for a flat repr, but a
+        // pointer repr (`neon_map*`, `neon_list*`) is one where they differ: the prefix form
+        // binds `const` to the map, not to the slot, and the element then cannot be passed to
+        // a runtime native that takes it unqualified. What is read-only here is the *slot*
+        // the witness was handed, so the qualifier belongs on the outer pointer.
+        let cast = format!("{ty} const* a = ({ty} const*)pa; {ty} const* b = ({ty} const*)pb;");
         let _ = writeln!(
             out,
             "static bool {name}_eq(const void* pa, const void* pb) {{ {cast} return {}; }}",

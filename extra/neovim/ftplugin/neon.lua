@@ -1,11 +1,15 @@
 -- Buffer-local settings for Neon.
 --
--- Everything here is what the buffer needs to behave sanely with no tree-sitter
--- grammar and no language server: comments, indent width, and the `formatoptions`
--- that make `gq` and auto-wrapping respect comment leaders.
+-- Everything here is what the buffer needs to behave sanely with neither a
+-- tree-sitter parser nor a language server attached: comments, indent width, and
+-- the `formatoptions` that make `gq` and auto-wrapping respect comment leaders.
+-- None of it is superseded by either, so it is set unconditionally.
 --
--- There is no Neon tree-sitter parser in existence. Highlighting comes from
--- `syntax/neon.vim`, indentation from `indent/neon.vim`.
+-- A tree-sitter grammar exists at `extra/tree-sitter-neon`, but a grammar is source
+-- and a parser is a compiled object, and nothing here can assume the second follows
+-- from the first. Until `:TSInstall neon` has been run, highlighting comes from
+-- `syntax/neon.vim` and indentation from `indent/neon.vim`; `require('neon').setup{}`
+-- swaps in the tree-sitter highlighter for buffers where the parser does load.
 
 if vim.b.did_ftplugin then
   return

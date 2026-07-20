@@ -102,8 +102,8 @@ fn m() {
       (let_statement
         (identifier)
         (call_expression
-          (index_expression
-            (identifier)
+          (identifier)
+          (turbofish_arguments
             (identifier))
           (arguments
             (integer))))

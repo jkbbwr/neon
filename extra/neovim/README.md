@@ -8,26 +8,67 @@ Neovim runtime directory — nothing here is built.
 
 ## What you actually get
 
-| Feature | Status |
-| --- | --- |
-| `.neon` filetype detection | yes |
-| Syntax highlighting (vim regex) | yes |
-| Indentation | yes |
-| `commentstring`, `comments`, `formatoptions` | yes |
-| Diagnostics from `neon-lsp` | yes |
-| Formatting (`gq`-independent; `vim.lsp.buf.format`) | yes |
-| Hover, completion, go-to-definition, rename, signature help | **no** |
+| Feature | Status | Comes from |
+| --- | --- | --- |
+| `.neon` filetype detection | yes | `ftdetect/neon.lua` |
+| Syntax highlighting | yes | tree-sitter when installed, `syntax/neon.vim` otherwise |
+| Indentation | yes | `queries/neon/indents.scm` or `indent/neon.vim` |
+| `commentstring`, `comments`, `formatoptions` | yes | `ftplugin/neon.lua` |
+| Diagnostics | yes | `neon-lsp` (`publishDiagnostics`) |
+| Formatting | yes | `documentFormattingProvider` |
+| Hover | yes | `hoverProvider` — type/signature plus the `///` doc comment |
+| Go-to-definition | yes | `definitionProvider` — jumps into stdlib files too |
+| References | yes | `referencesProvider` — shadowing-correct |
+| Rename | yes | `renameProvider` — declines a symbol defined in another file |
+| Completion | yes | `completionProvider`, trigger `:` |
+| Signature help | yes | `signatureHelpProvider`, triggers `(` and `,` |
+| Document symbols | yes | `documentSymbolProvider` — nested under `mod` and `impl` |
+| Inlay hints | yes, opt-in | `inlayHintProvider` — types on un-annotated `let`s |
+| Code actions | **no** | the server does not advertise `codeActionProvider` |
 
-That last row is not an oversight. `neon-lsp` advertises exactly two server
-capabilities — `publishDiagnostics` and `documentFormattingProvider` — and nothing
-else (see the module docs at the top of `lsp/src/main.rs`, which explain why). This
-plugin does not configure keymaps or handlers for capabilities the server does not
-have, because an editor that appears to offer go-to-definition and then does nothing
-is worse than one that never offered it.
+The authoritative list is the `ServerCapabilities` literal near the top of
+`lsp/src/main.rs`, not this table. The rule that governs both is unchanged: a
+capability appears in the server only once it works, and this plugin binds no key
+for a capability the server does not advertise — `bind_keymaps` in
+`lua/neon/init.lua` checks `client.server_capabilities` per key, so an older
+`neon-lsp` on your `$PATH` leaves the corresponding key unbound rather than bound
+to something that errors. `:NeonInfo` prints the live list off the attached client.
 
-There is **no tree-sitter grammar for Neon**. None exists. Highlighting here is a
-hand-written vim regex syntax file derived from `compiler/src/lexer/token.rs`; do not
-expect `nvim-treesitter` to have anything to install.
+Keymaps are **off by default** (`keymaps = true` to get them) and so are inlay
+hints (`inlay_hints = true`). Neither default is a doubt about whether the server
+answers. Neovim 0.11 already binds `K`, `grn`, `grr`, `gri` and `gra` for any
+attached client, so the option exists for people who want the older `gd`/`gr`/
+`<leader>rn` mnemonics rather than to fill a gap; and inlay hints change how every
+line *looks*, which is a preference rather than a capability question.
+
+### Tree-sitter
+
+A grammar **does** exist, in this repository, at [`extra/tree-sitter-neon`](../tree-sitter-neon).
+It parses 308 of the 310 `.neon` files in `tests/lang/` and `stdlib/` (the two
+exceptions are `//@ compile-fail` fixtures that are *supposed* to be malformed) and
+ships `highlights.scm`, `indents.scm`, `locals.scm` and `textobjects.scm`.
+
+`setup{}` registers it with nvim-treesitter so `:TSInstall neon` knows where to
+fetch from and, crucially, that `src/scanner.c` must be compiled alongside
+`src/parser.c` — Neon's block comments nest, no regular expression can count, and
+the nesting depth lives in that external scanner. Registering is not installing:
+`:TSInstall neon` still has to be run, and it needs a C compiler.
+
+Until it is, `syntax/neon.vim` and `indent/neon.vim` do the work. They are the
+fallback, not a deprecated leftover: a `set runtimepath+=` install has no build
+step at all, and "no highlighting until you compile a parser" is not an acceptable
+out-of-the-box state. On buffers where the parser *does* load, `setup{}` calls
+`vim.treesitter.start` and clears `syntax`, so the two never paint over each other.
+Set `treesitter = false` to keep the regex highlighter unconditionally.
+
+`queries/neon/*.scm` here are **symlinks** into `../tree-sitter-neon/queries/`.
+Copies were the alternative and were rejected: two files that must agree and are
+edited in different directories are two files that will disagree, and a stale
+`highlights.scm` fails silently by colouring something wrong rather than by
+erroring. The cost is that the symlinks do not survive being extracted to a
+filesystem without them, so a Windows checkout without developer mode, or a release
+tarball built with `--no-symlinks`, gets four dangling files — copy the four `.scm`
+files by hand in that case.
 
 ## Requirements
 
@@ -162,11 +203,54 @@ require("neon").setup({
   -- Note this cannot conjure capabilities the *server* lacks.
   capabilities = nil,
 
+  -- Bind the buffer-local LSP keymaps listed below. Off by default: Neovim 0.11
+  -- already binds K/grn/grr/gri/gra for any attached client, and a plugin that
+  -- silently takes over `gd` in someone's config is a bug report.
+  keymaps = false,
+
+  -- Turn inlay hints on at attach. Off by default because they insert virtual
+  -- text mid-line -- a look preference, not a capability question.
+  -- `:lua vim.lsp.inlay_hint.enable()` toggles at runtime regardless.
+  inlay_hints = false,
+
+  -- Register the grammar with nvim-treesitter and start the parser on .neon
+  -- buffers when one is installed. Costs nothing when it is not: the call is
+  -- pcall'd and syntax/neon.vim stays in charge.
+  treesitter = true,
+
   settings = {},
   autostart = true,
   warn_on_missing_sysroot = true,
 })
 ```
+
+### Keymaps, when `keymaps = true`
+
+Buffer-local, and each one is bound only if the attached server advertises the
+matching capability.
+
+| Key | Action | Gated on |
+| --- | --- | --- |
+| `K` | hover | `hoverProvider` |
+| `gd` | go to definition | `definitionProvider` |
+| `gr` | references | `referencesProvider` |
+| `<leader>rn` | rename | `renameProvider` |
+| `<leader>ca` | code action | `codeActionProvider` (so: never, today) |
+| `<leader>f` | format buffer | `documentFormattingProvider` |
+| `<C-s>` (normal and insert) | signature help | `signatureHelpProvider` |
+| `<leader>ds` | document symbols | `documentSymbolProvider` |
+| `<leader>e` | line diagnostics float | — |
+| `<leader>q` | diagnostics to loclist | — |
+
+The last two have no gate because diagnostics are a notification the server pushes
+rather than something it advertises in `ServerCapabilities`; there is nothing to
+check. `<leader>ca` is listed for the same reason it is written: when
+`codeActionProvider` appears in `lsp/src/main.rs`, the key starts working with no
+change here.
+
+Rename declines a symbol whose definition is outside the current file and returns
+an LSP error, which surfaces as a message. That is the intended behaviour — a
+rename that silently missed the definition is worse than one that refused.
 
 ## Commands
 
@@ -196,9 +280,11 @@ for the reserved words, the `Display` impl for the punctuation) and
   after the dot, so `x.0` (field access) and `xs..1` (spread) are not floats.
 - Comments `//`, doc comments `///` (but not `////`), and `/* */` block comments,
   which **nest** — the lexer supports nesting and so does the syntax file.
-- The five valid annotations `@native @cfg @doc @runtime @pure` are highlighted as
-  preprocessor directives; any other `@name` is highlighted as an **error**, matching
-  the compiler, which rejects it.
+- The six valid annotations `@native @cfg @doc @runtime @pure @inline` are highlighted
+  as preprocessor directives; any other `@name` is highlighted as an **error**, matching
+  the compiler, which rejects it. `@inline` was added to `lookup()` after this file was
+  first written and had to be backfilled here — it is the list that goes stale, so
+  check `lookup()` rather than this sentence.
 
 Only `i64`, `f64`, `str` and `bool` are highlighted as primitive types — those are
 what `primitive()` in `compiler/src/typecheck/resolve.rs` recognises — plus `any`,
@@ -231,7 +317,18 @@ Verified by running Neovim 0.12.4 headless against this directory:
 - `neon-lsp` attaches to a `.neon` buffer, reports `documentFormattingProvider =
   true`, receives `NEON_SYSROOT` through `cmd_env`, and publishes diagnostics.
 
-**Not** verified: the Neovim 0.8–0.10 `vim.lsp.start` fallback path. It is written
-against the documented API but has not been executed, because only 0.12 was available
-here. If you are on 0.10 or older and it misbehaves, that is the code to look at
-(`start_legacy` in `lua/neon/init.lua`).
+**Not** verified:
+
+- The Neovim 0.8–0.10 `vim.lsp.start` fallback path. It is written against the
+  documented API but has not been executed, because only 0.12 was available here. If
+  you are on 0.10 or older and it misbehaves, that is the code to look at
+  (`start_legacy` in `lua/neon/init.lua`).
+- The tree-sitter path **end to end**. `register_parser` and `start_treesitter` were
+  exercised with no `neon` parser installed and with nvim-treesitter absent, which is
+  the branch that matters for not breaking anyone — both degrade quietly and the
+  regex highlighter stays in charge. Nobody has run `:TSInstall neon` here, so
+  "tree-sitter highlighting looks right in Neovim" is *not* claimed. The queries
+  themselves are verified in `../tree-sitter-neon/README.md`, by `tree-sitter`
+  rather than by Neovim.
+- The keymaps. Each is a one-line `vim.keymap.set` behind a capability check, and
+  the file loads, but no key has been pressed against a live server.

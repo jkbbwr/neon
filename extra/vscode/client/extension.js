@@ -6,9 +6,18 @@
 // watch task to a file with no type-level complexity to check, and would put a
 // `npm run compile` between cloning the repo and pressing F5. See README.md.
 //
-// The server advertises exactly two capabilities — publishDiagnostics and
-// document formatting — so this file configures nothing else. Nothing here
-// asks for hover, completion, go-to-definition or rename.
+// This file configures no LSP features, and that is now a statement about the
+// protocol rather than about the server. `neon-lsp` advertises ten capabilities
+// (the `ServerCapabilities` literal in `lsp/src/main.rs` is the list): sync,
+// formatting, hover, definition, references, rename, completion, signature help,
+// document symbols and inlay hints. vscode-languageclient reads them off the
+// `initialize` response and registers the corresponding providers itself, so
+// hover, go-to-definition and the rest work without a line here.
+//
+// This comment previously read "the server advertises exactly two capabilities",
+// and stayed that way while eight more were added. It is a duplicate of a list
+// that lives elsewhere, which is the only kind of comment that can go stale —
+// hence the pointer at lsp/src/main.rs instead of a fresh copy of the list.
 
 const path = require("path");
 const vscode = require("vscode");

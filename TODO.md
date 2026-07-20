@@ -247,18 +247,44 @@ releasing 10M temporary five-byte keys. Two languages beat C on this bench and e
 a tell: Zig at 0.51× formats integers with generated code (no snprintf), LuaJIT at
 0.76× interns strings so table keys are nearly free.
 
+**Status after items 1 and 2: 0.67s → 0.35s, 1.69× C → 0.95×.** Neon is now faster than
+the C reference on this benchmark. Items 3 and 4 are unstarted, and the profile that
+ranked them is the *old* one — re-profile before building either, since the two largest
+costs it named have both been paid off.
+
 In order — each item stands alone, and the first two are runtime-only:
 
-1. **Hand-rolled itoa in `neon_i64_to_string`** (`runtime/src/rt.c`). Digit loop into a
-   fixed buffer, one copy out; replaces snprintf. The largest single win on the profile
-   and helps every program that interpolates a number. Trivial, no ABI impact. The C
-   reference also pays snprintf, so this alone may cross it.
-2. **A real map upsert.** The counting pattern
-   `map::set(m, k, map::get_or(m, k, 0) + 1)` hashes twice and probes twice per token,
-   as two natives nothing can fuse. One entry-style native (hash once, probe once,
-   insert-or-modify) halves the map cost — and is where borrow-key insertion lives:
-   probe with the caller's scratch key, copy into owned storage only on first insert,
-   which also deletes most of the temp-key frees.
+1. ~~**Hand-rolled itoa in `neon_i64_to_string`**~~ — **done** (`runtime/src/string.c`,
+   not `rt.c` as this entry originally said). Digit loop into a fixed 20-byte buffer, one
+   copy out, negation through `uint64_t` so `INT64_MIN` is not UB. Worth **0.67s → 0.54s**,
+   1.69× C down to **1.50×**. It did not cross C: the C reference pays `snprintf` too, but
+   the remaining gap is the temp-key traffic that items 2 and 3 target, not formatting.
+2. ~~**A real map upsert.**~~ — **done**, as `map::update`. This entry undercounted the
+   cost: `set(m, k, get_or(m, k, 0) + 1)` is *three* passes, not two, because `get_or` is
+   itself `contains` followed by an index. `map::update(m, k, fallback, f)` probes once.
+   Worth **0.54s → 0.35s**, and it crosses C — **0.95×**, from 1.69× where this section
+   started.
+
+   Not named `upsert` in the end: `map::set` is already insert-or-update, so the word
+   would not have distinguished them. What is new is that the value is computed *from*
+   the old one, which is `update` (Clojure, Scala) rather than `upsert` (SQL).
+
+   Deliberately a method rather than an IR fusion of the three-pass idiom. Fusing would
+   have to prove both maps are the same value and that nothing observes it in between;
+   worse, when the proof failed it would fail *silently*, leaving a 2× cliff with no
+   diagnostic. The fast shape is one you ask for.
+
+   The runtime cannot call a `(V) -> V` closure itself — that call's C signature depends
+   on `V` — so codegen emits a `nmap_upd_*` shim per value repr, the same division of
+   labour as `nres_drop_*` for a resource's cleanup. Measured and rejected: keying the
+   shim on the closure's target too, so the inner call is direct and inlinable. It is
+   worth 0.2% (0.572s → 0.571s on an identical build); GCC already speculatively
+   devirtualizes, and the cost is hashing and allocation, not the indirect call.
+
+   Still unbuilt from this entry, and still worth it: **borrow-key insertion** — probe
+   with the caller's scratch key and copy into owned storage only on first insert. That
+   is what deletes the temp-key frees, and `update` does not do it yet; it still consumes
+   a freshly built key per token.
 3. **Small-string optimisation in `neon_str`.** Every key here fits inline; SSO removes
    all per-token heap traffic and makes hashing/equality pointer-chase-free. Highest
    ceiling and it compounds everywhere — but it is a representation/ABI change across

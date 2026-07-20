@@ -2,21 +2,47 @@
 
 Registers `.neon` files as a language and starts [`neon-lsp`](../../lsp) against them.
 
-**There is no syntax highlighting.** That is not an oversight; see
-[Why there is no highlighting](#why-there-is-no-highlighting) below. What you get is:
+**There is no syntax highlighting.** That is not an oversight, and as of now it is a
+packaging problem rather than a missing grammar; see
+[Why there is no highlighting](#why-there-is-no-highlighting) below. Everything else the
+server offers does work, because Zed reads capabilities from the `initialize` response
+and nothing in this extension has to declare them.
 
 | Feature | Source |
 | --- | --- |
 | `.neon` recognised as the "Neon" language | `languages/neon/config.toml` |
 | Inline diagnostics | `neon-lsp` (`publishDiagnostics`) |
-| Format buffer / format on save | `neon-lsp` (`textDocument/formatting`) |
+| Format buffer / format on save | `textDocument/formatting` |
+| Hover — type or signature, plus the `///` doc comment | `hoverProvider` |
+| Go to definition, including into stdlib files | `definitionProvider` |
+| Find all references (shadowing-correct) | `referencesProvider` |
+| Rename symbol | `renameProvider` |
+| Completion (locals and visible fns, with signatures and docs) | `completionProvider`, trigger `:` |
+| Signature help | `signatureHelpProvider`, triggers `(` and `,` |
+| Outline / symbol search, nested under `mod` and `impl` | `documentSymbolProvider` |
+| Inlay hints — types on un-annotated `let`s | `inlayHintProvider` |
 | `//` and `///` comment toggling and continuation | `languages/neon/config.toml` |
 | `/* */` block comments, bracket matching, 4-space indent | `languages/neon/config.toml` |
+| Structural selection, syntax folding, semantic highlighting | **absent** — needs the grammar |
 
-`neon-lsp` advertises exactly two capabilities — diagnostics and formatting — and this
-extension declares nothing beyond them. There is no hover, completion, go-to-definition or
-rename, because the server does not implement them. See the module docs in
-`lsp/src/main.rs` for why that list is deliberately short.
+The authoritative capability list is the `ServerCapabilities` literal near the top of
+`lsp/src/main.rs`. It is not duplicated in `extension.toml`, deliberately: the copy that
+used to live there said "diagnostics and formatting" and stayed wrong through eight
+capabilities being added.
+
+Rename declines a symbol whose definition lives in another file and returns an LSP error
+rather than a partial edit. That is intended — a rename that silently missed the
+definition would be worse than one that refused.
+
+Inlay hints are controlled by Zed's own `inlay_hints` setting, per language:
+
+```json
+{
+  "languages": {
+    "Neon": { "inlay_hints": { "enabled": true } }
+  }
+}
+```
 
 ## Install as a dev extension
 
@@ -115,29 +141,61 @@ rev = "..."
 ```
 
 `GrammarManifestEntry` in Zed's source makes `repository` and `rev` required and offers no
-local-path option, so a grammar cannot be vendored into this directory and used. This
-repository currently has no published remote hosting a Neon grammar, so there is no honest
-value to put there.
+local-path option, so a grammar cannot be vendored into this directory and used.
+
+**The grammar is no longer the missing piece.** A complete one lives in this repository at
+[`extra/tree-sitter-neon`](../tree-sitter-neon): written against `compiler/src/lexer/token.rs`,
+`compiler/src/parser/mod.rs` and `compiler/src/ops.rs` rather than against the docs, parsing
+308 of the 310 `.neon` files in `tests/lang/` and `stdlib/` cleanly — the two exceptions are
+`//@ compile-fail` fixtures that are supposed to be malformed — with `highlights.scm`,
+`indents.scm`, `locals.scm` and `textobjects.scm` alongside it.
+
+What is missing is a **URL**. `git remote -v` in this checkout prints nothing, so there is no
+value that would resolve if written into `repository`. That is the entire blocker.
 
 Zed's `LanguageConfig.grammar` field is `Option<Arc<str>>`, so omitting it is supported
 rather than a hack: the language registers, the file type is recognised, and the language
 server attaches. Only tree-sitter-driven features (highlighting, structural selection,
 code folding by syntax) are absent.
 
-### Prior art, if you want to fix this
+### Fixing it, once this repository has a remote
 
-A tree-sitter grammar for Neon *does* exist, written against the **predecessor** repository
-(`github.com/jkbbwr/neon`, at `extra/tree-sitter-neon`). It is not wired up here because:
+Three edits, all of them small:
 
-- it targets the older language and is missing at least `marker`, `bench` and
-  `assert_throws`, and has no rule for string interpolation (`"#{expr}"`);
-- it lives in a different repository from this one.
+1. Add the block to `extension.toml`, pinning a **commit sha** — Zed resolves by revision,
+   not by branch:
 
-Wiring it up means publishing a grammar at a reachable `repository` + `rev`, updating it
-against `compiler/src/lexer/token.rs` (the authoritative keyword list), adding
-`highlights.scm` / `folds.scm` / `indents.scm` under `languages/neon/`, and adding the
-`[grammars.neon]` block plus `grammar = "neon"` in `languages/neon/config.toml`. None of
-that is done, and none of it is claimed here.
+   ```toml
+   [grammars.neon]
+   repository = "https://github.com/jkbbwr/neon2"
+   rev = "…"
+   ```
+
+2. Set `grammar = "neon"` in `languages/neon/config.toml`.
+3. Copy `extra/tree-sitter-neon/queries/highlights.scm` (and `indents.scm`) into
+   `languages/neon/` — **and widen the capture names while copying.** The queries use
+   Neovim's fine-grained vocabulary (`@keyword.conditional`, `@variable.member`,
+   `@type.definition`, `@function.method`, `@number.float`, `@module`, `@error`). Zed maps
+   a capture it does not recognise to *nothing* rather than to a fallback, so a verbatim
+   copy leaves large regions unstyled. Add coarse duplicates (`@keyword`, `@property`,
+   `@type`, `@number`) beside the fine ones. This is written up under "Capture-name
+   divergence" in the grammar's README.
+
+Note that the grammar's external scanner is mandatory, not optional: Neon's block comments
+nest, no regular expression can count, and the depth is tracked in `src/scanner.c`. Zed
+compiles `scanner.c` automatically when it is present in `src/`, which it is.
+
+### Prior art, and a warning about it
+
+The **predecessor** repository (`github.com/jkbbwr/neon`) also carries a Neon grammar. Do
+not point Zed at that one as a shortcut. It describes an older language — it has
+`enum_declaration`, `if_let_expr`, `map_init` and `type_nullable`, none of which exist now,
+and no rule for string interpolation, `marker`, `bench` or `assert_throws` — and its node
+names are entirely different (`binary_expr` against `binary_expression`, `int_literal`
+against `integer`, and so on). Queries written for the current grammar do not merely
+degrade against it, they fail to compile. This was observed in practice, in Neovim: an
+installed copy of the old parser makes the new `highlights.scm` error out with
+`Invalid node type "doc_comment"`.
 
 ## What has and has not been verified
 
@@ -157,3 +215,14 @@ Not verified:
   from this shell, so "installs and attaches successfully" is reasoned from Zed's source,
   not observed. Confirm with `zed: install dev extension` and check the language server
   logs (`zed: open log`).
+- **The feature table above is a capability list, not an observation.** Every row was read
+  off the `ServerCapabilities` literal in `lsp/src/main.rs`, and the ten capabilities were
+  confirmed to arrive in an `initialize` response — but by a Neovim client, not by Zed.
+  Zed consuming each of them is expected rather than seen.
+- **Whether a newer Zed offers a local-path grammar option.** The claim that
+  `GrammarManifestEntry` requires `repository` + `rev` is inherited from the earlier
+  check against Zed's source and could not be re-checked here: no `zed` binary, no network,
+  and `zed_extension_api` 0.7.0 carries nothing about grammars (they are resolved entirely
+  on Zed's host side, not through the guest API). If you can reach Zed's source, re-check
+  it before trusting that paragraph — it is the one claim here with no live evidence behind
+  it.

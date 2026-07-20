@@ -18,6 +18,7 @@
 
 mod ids;
 mod spans;
+pub mod visit;
 
 #[cfg(test)]
 mod tests;

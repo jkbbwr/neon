@@ -86,6 +86,13 @@ pub fn load() -> Result<Stdlib, Failure> {
     }
 
     let dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    // Resolved, because this path becomes a `file://` URI in every go-to-definition that
+    // lands in the stdlib. The CLI reports it relative to its own executable, so it
+    // arrives looking like `.../target/debug/../stdlib` — which is the same directory but
+    // not the same string, and an editor asked to open a URI containing `..` may decline,
+    // or may open a second buffer onto a file it already has. Failure to canonicalise is
+    // not fatal: the unresolved path still reads.
+    let dir = dir.canonicalize().unwrap_or(dir);
     if dir.as_os_str().is_empty() {
         return Err(Failure::Unusable {
             program,

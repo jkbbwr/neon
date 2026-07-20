@@ -1,21 +1,40 @@
 //! The Neon language server.
 //!
-//! Two capabilities, both of which the compiler already supports honestly: diagnostics,
-//! and formatting. Nothing else is advertised. An editor that is told a server can do
-//! hover or go-to-definition, and then gets nothing back, looks broken in a way the user
-//! cannot diagnose — so a capability appears here only once it works.
+//! Every capability advertised here works. An editor told a server can do hover, and then
+//! given nothing back, looks broken in a way the user cannot diagnose — so a capability
+//! appears in `ServerCapabilities` only once it answers.
 //!
-//! Go-to-definition is the obvious next one and the architecture already accommodates it:
-//! the stdlib is loaded from real files with real spans precisely so that jumping into
-//! `println` can open one (`docs/decisions.md`). What is missing is a span-to-definition
-//! index, not access to the source.
+//! **Where the answers come from.** Not from an index this server builds and maintains.
+//! The type checker already decides, for every expression, what its type is and which
+//! binding each name refers to; it records both in a `TypecheckResult`. That value used to
+//! be dropped on the floor the moment the diagnostics were extracted from it — which is
+//! why an earlier version of this comment described go-to-definition as blocked on "a
+//! span-to-definition index" that did not exist. It did exist. Keeping the result instead
+//! of discarding it (`analysis::Checked`) turned eight capabilities from "not built" into
+//! "read the map", and made none of them cost a second pass over the source.
+//!
+//! So every feature in `features.rs` is a query, never a derivation: position to byte
+//! offset, offset to the innermost AST node, node id to whatever the checker recorded
+//! against it. A hover that recomputed a type would be a second type checker, and two type
+//! checkers disagree.
 //!
 //! The loop is synchronous and handles one message at a time. That is affordable because
 //! the two expensive things have been taken off the per-keystroke path: the stdlib is
 //! parsed once per session (`analysis::Analyzer`), and checks are debounced so a burst of
-//! typing costs one check rather than one per character.
+//! typing costs one check rather than one per character. Requests that read the analysis
+//! force a pending check first — see `needs_analysis` — because otherwise the answer to
+//! the first hover after an edit is "nothing here".
+
+// Clippy objects to `Uri` as a `HashMap` key because `fluent_uri`, which `lsp_types`
+// wraps, holds a `Cell` internally. It is a parse cache and nothing else: `lsp_types`
+// defines both `Hash` and `PartialEq` for `Uri` on `as_str()` alone (`lsp-types-0.97.0`,
+// `src/uri.rs:68` and `:76`), so neither can observe the cell, and a key's hash cannot
+// drift while it sits in the map. Keying by `String` instead would sidestep the lint at
+// the cost of converting on every lookup and rebuilding a `Uri` for every `Location`.
+#![allow(clippy::mutable_key_type)]
 
 mod analysis;
+mod features;
 mod position;
 mod toolchain;
 
@@ -24,12 +43,20 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 };
-use lsp_types::request::{Formatting, Request as _};
+use lsp_types::request::{
+    Completion, DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
+    HoverRequest, InlayHintRequest, References, Rename, Request as _, SelectionRangeRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest,
+};
 use lsp_types::{
-    DiagnosticRelatedInformation, DiagnosticSeverity, DocumentFormattingParams, InitializeParams,
-    Location, LogMessageParams, MessageType, OneOf, PublishDiagnosticsParams, Range,
-    ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextEdit, Url,
+    CompletionOptions, CompletionResponse, DiagnosticRelatedInformation, DiagnosticSeverity,
+    DocumentFormattingParams, DocumentSymbol, DocumentSymbolResponse, GotoDefinitionResponse, Hover,
+    HoverContents, HoverProviderCapability, InitializeParams, InlayHint, InlayHintKind,
+    InlayHintLabel, Location, LogMessageParams, MessageType, OneOf, PublishDiagnosticsParams,
+    FoldingRange, FoldingRangeKind, Range, SelectionRange, SemanticTokens, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, ShowMessageParams, SignatureHelpOptions,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use position::LineIndex;
 use std::collections::HashMap;
@@ -51,14 +78,27 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 /// appear at all — the failure mode where the feature looks broken rather than slow.
 const MAX_DELAY: Duration = Duration::from_millis(750);
 
+/// One open document: its current text, and the most recent check of it.
+///
+/// `checked` deliberately survives a failed parse. A file is unparseable for most of the
+/// time anyone is typing in it, and a server that dropped its analysis on every
+/// half-written line would answer "no hover, no definition" precisely when the user is
+/// reaching for them. So the last check that succeeded stays until a later one replaces
+/// it — slightly stale beats absent, and the diagnostics (which are recomputed every
+/// time) are what tell the user the file is currently broken.
+struct Doc {
+    index: LineIndex,
+    checked: Option<analysis::Checked>,
+}
+
 /// Open documents, by URI. The editor's copy is authoritative — a file on disk may be
 /// stale by several keystrokes, and checking the stale one would report errors the user
 /// has already fixed.
-type Documents = HashMap<Url, LineIndex>;
+type Documents = HashMap<Uri, Doc>;
 
 /// A document that has changed and not yet been checked.
 struct Pending {
-    uri: Url,
+    uri: Uri,
     /// When it first went dirty — the anchor for `MAX_DELAY`.
     first: Instant,
     /// When it last changed — the anchor for `DEBOUNCE`.
@@ -81,6 +121,40 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         // edits would only be bookkeeping on the way to reassembling the same string.
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            // `::` because a qualified name is the case where completion has to fire
+            // without a fresh identifier character to trigger on. `.` is deliberately
+            // absent: Neon has no method-call syntax, so a dot is field access on a record
+            // whose fields are already offered by the identifier path.
+            trigger_characters: Some(vec![":".into()]),
+            ..Default::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".into(), ",".into()]),
+            ..Default::default()
+        }),
+        folding_range_provider: Some(lsp_types::FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(lsp_types::SelectionRangeProviderCapability::Simple(true)),
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: features::TOKEN_TYPES.to_vec(),
+                    token_modifiers: Vec::new(),
+                },
+                // Whole-file only. Range and delta requests exist to avoid re-tokenising a
+                // large file on every edit, but the tokens here are a by-product of a check
+                // that already ran, so producing them costs one walk of the AST — less than
+                // the bookkeeping a delta would need.
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..Default::default()
+            }),
+        ),
         ..Default::default()
     })?;
 
@@ -126,7 +200,7 @@ fn start_analyzer(
                 std.sources.len(),
                 std.dir.display()
             );
-            match analysis::Analyzer::new(&std.sources) {
+            match analysis::Analyzer::new(&std.dir, &std.sources) {
                 Ok(a) => (a, detail, None),
                 // A stdlib that does not parse is a broken toolchain, not the user's
                 // fault — but they still need to know why type errors stopped appearing.
@@ -192,7 +266,7 @@ fn serve(
                 match connection.receiver.recv_timeout(wait) {
                     Ok(msg) => msg,
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        flush(connection, &docs, analyzer, pending.take())?;
+                        flush(connection, &mut docs, analyzer, pending.take())?;
                         continue;
                     }
                     // The editor vanished. Its diagnostics do not matter now.
@@ -210,15 +284,33 @@ fn serve(
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
-                // Answered immediately even mid-debounce: `docs` is updated on every
-                // change, so a format never works from stale text. Only the *check* is
-                // deferred.
-                let response = handle_request(req, &docs);
+                // A request that reads the analysis must not race the debounce. Without
+                // this, opening a file and hovering inside the next 150ms answers
+                // "nothing here" — the check has not run yet — and the user sees a
+                // server that works only if they pause first. Formatting is exempt
+                // because it reprints from the text, which is always current, and
+                // completion fires per keystroke in some editors, so forcing a check for
+                // every request would undo the debounce entirely.
+                if needs_analysis(&req.method) {
+                    let for_this_doc = pending.as_ref().is_some_and(|p| Some(&p.uri) == uri_of(&req).as_ref());
+                    if for_this_doc {
+                        flush(connection, &mut docs, analyzer, pending.take())?;
+                    }
+                }
+                let response = handle_request(req, &mut docs, analyzer);
                 connection.sender.send(Message::Response(response))?;
             }
             Message::Notification(note) => match document_event(note) {
                 Some(Event::Changed(uri, text)) => {
-                    docs.insert(uri.clone(), LineIndex::new(&text));
+                    let index = LineIndex::new(&text);
+                    match docs.get_mut(&uri) {
+                        // Keep the previous check: the new text may not parse, and this
+                        // is exactly the moment its answers are still worth having.
+                        Some(doc) => doc.index = index,
+                        None => {
+                            docs.insert(uri.clone(), Doc { index, checked: None });
+                        }
+                    }
                     let now = Instant::now();
                     match &mut pending {
                         // Same document still settling: renew the debounce, but keep the
@@ -227,7 +319,7 @@ fn serve(
                         // A different document went dirty. Check the old one now rather
                         // than letting edits elsewhere postpone it indefinitely.
                         Some(_) => {
-                            flush(connection, &docs, analyzer, pending.take())?;
+                            flush(connection, &mut docs, analyzer, pending.take())?;
                             pending = Some(Pending { uri, first: now, last: now });
                         }
                         None => pending = Some(Pending { uri, first: now, last: now }),
@@ -253,21 +345,21 @@ fn serve(
 /// Run the deferred check and publish its result.
 fn flush(
     connection: &Connection,
-    docs: &Documents,
+    docs: &mut Documents,
     analyzer: &analysis::Analyzer,
     pending: Option<Pending>,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     let Some(p) = pending else { return Ok(()) };
     // Closed between the edit and the deadline: nothing to say about it.
-    let Some(index) = docs.get(&p.uri) else { return Ok(()) };
-    connection.sender.send(Message::Notification(publish(&p.uri, index, analyzer)))?;
+    let Some(doc) = docs.get_mut(&p.uri) else { return Ok(()) };
+    connection.sender.send(Message::Notification(publish(&p.uri, doc, analyzer)))?;
     Ok(())
 }
 
 /// What a text-document notification means to this server.
 enum Event {
-    Changed(Url, String),
-    Closed(Url),
+    Changed(Uri, String),
+    Closed(Uri),
 }
 
 fn document_event(note: Notification) -> Option<Event> {
@@ -296,17 +388,24 @@ fn document_event(note: Notification) -> Option<Event> {
     }
 }
 
-fn empty_diagnostics(uri: &Url) -> Notification {
+fn empty_diagnostics(uri: &Uri) -> Notification {
     Notification::new(
         PublishDiagnostics::METHOD.to_string(),
         PublishDiagnosticsParams { uri: uri.clone(), diagnostics: Vec::new(), version: None },
     )
 }
 
-/// Check a document and build the notification carrying its diagnostics.
-fn publish(uri: &Url, index: &LineIndex, analyzer: &analysis::Analyzer) -> Notification {
-    let diagnostics = analyzer
-        .diagnostics(index.text())
+/// Check a document, keep the result, and build the notification carrying its diagnostics.
+///
+/// The check is the expensive part of the server and it now produces two things rather
+/// than one: the diagnostics, which go out immediately, and the `Checked`, which stays
+/// behind to answer hover and navigation. Doing both from one pass is the point — the
+/// alternative is re-checking the file the first time someone hovers over it.
+fn publish(uri: &Uri, doc: &mut Doc, analyzer: &analysis::Analyzer) -> Notification {
+    let index = &doc.index;
+    let analysis = analyzer.analyze(index.text());
+    let diagnostics = analysis
+        .diagnostics
         .into_iter()
         .map(|d| lsp_types::Diagnostic {
             range: Range {
@@ -340,23 +439,342 @@ fn publish(uri: &Url, index: &LineIndex, analyzer: &analysis::Analyzer) -> Notif
         })
         .collect::<Vec<_>>();
 
+    // Only on success. A failed parse leaves the previous check in place; see `Doc`.
+    if analysis.checked.is_some() {
+        doc.checked = analysis.checked;
+    }
+
     Notification::new(
         PublishDiagnostics::METHOD.to_string(),
         PublishDiagnosticsParams { uri: uri.clone(), diagnostics, version: None },
     )
 }
 
-fn handle_request(req: Request, docs: &Documents) -> Response {
+/// Whether answering this request means reading a `Checked`.
+///
+/// Formatting is the one handled request that does not: it reprints from the document
+/// text, which every `didChange` updates synchronously.
+fn needs_analysis(method: &str) -> bool {
+    matches!(
+        method,
+        HoverRequest::METHOD
+            | GotoDefinition::METHOD
+            | References::METHOD
+            | Rename::METHOD
+            | Completion::METHOD
+            | SignatureHelpRequest::METHOD
+            | DocumentSymbolRequest::METHOD
+            | InlayHintRequest::METHOD
+            | SemanticTokensFullRequest::METHOD
+            | FoldingRangeRequest::METHOD
+            | SelectionRangeRequest::METHOD
+    )
+}
+
+/// The document a request is about, read straight off the wire.
+///
+/// Every request handled here carries its URI in one of two shapes, and this only has to
+/// decide whether a pending check is for the *same* document — so a miss is a missed
+/// optimisation, not a wrong answer.
+fn uri_of(req: &Request) -> Option<Uri> {
+    req.params
+        .get("textDocument")
+        .and_then(|d| d.get("uri"))
+        .and_then(|u| u.as_str())
+        .and_then(|u| u.parse().ok())
+}
+
+/// Dispatch one request.
+///
+/// Every arm but formatting needs a `Checked`, and takes `&mut` to get one: printing a
+/// type interns its complement, so rendering an answer mutates the type table. Nothing
+/// observable changes — the table is hash-consed — but the borrow checker is right that
+/// it is a mutation, and threading `&mut` is cheaper than an interior-mutability wrapper
+/// that would hide it.
+fn handle_request(req: Request, docs: &mut Documents, analyzer: &analysis::Analyzer) -> Response {
     match req.method.as_str() {
         Formatting::METHOD => match cast::<Formatting>(req) {
             Ok((id, params)) => format_document(id, params, docs),
             Err(err) => err,
         },
+
+        HoverRequest::METHOD => answer::<HoverRequest>(req, docs, |doc, uri, pos| {
+            let checked = doc.checked.as_mut()?;
+            let (contents, range) = features::hover(analyzer, checked, &doc.index, pos)?;
+            let _ = uri;
+            Some(Hover { contents: HoverContents::Markup(contents), range: Some(range) })
+        }),
+
+        GotoDefinition::METHOD => answer::<GotoDefinition>(req, docs, |doc, uri, pos| {
+            let checked = doc.checked.as_ref()?;
+            let loc = features::definition(analyzer, checked, &doc.index, uri, pos)?;
+            Some(GotoDefinitionResponse::Scalar(loc))
+        }),
+
+        References::METHOD => answer::<References>(req, docs, |doc, uri, pos| {
+            let checked = doc.checked.as_ref()?;
+            let ranges = features::references(analyzer, checked, &doc.index, pos);
+            Some(
+                ranges
+                    .into_iter()
+                    .map(|range| Location { uri: uri.clone(), range })
+                    .collect::<Vec<_>>(),
+            )
+        }),
+
+        Rename::METHOD => answer_rename(req, docs, analyzer),
+
+        Completion::METHOD => answer::<Completion>(req, docs, |doc, uri, pos| {
+            let _ = uri;
+            let checked = doc.checked.as_mut()?;
+            Some(CompletionResponse::Array(features::completions(
+                analyzer, checked, &doc.index, pos,
+            )))
+        }),
+
+        SignatureHelpRequest::METHOD => answer::<SignatureHelpRequest>(req, docs, |doc, uri, pos| {
+            let _ = uri;
+            features::signature_help(doc.checked.as_mut()?, &doc.index, pos)
+        }),
+
+        DocumentSymbolRequest::METHOD => match cast::<DocumentSymbolRequest>(req) {
+            Ok((id, params)) => {
+                let symbols = docs
+                    .get(&params.text_document.uri)
+                    .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
+                    .map(|(c, index)| {
+                        features::document_symbols(c, index).iter().map(to_symbol).collect()
+                    })
+                    .unwrap_or_default();
+                Response::new_ok(id, DocumentSymbolResponse::Nested(symbols))
+            }
+            Err(err) => err,
+        },
+
+        InlayHintRequest::METHOD => match cast::<InlayHintRequest>(req) {
+            Ok((id, params)) => {
+                let hints = docs
+                    .get_mut(&params.text_document.uri)
+                    .and_then(|doc| {
+                        let index = &doc.index;
+                        doc.checked.as_mut().map(|c| features::inlay_hints(c, index))
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(position, label)| InlayHint {
+                        position,
+                        label: InlayHintLabel::String(label),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: None,
+                        padding_right: None,
+                        data: None,
+                    })
+                    .collect::<Vec<_>>();
+                Response::new_ok(id, hints)
+            }
+            Err(err) => err,
+        },
+
+        SemanticTokensFullRequest::METHOD => match cast::<SemanticTokensFullRequest>(req) {
+            Ok((id, params)) => {
+                let data = docs
+                    .get(&params.text_document.uri)
+                    .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
+                    .map(|(c, index)| features::semantic_tokens(c, index))
+                    .unwrap_or_default();
+                Response::new_ok(
+                    id,
+                    SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data }),
+                )
+            }
+            Err(err) => err,
+        },
+
+        FoldingRangeRequest::METHOD => match cast::<FoldingRangeRequest>(req) {
+            Ok((id, params)) => {
+                let ranges = docs
+                    .get(&params.text_document.uri)
+                    .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
+                    .map(|(c, index)| features::folding_ranges(c, index))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(start_line, end_line)| FoldingRange {
+                        start_line,
+                        end_line,
+                        kind: Some(FoldingRangeKind::Region),
+                        ..Default::default()
+                    })
+                    .collect::<Vec<_>>();
+                Response::new_ok(id, ranges)
+            }
+            Err(err) => err,
+        },
+
+        SelectionRangeRequest::METHOD => match cast::<SelectionRangeRequest>(req) {
+            Ok((id, params)) => {
+                let Some((checked, index)) = docs
+                    .get(&params.text_document.uri)
+                    .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
+                else {
+                    return Response::new_ok(id, serde_json::Value::Null);
+                };
+                // One answer per position asked about, in the same order.
+                let out: Vec<SelectionRange> = params
+                    .positions
+                    .iter()
+                    .filter_map(|&pos| chain(features::selection_range(checked, index, pos)))
+                    .collect();
+                Response::new_ok(id, out)
+            }
+            Err(err) => err,
+        },
+
         _ => Response::new_err(
             req.id,
             lsp_server::ErrorCode::MethodNotFound as i32,
             format!("unhandled request: {}", req.method),
         ),
+    }
+}
+
+/// Nested containing ranges, innermost first, as the linked list the protocol wants.
+///
+/// Built back to front because each link owns its parent: the outermost range is the only
+/// one with no parent, so it has to exist before the one inside it can point at it.
+fn chain(mut ranges: Vec<Range>) -> Option<SelectionRange> {
+    let outermost = ranges.pop()?;
+    let mut node = SelectionRange { range: outermost, parent: None };
+    while let Some(range) = ranges.pop() {
+        node = SelectionRange { range, parent: Some(Box::new(node)) };
+    }
+    Some(node)
+}
+
+/// The shape every position-taking request shares: find the document, run the query, and
+/// answer `null` when there is nothing to say.
+///
+/// `null` rather than an error, because "no hover here" is the ordinary case — the cursor
+/// spends most of its life on whitespace — and an editor that got an error response for it
+/// would log a failure every time the mouse moved.
+fn answer<R>(
+    req: Request,
+    docs: &mut Documents,
+    f: impl FnOnce(&mut Doc, &Uri, lsp_types::Position) -> R::Result,
+) -> Response
+where
+    R: lsp_types::request::Request,
+    R::Params: serde::de::DeserializeOwned + HasPosition,
+    R::Result: serde::Serialize + Default,
+{
+    let (id, params) = match cast::<R>(req) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let (uri, pos) = params.at();
+    // Every one of these requests has an `Option` result, whose `Default` is `None` and
+    // serialises to `null` — which is exactly the "nothing here" answer, so an unknown
+    // document needs no special case.
+    let result = docs.get_mut(&uri).map(|doc| f(doc, &uri, pos)).unwrap_or_default();
+    Response::new_ok(id, result)
+}
+
+/// Rename is its own arm because it is the one request that answers "no" meaningfully.
+///
+/// Declining a rename has to be an *error*, not an empty edit: an empty `WorkspaceEdit`
+/// tells the editor the rename succeeded and changed nothing, so the user sees their
+/// symbol keep its old name with no explanation. The error message is what tells them the
+/// definition lives in the stdlib.
+fn answer_rename(req: Request, docs: &mut Documents, analyzer: &analysis::Analyzer) -> Response {
+    let (id, params) = match cast::<Rename>(req) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+    let uri = params.text_document_position.text_document.uri.clone();
+    let pos = params.text_document_position.position;
+
+    let ranges = docs
+        .get(&uri)
+        .and_then(|doc| doc.checked.as_ref().map(|c| (c, &doc.index)))
+        .and_then(|(c, index)| features::rename(analyzer, c, index, pos));
+
+    let Some(ranges) = ranges else {
+        return Response::new_err(
+            id,
+            lsp_server::ErrorCode::InvalidRequest as i32,
+            "this name cannot be renamed from here: it is not defined in this file".into(),
+        );
+    };
+
+    let edits: Vec<TextEdit> =
+        ranges.into_iter().map(|range| TextEdit { range, new_text: params.new_name.clone() }).collect();
+    let changes = std::collections::HashMap::from([(uri, edits)]);
+    Response::new_ok(id, WorkspaceEdit { changes: Some(changes), ..Default::default() })
+}
+
+/// One outline entry, converted for the wire.
+///
+/// `selection_range` is the same as `range` here: it is meant to be the identifier alone,
+/// which would need a span the AST does not record separately for every declaration kind.
+/// Pointing at the whole declaration is a worse highlight than pointing at its name, but
+/// it is never a *wrong* one, and the protocol requires the selection range to be
+/// contained by the range.
+#[allow(deprecated)] // `DocumentSymbol::deprecated` is required by the struct literal.
+fn to_symbol(s: &features::Symbol) -> DocumentSymbol {
+    DocumentSymbol {
+        name: s.name.clone(),
+        detail: None,
+        kind: s.kind,
+        tags: None,
+        deprecated: None,
+        range: s.range,
+        selection_range: s.range,
+        children: Some(s.children.iter().map(to_symbol).collect()),
+    }
+}
+
+/// The document and position a request names.
+///
+/// LSP spells this three different ways across the requests handled here, so the trait
+/// exists to let `answer` be written once rather than once per request type.
+trait HasPosition {
+    fn at(&self) -> (Uri, lsp_types::Position);
+}
+
+impl HasPosition for lsp_types::TextDocumentPositionParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        (self.text_document.uri.clone(), self.position)
+    }
+}
+
+impl HasPosition for lsp_types::HoverParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        self.text_document_position_params.at()
+    }
+}
+
+impl HasPosition for lsp_types::GotoDefinitionParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        self.text_document_position_params.at()
+    }
+}
+
+impl HasPosition for lsp_types::SignatureHelpParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        self.text_document_position_params.at()
+    }
+}
+
+impl HasPosition for lsp_types::ReferenceParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        self.text_document_position.at()
+    }
+}
+
+impl HasPosition for lsp_types::CompletionParams {
+    fn at(&self) -> (Uri, lsp_types::Position) {
+        self.text_document_position.at()
     }
 }
 
@@ -367,7 +785,7 @@ fn handle_request(req: Request, docs: &Documents) -> Response {
 /// leaves the buffer as the user typed it. Failing loudly here would mean an error popup
 /// on every format-on-save while a line is half-written.
 fn format_document(id: RequestId, params: DocumentFormattingParams, docs: &Documents) -> Response {
-    let Some(index) = docs.get(&params.text_document.uri) else {
+    let Some(index) = docs.get(&params.text_document.uri).map(|d| &d.index) else {
         return Response::new_ok(id, Vec::<TextEdit>::new());
     };
     let Ok(formatted) = neon_compiler::format::format(index.text()) else {

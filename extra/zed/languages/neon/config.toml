@@ -22,6 +22,13 @@ brackets = [
     { start = "\"", end = "\"", close = true, newline = false },
 ]
 
-# No `grammar` key: no Neon tree-sitter grammar is available to this repository.
-# Zed's LanguageConfig makes `grammar` optional, so the language registers and
-# `neon-lsp` attaches; syntax highlighting is simply absent. See ../../README.md.
+# No `grammar` key -- yet. A Neon grammar exists, in this repository, at
+# `extra/tree-sitter-neon`; what is missing is a git URL for Zed to fetch it from,
+# because Zed resolves a grammar by `repository` + `rev` and this checkout has no
+# remote. The reasoning is spelled out at the bottom of `../../extension.toml`,
+# beside the `[grammars.neon]` block that has to be filled in at the same time as
+# this line becomes `grammar = "neon"`.
+#
+# Zed's LanguageConfig makes `grammar` optional, so until then the language
+# registers and `neon-lsp` attaches; only tree-sitter features are absent.
+# See ../../README.md.

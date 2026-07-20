@@ -14,7 +14,7 @@ use super::env::{Env, TypeError, TypeErrorKind};
 use super::narrow::{self, Projected};
 use super::print::print;
 use super::resolve::Scope;
-use super::result::TypecheckResult;
+use super::result::{DefKind, DefSite, TypecheckResult};
 use super::types::TyId;
 use crate::ast::{self, BinOp, Expr, ExprKind, UnOp};
 use crate::lexer::Span;
@@ -122,8 +122,9 @@ struct Checker<'a> {
     result: TypecheckResult,
     errors: Vec<TypeError>,
     /// Innermost last. A name resolves to the nearest binding. Each carries the span
-    /// it was bound at, so a diagnostic can point back at a name's origin.
-    locals: Vec<Vec<(String, TyId, Span)>>,
+    /// it was bound at, so a diagnostic can point back at a name's origin, and what
+    /// kind of binding it is, so an editor can too.
+    locals: Vec<Vec<(String, TyId, Span, DefKind)>>,
     ret: Option<TyId>,
     throws: Option<Throws>,
     /// Break values of the enclosing loops, innermost last. A `loop` is the union
@@ -614,7 +615,7 @@ impl Checker<'_> {
         self.locals.push(vec![]);
         for p in &f.params {
             let t = self.env.resolve(&scope, &p.ty);
-            self.bind(&p.name, t, p.span.clone());
+            self.bind(&p.name, t, p.span.clone(), DefKind::Param);
         }
 
         let ret = match &f.ret {
@@ -660,9 +661,13 @@ impl Checker<'_> {
     ///
     /// Silently does nothing when there is no frame, which only happens outside any
     /// declaration.
-    fn bind(&mut self, name: &str, t: TyId, span: Span) {
+    ///
+    /// `kind` is carried purely so a later jump-to-definition can say whether it landed
+    /// on a parameter or a `let`. It takes no part in lookup: shadowing does not care
+    /// what sort of binding it shadows.
+    fn bind(&mut self, name: &str, t: TyId, span: Span, kind: DefKind) {
         if let Some(scope) = self.locals.last_mut() {
-            scope.push((name.to_string(), t, span));
+            scope.push((name.to_string(), t, span, kind));
         }
     }
 
@@ -671,7 +676,7 @@ impl Checker<'_> {
     /// order between the two is decided at each use site (`call` and `path` both try the
     /// local first, so a local shadows a fn).
     fn lookup(&self, name: &str) -> Option<TyId> {
-        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(_, t, _)| *t)
+        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(_, t, ..)| *t)
     }
 
     /// The index of the innermost `locals` frame that binds `name`, for deciding
@@ -682,7 +687,20 @@ impl Checker<'_> {
 
     /// The span where `name` was bound, for a "captured here"-style secondary label.
     fn origin_of(&self, name: &str) -> Option<Span> {
-        self.locals.iter().rev().flat_map(|s| s.iter().rev()).find(|(n, ..)| n == name).map(|(.., s)| s.clone())
+        self.binding_of(name).map(|(s, _)| s)
+    }
+
+    /// Where `name` was bound and what sort of binding it is. The same innermost-first
+    /// scan as `lookup`, so the three agree by construction about which binding a name
+    /// means — a jump-to-definition that disagreed with the type shown on hover would be
+    /// worse than no jump at all.
+    fn binding_of(&self, name: &str) -> Option<(Span, DefKind)> {
+        self.locals
+            .iter()
+            .rev()
+            .flat_map(|s| s.iter().rev())
+            .find(|(n, ..)| n == name)
+            .map(|(_, _, s, k)| (s.clone(), *k))
     }
 
     // ---- blocks and statements ----
@@ -800,7 +818,7 @@ impl Checker<'_> {
     /// (never `never`) where none does.
     fn bind_pattern(&mut self, module: &[String], p: &ast::Pattern, t: TyId) {
         match &p.kind {
-            ast::PatternKind::Bind(n) => self.bind(n, t, p.span.clone()),
+            ast::PatternKind::Bind(n) => self.bind(n, t, p.span.clone(), DefKind::Local),
             ast::PatternKind::Wildcard => {}
             ast::PatternKind::Tuple(ps) => {
                 for (i, sub) in ps.iter().enumerate() {
@@ -835,7 +853,7 @@ impl Checker<'_> {
                     let ft = self.projected(p.span.clone(), pj, &f.name, t);
                     match &f.pat {
                         Some(sub) => self.bind_pattern(module, sub, ft),
-                        None => self.bind(&f.name, ft, f.span.clone()),
+                        None => self.bind(&f.name, ft, f.span.clone(), DefKind::Local),
                     }
                 }
             }
@@ -1286,7 +1304,7 @@ impl Checker<'_> {
             };
             // A lambda param carries no span of its own; the lambda's is close enough
             // for a diagnostic, and a param is never a capture anyway.
-            self.bind(&p.name, t, e.span.clone());
+            self.bind(&p.name, t, e.span.clone(), DefKind::Param);
             param_tys.push(t);
         }
 
@@ -1706,7 +1724,7 @@ impl Checker<'_> {
             // The error union is handled here, not propagated. `catch` binds it.
             self.locals.push(vec![]);
             let bound = if thrown.is_empty() { never } else { caught };
-            self.bind(&arm.binding, bound, arm.span.clone());
+            self.bind(&arm.binding, bound, arm.span.clone(), DefKind::Local);
             let handled = self.block(module, &arm.body, expected);
             self.locals.pop();
             return self.union_branches(val, handled);
@@ -1748,7 +1766,9 @@ impl Checker<'_> {
     /// leaf, so `element_type(any)` answered `Some(any)`. That made `for x in v` compile
     /// for a `v: any` holding an i64, and the backend read the scalar as a list:
     ///
+    /// ```text
     ///     let v: any = 5; for x in v { .. }     // ASan: heap-buffer-overflow
+    /// ```
     ///
     /// A collection is a nominal record and nothing else. A type that also admits an i64,
     /// a str, an atom, a tuple, a function, `null`, or a rigid variable is not one,
@@ -1903,6 +1923,12 @@ impl Checker<'_> {
     fn path(&mut self, module: &[String], e: &Expr, p: &[String]) -> TyId {
         if let [one] = p {
             if let Some(t) = self.lookup(one) {
+                // The one place in the compiler that knows this `one` is *that* one.
+                // Recorded rather than recomputed because no later pass can: the frame
+                // that held the binding is popped when the block ends.
+                if let Some((span, kind)) = self.binding_of(one) {
+                    self.result.set_def(e.id, DefSite { module: module.to_vec(), span, kind });
+                }
                 return t;
             }
         }
@@ -1911,7 +1937,14 @@ impl Checker<'_> {
             // A function used as a value, throwing or not: its arrow carries the
             // `throws`, the closure repr carries it in turn, and the adapter thunk
             // returns the tagged result — the calling convention survives the trip.
-            return sig.ty;
+            //
+            // The declaring module, not `module`: a `use`d name is defined where it was
+            // written, and that is the file the jump has to open.
+            let ty = sig.ty;
+            let site =
+                DefSite { module: sig.module.clone(), span: sig.span.clone(), kind: DefKind::Fn };
+            self.result.set_def(e.id, site);
+            return ty;
         }
         // A name that exists but is fenced off reports why, rather than "not in scope".
         if let Some(owner) = self.env.hidden_by_internal(module, p) {
@@ -2135,7 +2168,7 @@ impl Checker<'_> {
             // succeed for the wrong reason.
             let bound = if self.env.solver.is_empty(bound) { self.poison() } else { bound };
             if let Some(v) = &scrut_var {
-                self.bind(v, bound, scrutinee.span.clone());
+                self.bind(v, bound, scrutinee.span.clone(), DefKind::Local);
             }
             self.bind_pattern(module, &arm.pat, bound);
             if let Some(g) = &arm.guard {
@@ -2316,6 +2349,12 @@ impl Checker<'_> {
         if let [one] = p.as_slice() {
             if let Some(t) = self.lookup(one) {
                 self.result.set_ty(callee.id, t);
+                // Keyed on the callee, not the call: the name the user can click is the
+                // callee's span, and `set_call` already covers the call itself.
+                if let Some((span, kind)) = self.binding_of(one) {
+                    let site = DefSite { module: module.to_vec(), span, kind };
+                    self.result.set_def(callee.id, site);
+                }
                 return self.apply(module, e, one, t, args);
             }
         }
@@ -2323,6 +2362,12 @@ impl Checker<'_> {
         // Then a module fn, which shadows protocols.
         if let Some(sig) = self.env.fn_named(module, p).cloned() {
             self.result.set_ty(callee.id, sig.ty);
+            let site = DefSite {
+                module: sig.module.clone(),
+                span: sig.span.clone(),
+                kind: DefKind::Fn,
+            };
+            self.result.set_def(callee.id, site);
             return self.direct_call(module, e, &sig, generics, args, expected);
         }
 

@@ -186,10 +186,33 @@ int64_t neon_str_parse_int(neon_str s) {
 
 // ---- to-string natives ----
 
+// Hand-rolled rather than `snprintf("%lld")`, because this is hot: on the word-frequency
+// benchmark, where every counted token is interpolated into a string, digit formatting was
+// ~40% of the run. `snprintf` re-parses its format string and walks its full conversion
+// machinery on every call to reach the same digit loop written out below.
+//
+// The longest result is `INT64_MIN` -- "-9223372036854775808", 20 characters. `neon_str`
+// carries its length and is not NUL-terminated, so 20 is exact rather than generous.
 neon_str neon_i64_to_string(int64_t n) {
-    char buf[24];
-    int len = snprintf(buf, sizeof buf, "%lld", (long long)n);
-    return neon_str_new(buf, (size_t)len);
+    char buf[20];
+    char* end = buf + sizeof buf;
+    char* p = end;
+
+    // Negate through `uint64_t`. `-INT64_MIN` overflows `int64_t` and is undefined, but
+    // unsigned negation is defined as modular and lands on 9223372036854775808 exactly --
+    // which is `INT64_MIN`'s magnitude, the one value a naive `-n` gets wrong.
+    uint64_t u = n < 0 ? 0u - (uint64_t)n : (uint64_t)n;
+
+    // Digits emerge least-significant first, so fill the buffer from the right. `do`/`while`
+    // rather than `while`, so that n == 0 writes its "0" instead of an empty string.
+    do {
+        *--p = (char)('0' + u % 10);
+        u /= 10;
+    } while (u);
+
+    if (n < 0) *--p = '-';
+
+    return neon_str_new(p, (size_t)(end - p));
 }
 
 neon_str neon_f64_to_string(double x) {

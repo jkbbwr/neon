@@ -201,6 +201,59 @@ neon_map* neon_map_set(neon_map* m, const void* key, const void* val) {
     return m;
 }
 
+// Read-modify-write in a single probe. `set(m, k, get_or(m, k, 0) + 1)` walks the table
+// three times for one increment; this walks it once.
+//
+// Ownership is the fiddly part, and it splits on whether the key was there:
+//
+//   - present: the table already holds an equal key, so the incoming one is dropped, and
+//     `fallback` is never used and is dropped too. The slot's value is handed *into* the
+//     closure, which consumes it -- so the old value must not also be released here. The
+//     closure's owned result replaces it.
+//   - absent: the key moves into the table, and `fallback` is handed into the closure
+//     instead. Again the closure consumes it; the result is the slot's new value.
+//
+// Either way exactly one value enters the closure and exactly one owned value comes back,
+// which is what keeps this leak-free for a refcounted `V`.
+neon_map* neon_map_update(neon_map* m, const void* key, const void* fallback, neon_closure f,
+                          neon_map_updater call) {
+    // Copy-on-write and grow, on the same terms as `set`: this is a mutation, and a full
+    // table probes badly. Growing before the probe is what makes the slot index below
+    // stay valid -- computing it first and then resizing would leave it pointing into the
+    // old table.
+    if (m->header.rc > 1 || (m->len + 1) * 4 >= m->cap * 3) {
+        size_t cap = (m->len + 1) * 4 >= m->cap * 3 ? m->cap * 2 : m->cap;
+        neon_map* c = neon_map_clone(m, cap);
+        neon_release((neon_header*)m);
+        m = c;
+    }
+    size_t ksz = m->kw->value->size, vsz = m->vw->size;
+    bool found = false;
+    size_t i = neon_map_slot(m, key, &found);
+    char* slot = m->vals + i * vsz;
+
+    if (found) {
+        // The table keeps its own key and never needed the fallback.
+        neon_map_release_key(m, key);
+        if (m->vw->release) m->vw->release((void*)fallback);
+        // `in` and `out` are the same slot. That is allowed: the updater loads `in` into a
+        // local before it calls the closure, so the write to `out` cannot disturb a read
+        // that has not happened yet. Aliasing them saves a scratch buffer whose size would
+        // have had to come off the witness at run time.
+        call(f, slot, slot);
+    } else {
+        memcpy(m->keys + i * ksz, key, ksz);
+        m->ctrl[i] = NEON_MAP_FULL;
+        m->len++;
+        call(f, fallback, slot);
+    }
+
+    // The closure is consumed like every other argument; a capture-free one has a null
+    // environment and this is a no-op.
+    neon_release(f.env);
+    return m;
+}
+
 // `keys`/`values` hand back a list; the element witness comes from codegen, which knows
 // the concrete element type.
 static neon_list* neon_map_collect(neon_map* m, const neon_witness* w, bool want_keys) {

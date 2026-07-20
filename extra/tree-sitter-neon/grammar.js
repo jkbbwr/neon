@@ -36,6 +36,23 @@ const PREC = {
   // the start of a statement is a statement, never a left operand.
   statement_block: 30,
 
+  // Above `statement_block`, because a bare `{}` has to read as an empty record
+  // literal in statement position too -- that is where it is most likely to be
+  // written -- and dynamic precedences accumulate along a parse, so the block
+  // reading arrives at the tie already carrying `statement_block`'s 30.
+  empty_record: 31,
+
+  // `f[T](x)` is a turbofished call, but it is *also* a well-formed index of `f`
+  // whose result is then called, and with the full type grammar in the brackets
+  // both readings survive to the end of the input for every `T`. The compiler
+  // settles it in `postfix_ops` (parser/mod.rs:1507): the turbofish is `.or_not()`
+  // ahead of the argument list, and chumsky tries the `Some` branch first, so a
+  // turbofish is preferred wherever one fits. This is that preference.
+  //
+  // It has to outrank `empty_record`, or `f[{}]()` would go the other way: the
+  // index reading of `{}` is an empty record literal carrying 31 already.
+  turbofish: 40,
+
   // Type ladder: `!` tightest, then `&`, then `|`.
   union: 1,
   intersection: 2,
@@ -63,9 +80,33 @@ module.exports = grammar({
     // the `=>` tells them apart, which is why the parser tries `lambda` first.
     [$.lambda_parameters, $.unit_expression],
     [$.lambda_parameter, $._expression],
-    // Inside `x[y]` a bare name is an expression if this is an index and a type
-    // if it is a turbofish; only the token after the `]` decides.
-    [$._expression, $._simple_type],
+    // ...and inside a turbofish `(x` is a third thing again: the start of a
+    // tuple/function-type parameter list. `f[(A, B) -> C]`, `f[(A, B)]` and the
+    // index `f[(a, b)]` are all still live at that point.
+    [$.lambda_parameter, $._expression, $._type],
+    // Inside `x[...]` the bracketed text is an expression if this is an index and
+    // a type if it is a turbofish; only the token after the `]` decides. Since
+    // turbofish takes the full type grammar (see `turbofish_arguments`), the two
+    // readings overlap on far more than a bare name -- `x[(A, B)]` is a tuple type
+    // or a tuple expression, `x[{a: i64}]` a structural type or a record literal --
+    // so the conflict is stated between the two supertypes rather than between the
+    // handful of leaf rules that happen to collide today.
+    [$._expression, $._type],
+    // `x[()]`: `()` is the empty tuple_type under the turbofish reading and the
+    // unit_expression under the index reading. The non-empty parenthesised shapes
+    // -- `x[(A)]`, `x[(A, B)]` -- are already covered by the supertype conflict
+    // above, but `unit_expression` is a leaf that never reaches `_expression`
+    // before the `)`, so it has to be named.
+    [$.tuple_type, $.unit_expression],
+    // `x[{}]`: two empty braces, which under the turbofish reading is an empty
+    // structural type and under the index reading is both of the things a bare
+    // `{}` is always both of -- an empty block and an empty record literal.
+    [$.structural_type, $.block, $.record_literal],
+    // The bare `{}`: an empty block and an empty record literal are the same two
+    // tokens forever. `prec.dynamic(PREC.empty_record)` on `record_literal` picks
+    // the record, matching the compiler's rule order; this conflict is what lets
+    // GLR carry both far enough for that precedence to be applied.
+    [$.block, $.record_literal],
     // `while a { }` could read `a { }` as an empty record and then find no
     // body. The parser switches record literals off in condition position;
     // here GLR explores both and the record reading dies for want of a block,
@@ -314,28 +355,19 @@ module.exports = grammar({
     type_arguments: ($) => seq('[', optional(seq(commaSep1($._type), optional(','))), ']'),
 
     // A turbofish and an index are the same tokens until the `(` after the `]`.
-    // Restricting the arguments to types that cannot start like a parenthesised
-    // expression keeps that ambiguity to the one case GLR can actually settle:
-    // a bare name. `f[(i64) -> str]()` is the casualty; write a named alias.
-    turbofish_arguments: ($) => seq('[', commaSep1($._simple_type), optional(','), ']'),
-
-    _simple_type: ($) =>
-      choice(
-        $.simple_union_type,
-        $.simple_intersection_type,
-        $.simple_negated_type,
-        $.generic_type,
-        $.path,
-        $.identifier,
-        $.atom,
-        $.any_type,
-        $.null,
-      ),
-
-    simple_union_type: ($) => prec.left(PREC.union, seq($._simple_type, '|', $._simple_type)),
-    simple_intersection_type: ($) =>
-      prec.left(PREC.intersection, seq($._simple_type, '&', $._simple_type)),
-    simple_negated_type: ($) => prec.right(PREC.negate, seq('!', $._simple_type)),
+    //
+    // This used to be restricted to a `_simple_type` subset -- types that cannot
+    // begin like a parenthesised expression -- to keep that ambiguity small. The
+    // restriction was worse than the ambiguity: `f[(A, B)](1)` and `f[{a: i64}](1)`
+    // still parsed, but SILENTLY as an index of a tuple/record literal that was
+    // then called, and `f[(i64) -> str]()` produced an ERROR node. A wrong tree
+    // with no error node is the worst outcome available, because highlighting and
+    // textobjects consume it without any signal that it is nonsense.
+    //
+    // parser/mod.rs:1507 uses the full type parser here, so this does too, and the
+    // ambiguity is handed to GLR (see the `[$._expression, $._type]` conflict).
+    turbofish_arguments: ($) =>
+      prec.dynamic(PREC.turbofish, seq('[', commaSep1($._type), optional(','), ']')),
 
     any_type: (_) => 'any',
 
@@ -582,11 +614,21 @@ module.exports = grammar({
     lambda_parameter: ($) =>
       seq(field('name', $.identifier), optional(seq(':', field('type', $._type)))),
 
-    // `Point { x: 1, ..base }`, or `{ x: 1 }` with no path.
+    // `Point { x: 1, ..base }`, `{ x: 1 }` with no path, or the bare `{}`.
     //
-    // A path or at least one field is required. The compiler accepts a bare
-    // `{}` as an empty record literal too, but that spelling is also an empty
-    // block, and requiring content is what keeps the two apart here.
+    // The bare `{}` is the same two tokens as an empty block, and both are in
+    // `_expression`, so nothing downstream can ever tell them apart -- this is a
+    // true ambiguity, not a lookahead problem, and GLR cannot settle it either.
+    // The compiler decides it by ordering: `atom_expr` tries `record_lit`
+    // (parser/mod.rs:1243, whose path and field list are both optional) before
+    // `block_expr` (:1318), so a bare `{}` in expression position is an empty
+    // record. `prec.dynamic` is this grammar's only ordering knob, and it is what
+    // reproduces that decision: both readings are explored and the record wins.
+    //
+    // Dynamic and not static precedence because the two rules are only in conflict
+    // for this one token pair. A static `prec` sits on the whole `record_literal`
+    // rule and would tilt every other block-vs-record decision with it, starting
+    // with `while a { }`, which must keep reading `{ }` as the loop body.
     record_literal: ($) =>
       choice(
         seq(
@@ -604,6 +646,7 @@ module.exports = grammar({
           ),
           '}',
         ),
+        prec.dynamic(PREC.empty_record, seq('{', '}')),
       ),
 
     field_initializer: ($) =>

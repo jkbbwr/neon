@@ -1,8 +1,13 @@
 //! Zed extension glue for Neon.
 //!
-//! The only job here is producing the command that starts `neon-lsp`. Everything the
-//! server can actually do is declared in `extension.toml`, and it is two things:
-//! diagnostics and document formatting.
+//! The only job here is producing the command that starts `neon-lsp`. What the server can
+//! do is not declared anywhere in this extension -- not here and not in `extension.toml`.
+//! Zed reads it from the `initialize` response, so the ten capabilities in the
+//! `ServerCapabilities` literal at the top of `lsp/src/main.rs` reach the editor without
+//! passing through this crate at all.
+//!
+//! This doc comment used to say "it is two things: diagnostics and document formatting",
+//! which was both a duplicate of that list and, by the time anyone read it, wrong.
 //!
 //! The one piece of real logic is `NEON_SYSROOT`. Without it the server still starts, but
 //! `load_stdlib` in `lsp/src/main.rs` returns nothing and the checker is skipped entirely,
