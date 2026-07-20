@@ -578,6 +578,22 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
         "neon_list_push" => {
             format!("neon_list_push({}, {})", var(args[0]), addr_of(types, f, args[1], &elem()))
         }
+        // An element type that is not refcounted takes the specialised setter: the slot
+        // being overwritten needs no release, and `sizeof` is a constant here, so the copy
+        // folds to a store instead of a witness-sized `memcpy`. The generic version has to
+        // read both facts off the witness at run time and can do neither. Worth 15% on the
+        // brainfuck benchmark's write loop; see `neon_list_set_scalar`.
+        //
+        // `is_counted` is the precondition that function states, asked of the repr codegen
+        // already has. `sizeof` rather than a size computed here, so the literal cannot
+        // disagree with the layout the emitter actually gave the type.
+        "neon_list_set" if !elem().is_counted() => format!(
+            "neon_list_set_scalar({}, {}, {}, sizeof({}))",
+            var(args[0]),
+            var(args[1]),
+            addr_of(types, f, args[2], &elem()),
+            types.c_type(&elem())
+        ),
         "neon_list_set" => format!(
             "neon_list_set({}, {}, {})",
             var(args[0]),

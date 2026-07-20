@@ -108,6 +108,7 @@ def main():
     python_ok = shutil.which("python3") is not None
     js_ok = shutil.which("node") is not None
     bun_ok = shutil.which("bun") is not None
+    deno_ok = shutil.which("deno") is not None
     luajit_ok = shutil.which("luajit") is not None
     lua_ok = shutil.which("lua") is not None
     ruby_ok = shutil.which("ruby") is not None
@@ -141,8 +142,11 @@ def main():
         {"name": "C# (.NET)", "cmd": ["./dotnet/build/brainfuck"], "available": dotnet_ok},
         {"name": "Java (Native)", "cmd": ["./java/bf_native"], "available": java_native_ok},
         {"name": "JS (Bun)", "cmd": ["bun", "js/main.js"], "available": bun_ok},
-        {"name": "LuaJIT", "cmd": ["luajit", "lua/main.lua"], "available": luajit_ok},
+        {"name": "JS (Deno)", "cmd": ["deno", "run", "js/main.js"], "available": deno_ok},
         {"name": "JS (Node)", "cmd": ["node", "js/main.js"], "available": js_ok},
+        {"name": "TS (Bun)", "cmd": ["bun", "ts/main.ts"], "available": bun_ok},
+        {"name": "TS (Deno)", "cmd": ["deno", "run", "ts/main.ts"], "available": deno_ok},
+        {"name": "LuaJIT", "cmd": ["luajit", "lua/main.lua"], "available": luajit_ok},
         {"name": "Neon", "cmd": ["./neon/_neon/brainfuck"], "available": neon_ok},
         {"name": "Java (JVM)", "cmd": ["java", "-cp", "java", "Main"], "available": java_ok},
         {"name": "Ruby (YJIT)", "cmd": ["ruby", "--yjit", "ruby/main.rb"], "available": ruby_ok},

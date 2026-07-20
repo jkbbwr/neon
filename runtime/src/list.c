@@ -86,6 +86,31 @@ neon_list* neon_list_push(neon_list* l, const void* elem) {
     return l;
 }
 
+// `neon_list_set` for an element type the *caller* knows is not refcounted, with `sz` a
+// constant at the call site.
+//
+// Both facts are static at every call: codegen knows the element repr exactly, so it knows
+// whether the slot being overwritten needs releasing and how wide it is. The generic
+// version cannot use either -- it reads `w->size` from the witness, which defeats
+// specialising the copy, and tests `w->release`, which for a scalar is a load and a branch
+// that can never fire. Passing the size as a literal lets the compiler fold the `memcpy`
+// into a single store once this is inlined.
+//
+// Measured on the brainfuck benchmark (10^8 writes into a `List[i64]`): 0.84s -> 0.71s.
+// The bounds check stays -- it costs nothing, because the caller's own check is adjacent
+// after inlining and the compiler folds the pair (measured: removing it is not a win).
+//
+// PRECONDITION, and it is codegen's to keep: the element type must not be refcounted.
+// Calling this for one that is leaks the value being overwritten.
+neon_list* neon_list_set_scalar(neon_list* l, int64_t i, const void* elem, size_t sz) {
+    if (i < 0 || (size_t)i >= l->len) {
+        neon_trap("list index out of range");
+    }
+    l = neon_list_ensure_unique(l);
+    memcpy(l->data + (size_t)i * sz, elem, sz);
+    return l;
+}
+
 neon_list* neon_list_set(neon_list* l, int64_t i, const void* elem) {
     if (i < 0 || (size_t)i >= l->len) {
         neon_trap("list index out of range");

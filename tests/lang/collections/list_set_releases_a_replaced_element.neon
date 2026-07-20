@@ -1,0 +1,44 @@
+// Overwriting a refcounted element releases the one it replaced.
+//
+// This pins the precondition behind a codegen split. `list::set` lowers to one of two
+// runtime entry points: the generic `neon_list_set`, which reads the element witness to
+// decide whether the overwritten slot needs releasing, and `neon_list_set_scalar`, which
+// skips the witness entirely and is therefore only correct when the element type is NOT
+// refcounted. Codegen chooses on `Repr::is_counted`. Choose wrong for a `str` and every
+// overwrite leaks the string it displaced — silently, since the program's output is
+// unaffected.
+//
+// So the test is written to leak loudly if the split ever mis-fires: the replaced strings
+// are heap-allocated (built by interpolation, not literals, which are static) and each
+// slot is overwritten many times. The corpus runs under ASan with `detect_leaks=1`, which
+// is what actually enforces this — the printed output would look correct either way.
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    // Heap strings, so a missed release is a real leak rather than a static literal.
+    let words: List[str] = list::repeat("#{1 + 1}", 4);
+
+    // Overwrite the same slot repeatedly: 200 displaced strings to lose.
+    let acc = words;
+    let i = 0;
+    while i < 200 {
+        acc = try! list::set(acc, i % 4, "#{i}");
+        i = i + 1;
+    };
+    io::println(acc[0]);
+    io::println("#{list::len(acc)}");
+
+    // A list of lists — also refcounted, and the case the corpus already leaned on.
+    let rows: List[List[i64]] = list::repeat([1, 2], 3);
+    let rows2 = try! list::set(rows, 1, [9, 9, 9]);
+    io::println("#{list::len(rows2[1])} #{rows2[1][0]}");
+    // The original is untouched, so both must still be readable and released once each.
+    io::println("#{list::len(rows[1])} #{rows[1][0]}");
+
+    // Scalars take the specialised path; same observable behaviour.
+    let nums = list::repeat(0, 4);
+    let nums2 = try! list::set(nums, 2, 42);
+    io::println("#{nums2[2]} #{nums[2]}");
+}
