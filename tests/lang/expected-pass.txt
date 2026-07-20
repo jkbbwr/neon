@@ -63,6 +63,7 @@ collections/iolist_and_files.neon
 collections/iterating_a_non_collection.neon
 collections/list_construction.neon
 collections/list_element_type_is_checked.neon
+collections/list_fill.neon
 collections/list_generics_are_covariant.neon
 collections/list_get_nullable_element_type.neon
 collections/list_get_out_of_range_throws.neon
@@ -70,6 +71,7 @@ collections/list_index_negative_traps.neon
 collections/list_index_out_of_bounds_traps.neon
 collections/list_iteration.neon
 collections/list_push_does_not_mutate_base.neon
+collections/list_repeat.neon
 collections/list_set_does_not_mutate_base.neon
 collections/list_sort.neon
 collections/map_equality.neon

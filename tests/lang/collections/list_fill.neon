@@ -1,0 +1,42 @@
+// `list::fill(xs, v)` replaces every element of `xs` with `v`, keeping its length —
+// resetting a buffer between passes without giving up the allocation it already has.
+//
+// It takes the list, not a count, like everything else in the module: operations are
+// `xs`-first and return a new list rather than mutating. So `fill` does NOT construct a
+// sized buffer, and `new_with_capacity(n)` does not either — that reserves room and hands
+// back an EMPTY list. The two read alike and only one of them has a length, which is the
+// distinction this file pins.
+//
+// The elements are independent: `fill` is not `n` aliases of one cell, so writing through
+// one index leaves the rest alone. That is the property a tape depends on.
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    // Same length, every element replaced.
+    let counted = [1, 2, 3, 4, 5];
+    let cleared = list::fill(counted, 0);
+    io::println("#{list::len(cleared)}");
+    io::println("#{cleared[0]} #{cleared[4]}");
+
+    // The list it was built from is untouched, as everywhere in this module.
+    io::println("#{counted[0]} #{counted[4]}");
+
+    // Reserving is not filling: capacity is not length.
+    let reserved: List[i64] = list::new_with_capacity(5);
+    io::println("#{list::len(reserved)}");
+
+    // Nothing to replace is the answer, not an edge case.
+    let empty: List[i64] = [];
+    io::println("#{list::len(list::fill(empty, 7))}");
+
+    // Writing one cell does not disturb its neighbours.
+    let tape = list::fill([0, 0, 0, 0], 0);
+    let after = try! list::set(tape, 2, 99);
+    io::println("#{after[0]} #{after[1]} #{after[2]} #{after[3]}");
+
+    // Not just scalars: a str element is retained once per copy, so every slot is usable.
+    let words = list::fill(["", "", ""], "ok");
+    io::println("#{words[0]}#{words[1]}#{words[2]}");
+}
