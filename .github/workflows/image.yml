@@ -1,6 +1,6 @@
 name: Image
 
-# Manual. Builds the Alpine toolchain image (see Dockerfile) and pushes it to this repo's
+# Manual. Builds the toolchain image (Debian/glibc, see Dockerfile) and pushes it to this repo's
 # GitHub Container Registry, so `docker run ghcr.io/<owner>/neon` gives a working `neon`
 # anywhere a container runs — including Windows via Docker Desktop, and locked-down
 # environments where installing a Rust + C toolchain directly is not an option.

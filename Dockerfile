@@ -1,19 +1,25 @@
-# A small, self-contained Neon toolchain image.
+# A self-contained Neon toolchain image, on glibc.
 #
-# Neon compiles to C and shells out to `cc` at run time, so the image has to carry a C
-# compiler as well as the toolchain. Everything is built on musl and the final image is
-# Alpine, so the neon binary, the prebuilt runtime archives, and the `cc` that later links a
-# user's program all share one libc — a glibc-built archive linked by musl's cc would fail.
+# Neon compiles to C and shells out to `cc` at run time, so the image carries a C compiler
+# as well as the toolchain. Everything is built and run on the same glibc: the neon binary,
+# the prebuilt runtime archives, and the `cc` that later links a user's program all share
+# one libc, which is what keeps a program compiled inside the image actually link.
 #
-# The point is portability: `docker run` (or Podman, or Docker Desktop on Windows) gives you
-# a working `neon` where installing a Rust + C toolchain directly is awkward or disallowed.
+# Debian slim rather than Alpine on purpose — glibc, not musl. The image is larger for it,
+# but it avoids musl's allocator and resolver differences, and matches the libc almost every
+# host and the prebuilt archives expect.
+#
+# The point is portability: `docker run` (or Podman, or Docker Desktop on Windows) gives a
+# working `neon` where installing a Rust + C toolchain directly is awkward or disallowed.
 
 # ---- builder ----
-FROM rust:alpine AS build
+FROM rust:slim-bookworm AS build
 
-# musl-dev/gcc: the C toolchain the runtime's CMake build and the corpus link against.
-# cmake: the runtime is a CMake project driven by neon-runtime's build script.
-RUN apk add --no-cache musl-dev gcc make cmake
+# The rust image already carries gcc + libc6-dev for building C-dependency crates; cmake is
+# what it lacks, and the runtime is a CMake project driven by neon-runtime's build script.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake make \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
@@ -28,10 +34,15 @@ RUN set -eux; \
     cp -r target/release/include target/release/lib target/release/stdlib /out/
 
 # ---- final ----
-FROM alpine:3.20
+FROM debian:bookworm-slim
 
-# gcc + musl-dev: `neon build` invokes `cc` and links the C standard headers/libs.
-RUN apk add --no-cache gcc musl-dev
+# gcc + libc6-dev: `neon build` invokes the C compiler and links the C standard
+# headers/libs. CC=gcc so neon names the compiler directly rather than relying on the `cc`
+# alternative being wired up.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc
 
 # Into /usr/local, so /usr/local/bin/neon finds /usr/local/{lib,include,stdlib} one level up.
 COPY --from=build /out/ /usr/local/
