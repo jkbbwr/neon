@@ -33,16 +33,28 @@ fn runtime_root() -> PathBuf {
 /// which is most of the ones it has found. Hence: this variant or a hard failure, never a
 /// fallback.
 ///
-/// Found via `NEON_RT_LIB_DIR`, which `compiler/build.rs` sets from the runtime crate's
-/// cmake output.
+/// Found via `NEON_RT_ROOT`, which `compiler/build.rs` sets from the runtime crate's
+/// cmake output; the flavor must match the `cc` this harness links with, because one
+/// family's sanitizer instrumentation does not link under the other family's driver.
 fn runtime_archive() -> PathBuf {
-    let path = PathBuf::from(env!("NEON_RT_LIB_DIR")).join("libneon_rt_san.a");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let is_clang = Command::new(&cc)
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("clang"))
+        .unwrap_or(false);
+    let flavor = if is_clang { "clang" } else { "gcc" };
+    let path = PathBuf::from(env!("NEON_RT_ROOT"))
+        .join(flavor)
+        .join("lib")
+        .join("libneon_rt_san.a");
     assert!(
         path.is_file(),
-        "the sanitized runtime archive is missing at {}.\n\
-         This suite must link a sanitized runtime; it will not fall back to an \
-         uninstrumented one, which would silently stop reporting every error inside the \
-         runtime. Run `cargo build -p neon-runtime`.",
+        "the sanitized {flavor} runtime archive is missing at {}.\n\
+         This suite must link a sanitized runtime built by the same compiler family as \
+         `{cc}`; it will not fall back to an uninstrumented or cross-family one, which \
+         would silently stop reporting every error inside the runtime. Run \
+         `cargo build -p neon-runtime` with {flavor} installed.",
         path.display()
     );
     path

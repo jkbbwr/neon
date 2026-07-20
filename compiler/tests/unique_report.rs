@@ -122,7 +122,11 @@ fn report() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
             let name = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
             for c in &found {
-                rows.push(format!("  {name}: {} (block {:?}, {} writes)", c.func, c.header, c.writes));
+                let gate = if c.scalar { "rewritten" } else { "declined: counted element" };
+                rows.push(format!(
+                    "  {name}: {} (block {:?}, {} writes, {gate})",
+                    c.func, c.header, c.writes
+                ));
             }
         }
     }

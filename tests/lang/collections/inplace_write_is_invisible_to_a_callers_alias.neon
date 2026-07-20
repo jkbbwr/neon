@@ -1,0 +1,29 @@
+// The sole-ownership rewrite (`ir::unique`) turns a qualifying loop's writes into
+// in-place stores after establishing uniqueness once on the loop's entry edge.
+// Establishing — `neon_list_ensure_unique`, a clone when anybody else holds the list —
+// is what makes that sound for a list arriving as a parameter: no intraprocedural
+// analysis can see the caller's holdings, so the runtime asks the refcount instead.
+//
+// This pins the establishment. `bump`'s loop qualifies and is rewritten; the caller
+// keeps an alias across the call and reads it afterwards, so the entry-edge clone is
+// the only thing standing between this output and a silent cross-owner mutation.
+
+use std::io;
+use std::collections::list;
+
+fn bump(xs: List[i64], n: i64) -> List[i64] {
+    let acc = xs;
+    let i = 0;
+    while i < n {
+        acc = try! list::set(acc, 0, acc[0] + 1);
+        i = i + 1;
+    };
+    acc
+}
+
+fn main() {
+    let a = list::repeat(7, 3);
+    let b = bump(a, 5);
+    // The alias is untouched; the result carries the writes.
+    io::println("#{a[0]} #{b[0]}");
+}

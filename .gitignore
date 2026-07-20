@@ -15,7 +15,22 @@ bench/brainfuck/c/bf
 bench/brainfuck/cpp/bf
 bench/brainfuck/go/bf
 bench/brainfuck/zig/bf
-bench/brainfuck/*/bf_native
+bench/binary-trees/c/bt
+bench/binary-trees/cpp/bt
+bench/binary-trees/go/bt
+bench/binary-trees/zig/bt
+bench/word-frequency/c/wf
+bench/word-frequency/cpp/wf
+bench/word-frequency/go/wf
+bench/word-frequency/zig/wf
+bench/n-body/c/nb
+bench/n-body/cpp/nb
+bench/n-body/go/nb
+bench/n-body/zig/nb
+bench/*/*/bf_native
+bench/*/*/bt_native
+bench/*/*/wf_native
+bench/*/*/nb_native
 
 # Java compiles in place — no bin/ dir to catch these.
 bench/**/*.class

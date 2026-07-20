@@ -36,7 +36,10 @@
 //! 4. A block parameter never used is released at the top of its block.
 //! 5. A lambda's environment parameter is **borrowed** — the closure value owns it and
 //!    may be called again — so it is excluded from every release. `CallClosure` likewise
-//!    borrows its callee: calling a closure reads it, it does not destroy it.
+//!    borrows its callee: calling a closure reads it, it does not destroy it. The native
+//!    `neon_list_set_inplace` (emitted only by `ir::unique`) also borrows: it mutates the
+//!    buffer but takes no reference and releases nothing, so the chain's one owner stays
+//!    live across it — see `operand_uses`.
 //!
 //! Because the language is immutable, values are acyclic and this is complete: the last
 //! release always runs, and nothing leaks. Moves at last use and `rc == 1` reuse are the
@@ -465,6 +468,13 @@ fn operand_uses(
     let mut consuming = Vec::new();
     let mut borrowing = Vec::new();
     match &inst.op {
+        // The in-place list write borrows: it mutates the buffer but takes no reference,
+        // and `neon_list_set_scalar_inplace` releases nothing. The chain's one owner
+        // stays live across it — a retain-per-write here is exactly the traffic
+        // `ir::unique` exists to remove, and would leak besides.
+        Op::Native { symbol, args } if symbol == "neon_list_set_inplace" => {
+            borrowing.extend(args.iter().copied())
+        }
         Op::Call { args, .. } | Op::Native { args, .. } | Op::MakeTuple(args) | Op::MakeList(args) => {
             consuming.extend(args.iter().copied())
         }

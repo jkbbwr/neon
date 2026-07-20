@@ -1,7 +1,9 @@
 # TODO
 
-Everything known-broken or undecided as of 2026-07-19, distilled from six middle-end
+Everything known-broken or undecided as of 2026-07-20, distilled from six middle-end
 audits, a compiler-wide collapsing-key sweep, three CBMC models and a fuzzing run.
+Resolved items are removed, not struck through — their write-ups live in the design docs
+they produced (`docs/design/identity.md`, `docs/design/opacity.md`).
 
 Each item has a repro or a file:line. Nothing here is speculative — the unproven leads are
 in their own section at the bottom and marked as such.
@@ -10,63 +12,18 @@ in their own section at the bottom and marked as such.
 
 ## P0 — soundness. These miscompile or accept wrong programs.
 
-### 1. ~~Nominal identity is a bare name~~ — RESOLVED 2026-07-20
+### 1. `as` out of `any` never checks the tag
 
-Was: two modules declaring the same record name declared the **same type**, so
-`vault::reveal(forge::fake(99))` type-checked and printed 99, defeating `opaque`
-outright — including `std::fs`'s cleanup guard.
-
-Identity is now `(declaring module path, name)`: `env.rs::record_body` and the newtype arm
-of `instantiate` intern the qualified declaration key rather than `r.name`. The readback
-sites moved in the same change, which was the reason this was "not local" — `ordered.rs`,
-`ir/repr.rs`, `check.rs`'s list literal, `ctype.rs::tag_name_inner` (the runtime tag), and
-the three head derivations that must agree (`impl_head`, `ast_head`, `repr_head`).
-`List`/`Map` are spelled once as `Env::LIST`/`Env::MAP` so those string comparisons cannot
-drift. Decision and consequences: `docs/design/identity.md`.
-
-Fixed alongside, and it was the same bug: **lead L4**. `ImplDef.target_head` held the
-*written* path while `nominal_head` read the tag, so `impl Mappable for List` produced
-`"List"` and never matched — and an impl written with a qualified path could not match one
-written bare. Both now use the resolved key.
-
-Also retired: the opacity residue where a program's own same-named record quietly unsealed
-a foreign one. A `#nominal` tag is now a declaration key, so `opaque_record_named` is a
-direct lookup instead of a scan that had to decline when two candidates existed.
-
-`types/a_nominal_name_is_not_a_module_identity.neon` and
-`modules/prelude_names_can_be_shadowed.neon` are green and ratcheted.
-
-### 1b. ~~`opaque` is also bypassed structurally~~ — RESOLVED 2026-07-19
-
-Was: `fn peek(s: {code: i64}) -> i64 { s.code }` read a foreign `Secret` without ever
-naming it, because nominal-satisfies-structural is true by design and the opacity check
-was syntactic while the leak was type-directed.
-
-The decision this item asked for was made, and it is the first option *without* its
-feared cost: an opaque record does not satisfy a structural view **outside its module**,
-and structural-width subtyping for everything else is untouched
-(`structural_param_accepts_nominal.neon` still pins it). Mechanism: `Types::seal` erases
-a foreign opaque record's contents and the checker re-asks each flow's subtyping sealed
-— at `assignable`, at `as`, at `is`, and member-wise at dispatch/`where`-bound targets.
-Design, full route enumeration and residue: `docs/design/opacity.md`. Each route is a
-corpus file under `tests/lang/records/opaque_*`.
-
-Also closed since: **construction/forgery** in its direct spellings. `as` to a foreign
-opaque target requires the source to vouch for it — by naming it, or by being broad
-enough to have held one — so `{code:99} as Secret` and the anonymous-literal spellings
-are rejected statically (opaque_no_anonymous_forgery.neon, ratcheted), while recovering
-a held one from a `Secret | str` still works.
-
-Still open here: **both `any` directions** (opaque_no_any_laundering.neon, unlisted).
-The read is accepted but dead at run time (nominal tags make the structural `is` false);
-the forge — `let a: any = {code:99}; a as Secret` — actually works. Neither closes
-statically: `any` can legitimately hold an opaque, so a cast out of it is
-indistinguishable from the pinned erased-recovery idiom, and a rule strict enough to
-stop the forge broke five corpus files when tried. Both want the same runtime fix — tag
-comparison on `as`-from-`any`, which is a general soundness fix anyway.
-
-Item 1 is resolved too, so `opaque` now stops name collision as well as structural escape
-and direct forgery.
+The one residue of the two resolved opacity holes (nominal identity and structural
+sealing — decisions and mechanisms in `docs/design/identity.md` and
+`docs/design/opacity.md`), and it runs in both `any` directions
+(`opaque_no_any_laundering.neon`, unlisted). The read is accepted but dead at run time
+(nominal tags make the structural `is` false); the forge —
+`let a: any = {code:99}; a as Secret` — actually works. Neither closes statically:
+`any` can legitimately hold an opaque, so a cast out of it is indistinguishable from
+the pinned erased-recovery idiom, and a rule strict enough to stop the forge broke five
+corpus files when tried. Both want the same runtime fix — tag comparison on
+`as`-from-`any`, which is a general soundness fix anyway.
 
 ### 2. Interpolating a dispatched call miscompiles
 
@@ -232,7 +189,8 @@ Still open: `repr_from_typespec` drops type arguments so `ident[Box[i64]]` and
 The sweep's own verdict: *"I kept finding more, and the rate did not fall."* Each fix pushed
 the question one layer up — fix the tag, the repr feeding it is collapsed; fix the repr, the
 type it came from is collapsed. It terminates at whatever the compiler treats as a primitive
-name, which is item 1.
+name — which, since the identity fix (`docs/design/identity.md`), is the qualified
+declaration key rather than a bare string, so the class now has its bottom.
 
 **Tell, for future readers:** a `match` over a structured type whose arms return string or
 integer constants, where the result is used as a name, key or tag. Every such function
@@ -276,6 +234,136 @@ tree-sitter external scanner entirely (nesting is why it exists).
 `@runtime` makes this possible now. It also removes the prelude-vs-root collision that
 forces `opacity_permits` to treat the root as a non-container — see the exception in
 `check.rs::opacity_permits`.
+
+---
+
+## Perf — what the word-frequency profile says to build
+
+From `bench/word-frequency/` (10M generated tokens counted in a `Map[str, i64]`),
+profiled 2026-07-20. Neon: 0.67s, 1.69× C. The map is NOT the bottleneck —
+`neon_map_slot` is ~12% — the strings around it are: ~40% of the run is
+snprintf-family digit formatting inside `neon_i64_to_string`, and ~8.5% is `cfree`
+releasing 10M temporary five-byte keys. Two languages beat C on this bench and each is
+a tell: Zig at 0.51× formats integers with generated code (no snprintf), LuaJIT at
+0.76× interns strings so table keys are nearly free.
+
+In order — each item stands alone, and the first two are runtime-only:
+
+1. **Hand-rolled itoa in `neon_i64_to_string`** (`runtime/src/rt.c`). Digit loop into a
+   fixed buffer, one copy out; replaces snprintf. The largest single win on the profile
+   and helps every program that interpolates a number. Trivial, no ABI impact. The C
+   reference also pays snprintf, so this alone may cross it.
+2. **A real map upsert.** The counting pattern
+   `map::set(m, k, map::get_or(m, k, 0) + 1)` hashes twice and probes twice per token,
+   as two natives nothing can fuse. One entry-style native (hash once, probe once,
+   insert-or-modify) halves the map cost — and is where borrow-key insertion lives:
+   probe with the caller's scratch key, copy into owned storage only on first insert,
+   which also deletes most of the temp-key frees.
+3. **Small-string optimisation in `neon_str`.** Every key here fits inline; SSO removes
+   all per-token heap traffic and makes hashing/equality pointer-chase-free. Highest
+   ceiling and it compounds everywhere — but it is a representation/ABI change across
+   runtime, codegen and the witnesses. A project, not a patch; wants its own CBMC model
+   before anything relies on it.
+4. **Fuse interpolation into a sized concat-n.** `"w#{id}"` is `to_string` then
+   `str_concat`: two allocations where one suffices, and `lower.rs:1505` already
+   confesses the n-hole fold is quadratic. Small lowering + runtime change; modest on
+   this bench, real for any multi-hole interpolation.
+
+Explicitly declined for now: a map sequel to `ir::unique`'s in-place rewrite
+(`neon_map_set_inplace`). The counts map is sole-owned round the loop — the shape
+matches — but the per-write `rc` test it would remove is noise on this profile, since
+`neon_map_set` already mutates in place at `rc == 1`. Wrong benchmark to justify it.
+
+---
+
+## Perf — what the binary-trees profile says to build
+
+From `bench/binary-trees/` (67M short-lived recursive nodes, built, walked, dropped),
+profiled 2026-07-20. Neon: 0.77s, 1.16× C — tied with C++, ahead of Go (1.40×), Rust
+(1.49×) and Zig (1.85×). The refcounting is NOT the cost: ~60% of the run is glibc
+allocator internals (`_int_malloc`/`_int_free` and friends), ~8% the generated Node
+drop (`ned0`), ~20% the program's own make/check recursion — the same shape as C's own
+profile. The languages that beat C (Java 0.51×, Bun 0.62×, C# 0.69×) all do it with a
+generational nursery: pointer-bump allocation and never touching the dead.
+
+In order:
+
+1. **A size-class slab behind `neon_alloc`.** Small same-size objects from a free list:
+   alloc is a pop, free is a push, versus glibc's bin machinery eating half the run.
+   This is also FBIP reuse arriving by the runtime door — the loop interleaves dropping
+   tree *i* with building tree *i+1*, so the slab recycles cache-hot slots exactly
+   where a compiler reuse-token analysis cannot reach (alloc and free live in different
+   functions here). Runtime-only. Projection: under C, since C stays on glibc. Costs:
+   a sizing/fragmentation policy, and `runtime/models/` must learn the new heap.
+   Bonus: also deletes word-frequency's per-token `cfree` cost.
+2. **Devirtualise the drop.** Releases go through the header's function pointer — an
+   indirect call per node, opaque to gcc. At a typed release site codegen knows the
+   repr and can call the concrete drop directly (keeping the `rc == 0` test), letting
+   small drops inline. A few percent, and it removes the same indirect-call barriers
+   the brainfuck work just paid to remove elsewhere.
+3. **Header diet.** The layout today is rc at +0, flags at +8, drop pointer at +16 — a
+   24-byte header on a 16-byte payload, so a Node is 40 bytes to C's 16. Pack rc+flags
+   and turn the drop pointer into a type index and the header halves; every heap object
+   in every program shrinks with it. ABI change across runtime, codegen and the
+   witnesses — a planned project with its own model updates, same tier as `neon_str`
+   SSO above.
+4. **The recursion itself: nothing.** make/check compile to the same shape and cost as
+   C's. `ir::unique` has no purchase — nothing is a loop-carried list.
+
+Non-options, on the record: a generational nursery is what actually wins this bench,
+but deferred reclamation breaks eager deterministic destruction — a semantics change,
+not an optimisation. Arena/region allocation needs region inference to be safe —
+research, not backlog.
+
+The two benchmark sections triangulate: both profiles put the cost in the allocator
+and object layout, and neither puts it in the refcounting. That is the runtime's next
+frontier.
+
+---
+
+## Perf — what the n-body profile says to build
+
+From `bench/n-body/` (20M steps of the benchmarks-game integrator over a `List[Body]`,
+`Body` a flat record of seven f64s), profiled 2026-07-20 *after* the nested-loop fix to
+`ir::unique`'s order rule (which this benchmark flushed out; the fix took 4.45s →
+2.83s). Neon: 2.83s, ~4.4× C — and 88% of the entire run is three `movups` stores: the
+in-place record writes themselves. The rewrite did its job — stable pointer, no rc
+traffic, stores go straight into the buffer — what remains is *granularity*.
+
+**Partial record update.** The idiomatic write rebuilds the whole record:
+
+    bodies = try! list::set(bodies, i, Body { vx: new_vx, vy: .., vz: .., x: bi.x, .. });
+
+so every velocity update copies 56 bytes out (`bodies[i]`), rebuilds seven fields, and
+stores 56 bytes back — where C stores the three changed doubles, 24 bytes, no copy-out.
+4× the memory traffic per pair-interaction, plus store-forwarding stalls when the next
+iteration reloads a just-stored record; that is the whole remaining gap.
+
+The shape of the fix, as an extension of the sole-ownership rewrite (which already
+proves the buffer is exclusively ours): when the stored value is a `MakeRecord` whose
+unchanged fields are `Field` projections of the same list's same slot (`bodies[i]` with
+a subset replaced), emit stores for only the replaced fields — a field-offset variant of
+`neon_list_set_inplace`. Needs: the literal-matches-slot proof (the record read and the
+write index must be the same value, not merely equal), a field-offset store primitive,
+and the same-buffer argument extended to partial writes. Not an afternoon; design it
+against the `advance` IR before building.
+
+Until then the program-level workaround exists and is honest to note: structure-of-
+arrays (seven `List[f64]`s) turns every write into an 8-byte scalar store and would
+likely put this benchmark near C today — but the benchmark keeps the record shape on
+purpose, because the record shape is what people write.
+
+**Revised by the clang experiment, same day.** Built clang-all-the-way-down
+(`CC=clang`, runtime archive included — verify with `strings` on the archive, not the
+binary's `.comment`, which always shows GCC from glibc's crt objects), this benchmark
+runs 0.73s against gcc's 2.83s: LLVM's GVN forwards the stored record fields to the
+immediate reloads and keeps the body in registers — it performs the partial-record
+elimination gcc declines. So the item above is not "the missing 4×"; it is "stop
+depending on which C compiler is in a forwarding mood" — explicit field stores would
+give both toolchains the fast shape. The toolchain split measured across all four
+benches: gcc wins brainfuck by 23% and binary-trees by 10%; clang wins word-frequency
+by 5% and n-body by 3.9×. Neither dominates; benchmark tables should say which `cc`
+built the Neon row.
 
 ---
 
@@ -348,14 +436,14 @@ Owner's call on timing; recorded so it is not lost.
 ## Unproven leads
 
 Marked as such because nobody built a repro. Worth a pass, not worth asserting.
+(L4 — qualified-path impls never matching — graduated: confirmed real and fixed with the
+identity change.)
 
 - **L1.** `env.rs::satisfies_marker` matches the bare protocol name `"Ord"`, so a user
   `marker Ord` in any module may inherit the built-in rule.
 - **L2.** `ordered.rs:90/165` match bare `"List"`/`"Map"`.
 - **L3.** `repr.rs::variant_rank` collapses five variants into one sort rank used as a
   canonical layout ordering.
-- **L4.** `ImplDef.target_head` is qualified while `nominal_head` is bare — **qualified-path
-  impls may currently never match at all.**
 - **L5.** Deferred-op duplicate `TyId`s reaching the backend, where `repr.rs`/`ctype.rs` key
   on `HashMap<TyId, _>`.
 - **L6.** `repr_components` checks `boxed` only on single-atom DNF paths; a multi-atom path

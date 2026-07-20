@@ -81,6 +81,11 @@ fn compile_with(
     if stage == Stage::Optimised {
         return program;
     }
+    // Between the optimiser and refcounting, deliberately: after refcounting the pass's
+    // own retains are indistinguishable from a real second reference (see `ir::unique`'s
+    // module doc), and refcount placement must see the rewritten writes to give the
+    // in-place native its borrow convention.
+    unique::apply(&mut program);
     refcount::insert(&mut program);
     program
 }

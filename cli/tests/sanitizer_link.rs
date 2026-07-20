@@ -142,9 +142,20 @@ fn unsanitized_modes_link_and_run() {
 /// sanitizer bug.
 #[test]
 fn every_variant_is_staged() {
-    for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
-        let path: PathBuf = sysroot().join("lib").join(archive);
-        assert!(path.is_file(), "missing staged runtime variant {}", path.display());
+    // At least one flavor must be complete; a flavor whose compiler is absent from the
+    // build machine is legitimately unstaged. The suite's own links go through the CLI,
+    // which picks the flavor matching its `cc`.
+    let staged: Vec<String> = ["gcc", "clang"]
+        .iter()
+        .filter(|f| sysroot().join("lib").join(f).join("libneon_rt.a").is_file())
+        .map(|f| f.to_string())
+        .collect();
+    assert!(!staged.is_empty(), "no runtime flavor staged under lib/");
+    for flavor in &staged {
+        for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
+            let path: PathBuf = sysroot().join("lib").join(flavor).join(archive);
+            assert!(path.is_file(), "missing staged runtime variant {}", path.display());
+        }
     }
     assert!(Path::new(&sysroot().join("stdlib")).is_dir(), "stdlib not staged");
 }

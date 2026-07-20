@@ -58,6 +58,28 @@ pub enum RuntimeVariant {
 /// outside this set is an error, never a fallback — see `runtime_variant`.
 pub const SANITIZED_VARIANT_COVERS: &[&str] = &["address", "undefined"];
 
+/// Which compiler *family* the resolved `cc` belongs to, which decides the runtime
+/// archive flavor under `lib/<flavor>/`. Family matters twice: LTO bitcode does not
+/// cross families (a clang link against gcc fat objects silently drops to the machine
+/// code and loses every cross-archive inline — measured at 4× on the n-body benchmark),
+/// and the two sanitizer runtimes do not link against each other's instrumentation at
+/// all. So the archive must be built by the same family that links the program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CcFlavor {
+    Gcc,
+    Clang,
+}
+
+impl CcFlavor {
+    /// The subdirectory of the sysroot's `lib/` holding this flavor's archives.
+    pub fn dir(self) -> &'static str {
+        match self {
+            CcFlavor::Gcc => "gcc",
+            CcFlavor::Clang => "clang",
+        }
+    }
+}
+
 impl RuntimeVariant {
     /// The archive's file name under the sysroot's `lib/`.
     pub fn archive(self) -> &'static str {
@@ -277,6 +299,19 @@ impl BuildConfig {
             SANITIZED_VARIANT_COVERS.join(","),
             if unsupported.len() == 1 { "" } else { "s" },
         ))
+    }
+
+    /// Which archive flavor this build's `cc` needs, probed from `cc --version` rather
+    /// than the name — `cc` is usually a symlink, and on macOS `gcc` *is* clang. Not
+    /// cached: it runs once per build, at link time, and a probe that cannot run at all
+    /// is the right moment to say the compiler is missing.
+    pub fn cc_flavor(&self) -> Result<CcFlavor> {
+        let output = std::process::Command::new(&self.cc)
+            .arg("--version")
+            .output()
+            .map_err(|e| eyre!("cannot run `{} --version` to identify the compiler: {e}", self.cc))?;
+        let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        Ok(if text.contains("clang") { CcFlavor::Clang } else { CcFlavor::Gcc })
     }
 
     /// The sanitizers requested, normalised: split on commas, trimmed, deduplicated.

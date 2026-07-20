@@ -534,6 +534,28 @@ fn emit_native_out(
 /// container's element repr first. Skipping that step is how a narrow value ends up read
 /// at the slot's wider size through a `void*`.
 fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Option<Value>, symbol: &str, args: &[Value]) {
+    // The in-place write returns nothing — that is its whole point, a call that cannot
+    // change the pointer — so its element repr comes from the *list argument*; there is
+    // no result to ask. Handled ahead of the result unwrap every other symbol shares.
+    // No `is_counted` gate here: `ir::unique` only rewrites writes whose element is
+    // uncounted, so reaching this with a refcounted element is a bug in that pass rather
+    // than a case to handle. `sizeof` as the width for the same reason `neon_list_set`
+    // takes one — the literal cannot disagree with the layout the emitter gave the type.
+    if symbol == "neon_list_set_inplace" {
+        let Repr::List(e) = f.value_repr(args[0]) else {
+            unreachable!("codegen: in-place write on a non-list")
+        };
+        let e = (**e).clone();
+        let _ = writeln!(
+            out,
+            "neon_list_set_scalar_inplace({}, {}, {}, sizeof({}));",
+            var(args[0]),
+            var(args[1]),
+            addr_of(types, f, args[2], &e),
+            types.c_type(&e)
+        );
+        return;
+    }
     let Some(r) = result else { return };
     // The element repr and its witness are computed *inside* the arms that use them, not
     // once up front. Half the symbols here return a `Map` or a `Resource`, so asking a
@@ -602,17 +624,6 @@ fn emit_list_builder(out: &mut String, types: &TypeTable, f: &Func, result: Opti
         // `is_counted` is the precondition that function states, asked of the repr codegen
         // already has. `sizeof` rather than a size computed here, so the literal cannot
         // disagree with the layout the emitter actually gave the type.
-        // The width as a literal for the same reason `neon_list_set` takes one, and no
-        // `is_counted` gate is needed at this arm: `ir::unique` only rewrites writes whose
-        // element is uncounted, so reaching here with a refcounted one is a bug in that
-        // pass rather than a case to handle.
-        "neon_list_set_inplace" => format!(
-            "neon_list_set_scalar_inplace({}, {}, {}, sizeof({}))",
-            var(args[0]),
-            var(args[1]),
-            addr_of(types, f, args[2], &elem()),
-            types.c_type(&elem())
-        ),
         "neon_list_ensure_unique" => format!("neon_list_ensure_unique({})", var(args[0])),
         "neon_list_set" if !elem().is_counted() => format!(
             "neon_list_set_scalar({}, {}, {}, sizeof({}))",

@@ -1,0 +1,66 @@
+// Binary-trees, as a benchmark: build and tear down millions of short-lived recursive
+// tree nodes. The deliberate inverse of the brainfuck bench — no list writes, no tight
+// arithmetic; the entire cost is allocation, refcount traffic, and recursive drop
+// chains. Single-threaded in every language, so the table compares runtimes rather
+// than thread pools.
+//
+// The shape is the benchmarks-game program: a stretch tree checked and dropped, a
+// long-lived tree held across the middle, and for each even depth a fleet of trees
+// each built, checked, and dropped. `check` counts nodes, so every tree is fully
+// walked before it dies. The final line sums every check printed, and the runner
+// pins it.
+
+use std::io;
+
+record Node {
+    left: Node | null,
+    right: Node | null,
+}
+
+fn make(depth: i64) -> Node {
+    if depth == 0 {
+        Node { left: null, right: null }
+    } else {
+        Node { left: make(depth - 1), right: make(depth - 1) }
+    }
+}
+
+fn check(n: Node | null) -> i64 {
+    if n is null {
+        0
+    } else {
+        let node = n as Node;
+        1 + check(node.left) + check(node.right)
+    }
+}
+
+fn main() {
+    let max_depth = 18;
+    let total = 0;
+
+    let stretch = check(make(max_depth + 1));
+    io::println("stretch tree of depth #{max_depth + 1} check: #{stretch}");
+    total = total + stretch;
+
+    let long_lived = make(max_depth);
+
+    let depth = 4;
+    while depth <= max_depth {
+        let iterations = 1 bsl (max_depth - depth + 4);
+        let sum = 0;
+        let i = 0;
+        while i < iterations {
+            sum = sum + check(make(depth));
+            i = i + 1;
+        };
+        io::println("#{iterations} trees of depth #{depth} check: #{sum}");
+        total = total + sum;
+        depth = depth + 2;
+    };
+
+    let ll = check(long_lived);
+    io::println("long lived tree of depth #{max_depth} check: #{ll}");
+    total = total + ll;
+
+    io::println("Result: #{total}");
+}

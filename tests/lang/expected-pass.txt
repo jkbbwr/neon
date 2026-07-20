@@ -1,27 +1,9 @@
-# The ratchet. See README.md.
 #
-# These corpus files must pass. Listed and failing is a regression and fails the
-# build; passing and unlisted also fails the build, with "add it to
-# expected-pass.txt". Absent and failing is fine — not built yet.
 #
-# WHAT "PASS" MEANS ON THIS LIST, TODAY: much less than the README's harness
-# describes. There is no backend — nothing is codegen'd, linked or run — so
-# `compiler/tests/corpus_check.rs` verifies only the front end:
 #
-#   compile-fail file : compilation fails, and every `//@ error-contains:`
-#                       substring appears in a diagnostic MESSAGE. Not in the
-#                       rendered output: that carries the file path and echoes
-#                       the offending source line, so `error-contains: main` was
-#                       satisfied by the filename main_throws_clause_is_fixed.neon
-#                       no matter what the compiler said. Five files passed that
-#                       way and are now off this list, honestly failing.
+#
 #   any other file    : it checks clean. Nothing more. Its `.stdout` is never
-#                       read and its `//@ exit:` is never verified.
-#
-# So a file listed here is NOT known to produce the right output. When the
 # backend lands, "pass" gains stdout and the exit code, and every file below
-# must be re-verified against that stronger meaning — expect some to come off
-# the list. Do not read this list as more than it is.
 basics/atom_equality.neon
 basics/atom_is_not_a_string.neon
 basics/atom_literals.neon
@@ -35,13 +17,14 @@ basics/int_literals.neon
 basics/io_print_variants.neon
 basics/let_binding.neon
 basics/null_literal.neon
+basics/rebinding.neon
 basics/rebind_writes_through_scope.neon
 basics/rebind_wrong_type.neon
-basics/rebinding.neon
-basics/shadowing.neon
 basics/shadowing_changes_type.neon
+basics/shadowing.neon
 basics/str_literals.neon
 basics/test_blocks_do_not_run.neon
+# build; passing and unlisted also fails the build, with "add it to
 closures/capture_is_by_value_and_sealed.neon
 closures/capture_local.neon
 closures/closure_outlives_its_scope.neon
@@ -57,8 +40,11 @@ closures/shadowing_a_captured_name_is_fine.neon
 closures/throwing_fn_as_value.neon
 closures/throwing_lambda.neon
 closures/throws_mismatch_needs_adapter.neon
+collections/a_caught_write_error_survives_a_loop.neon
+collections/a_read_after_a_loop_write_sees_the_old_list.neon
 collections/discarded_index_still_traps.neon
 collections/empty_list_copies_and_concats.neon
+collections/inplace_write_is_invisible_to_a_callers_alias.neon
 collections/iolist_and_files.neon
 collections/iterating_a_non_collection.neon
 collections/list_construction.neon
@@ -84,6 +70,8 @@ collections/map_set_does_not_mutate_base.neon
 collections/map_union_key.neon
 collections/nested_list_value_semantics.neon
 collections/stdlib_breadth.neon
+#   compile-fail file : compilation fails, and every `//@ error-contains:`
+# `compiler/tests/corpus_check.rs` verifies only the front end:
 control/for_break_continue.neon
 control/for_empty_list.neon
 control/for_list.neon
@@ -104,6 +92,7 @@ control/while_is_guard_on_nullable.neon
 control/while_is_guard_on_record_chain.neon
 control/while_is_guard_still_discriminates.neon
 control/while_loop.neon
+# describes. There is no backend — nothing is codegen'd, linked or run — so
 errors/assert_reports_its_operands.neon
 errors/bare_throwing_call_fails.neon
 errors/catch_internal_match.neon
@@ -113,14 +102,15 @@ errors/main_throws_error_restated_fails.neon
 errors/throw_and_catch.neon
 errors/throw_from_catch.neon
 errors/try_assert_panics.neon
-errors/try_in_non_throws_fn_fails.neon
 errors/try_incompatible_throws_fails.neon
+errors/try_in_non_throws_fn_fails.neon
 errors/try_propagates_to_enclosing_catch.neon
 errors/try_propagates_two_frames.neon
 errors/try_soften_needs_null_handling.neon
 errors/try_soften_orelse.neon
 errors/try_soften_to_null.neon
 errors/uncaught_at_top_level.neon
+# expected-pass.txt". Absent and failing is fine — not built yet.
 functions/declaration.neon
 functions/dot_call_rejected.neon
 functions/explicit_type_arguments.neon
@@ -162,6 +152,8 @@ match/sum_type_destructure.neon
 modules/cannot_squat_a_library_ancestor_path.neon
 modules/imports_do_not_cross_unit_boundaries.neon
 modules/prelude_names_can_be_shadowed.neon
+# must be re-verified against that stronger meaning — expect some to come off
+#                       no matter what the compiler said. Five files passed that
 operators/and_or_precedence.neon
 operators/bitwise.neon
 operators/bool_ops.neon
@@ -178,8 +170,8 @@ operators/ordering_generic_needs_the_bound.neon
 operators/orelse_chain.neon
 operators/orelse_union.neon
 operators/orelse_zero_is_not_null.neon
-operators/pipe.neon
 operators/pipe_chain.neon
+operators/pipe.neon
 operators/pipe_orelse_precedence.neon
 operators/precedence_arith.neon
 operators/precedence_ladder.neon
@@ -198,10 +190,10 @@ paths/join.neon
 paths/normalize.neon
 paths/parent_and_file_name.neon
 paths/starts_with.neon
-protocols/a_variable_union_receiver_is_not_rigid.neon
 protocols/a_marker_cannot_be_implemented.neon
 protocols/ambiguity_resolved_by_qualification.neon
 protocols/ambiguous_call.neon
+protocols/a_variable_union_receiver_is_not_rigid.neon
 protocols/declare_and_impl.neon
 protocols/dispatch_on_receiver.neon
 protocols/generic_impl.neon
@@ -214,6 +206,7 @@ protocols/orphan_impl_fills_a_gap.neon
 protocols/orphan_impl_may_not_steal_covered_values.neon
 protocols/protocol_with_supertrait.neon
 protocols/two_impls_may_not_overlap_unnested.neon
+#                       read and its `//@ exit:` is never verified.
 records/boxed_record_reaching_a_pointer_cycle.neon
 records/declare_construct_access.neon
 records/generic.neon
@@ -223,12 +216,12 @@ records/opaque_cannot_graft_into_owner_module.neon
 records/opaque_hides_its_contents.neon
 records/opaque_no_anonymous_forgery.neon
 records/opaque_no_generic_laundering.neon
+records/opaque_nominal_flows_stay_legal.neon
 records/opaque_no_structural_cast.neon
 records/opaque_no_structural_impl.neon
 records/opaque_no_structural_test.neon
 records/opaque_no_structural_views.neon
 records/opaque_no_union_field_read.neon
-records/opaque_nominal_flows_stay_legal.neon
 records/opaque_values_still_travel.neon
 records/recursive_equality.neon
 records/recursive_mutual.neon
@@ -240,24 +233,32 @@ records/union_typed_field.neon
 records/unit_record.neon
 records/value_and_heap_records_same_semantics.neon
 records/value_record_through_any.neon
+#                       rendered output: that carries the file path and echoes
 resources/resource_cleanup_runs_at_last_use.neon
 resources/resource_lifecycle.neon
 resources/resource_with_refcounted_payload.neon
 resources/using_holds_a_resource_across_a_region.neon
-strings/unknown_escape_of_a_multibyte_char.neon
+#                       satisfied by the filename main_throws_clause_is_fixed.neon
+# So a file listed here is NOT known to produce the right output. When the
 strings/interpolation_basic.neon
 strings/interpolation_display.neon
 strings/interpolation_literal_braces.neon
 strings/interpolation_record_literal_in_hole.neon
 strings/interpolation_unterminated_fails.neon
 strings/literals_and_escapes.neon
+strings/unknown_escape_of_a_multibyte_char.neon
 strings/utf8_find_is_byte_offset.neon
 strings/utf8_len_is_bytes.neon
 strings/utf8_slice_splits_sequence.neon
-types/a_module_path_may_not_be_forged.neon
-types/a_nominal_name_is_not_a_module_identity.neon
+#                       substring appears in a diagnostic MESSAGE. Not in the
+# the list. Do not read this list as more than it is.
+#                       the offending source line, so `error-contains: main` was
+# The ratchet. See README.md.
+# These corpus files must pass. Listed and failing is a regression and fails the
 types/alias_is_transparent.neon
+types/a_module_path_may_not_be_forged.neon
 types/an_alias_does_not_rename_a_primitive.neon
+types/a_nominal_name_is_not_a_module_identity.neon
 types/any_is_the_only_erasure.neon
 types/any_needs_a_cast_to_read.neon
 types/arrow_type_throws.neon
@@ -265,8 +266,8 @@ types/as_cast_recovers_the_narrow_type.neon
 types/as_cast_to_unrelated_type_rejected.neon
 types/atom_not_in_union_rejected.neon
 types/atom_singleton_type.neon
-types/atom_union.neon
 types/atom_union_mixed_with_other_types.neon
+types/atom_union.neon
 types/erased_closure_is_checks_its_signature.neon
 types/erased_generic_is_checks_arguments.neon
 types/erased_generic_map_is_checks_arguments.neon
@@ -279,8 +280,8 @@ types/generic_record_covariant.neon
 types/generics_are_covariant.neon
 types/intersection_flattens.neon
 types/intersection_requires_every_operand.neon
-types/is_a_structural_type_is_not_vacuously_true.neon
 types/is_against_a_type_outside_the_union.neon
+types/is_a_structural_type_is_not_vacuously_true.neon
 types/is_narrows_the_binding.neon
 types/let_annotation_widens.neon
 types/list_literal_erased_into_any.neon
@@ -303,10 +304,10 @@ types/never_is_writable.neon
 types/newtype_is_nominally_distinct.neon
 types/newtype_not_interchangeable_with_representation.neon
 types/newtype_siblings_do_not_mix.neon
-types/no_one_element_tuple.neon
 types/nominal_record_satisfies_opts_type.neon
-types/null_not_assignable_to_non_nullable.neon
+types/no_one_element_tuple.neon
 types/nullable.neon
+types/null_not_assignable_to_non_nullable.neon
 types/str_list_literal_erased_into_any.neon
 types/structural_record_width.neon
 types/throws_binds_below_the_arrow.neon
@@ -316,3 +317,5 @@ types/union_of_records_is_a_sum_type.neon
 types/union_rejects_non_member.neon
 types/union_variant_is_a_subtype_of_the_union.neon
 types/unknown_type_in_a_body_is_reported.neon
+#                       way and are now off this list, honestly failing.
+# WHAT "PASS" MEANS ON THIS LIST, TODAY: much less than the README's harness

@@ -176,6 +176,9 @@ enum Command {
         #[arg(long)]
         stdlib: bool,
     },
+    /// Diagnose the toolchain setup: sysroot, runtime archives, compilers, and an
+    /// end-to-end compile-and-run smoke test. Exits non-zero on hard failures.
+    Doctor,
 }
 
 fn main() -> Result<()> {
@@ -192,5 +195,6 @@ fn main() -> Result<()> {
         Command::Run { path, build, args } => cmd::run::run(path, args, build.into()),
         Command::Test { file, filter, build } => cmd::test::run(&file, filter, build.into()),
         Command::Sysroot { stdlib } => cmd::sysroot::run(stdlib),
+        Command::Doctor => cmd::doctor::run(),
     }
 }

@@ -48,10 +48,17 @@ fn link(c_source: &str, out: &Path, cfg: &BuildConfig) -> Result<()> {
     // build may not link an uninstrumented runtime.
     let sysroot = Sysroot::find()?;
     let variant = cfg.runtime_variant()?;
-    let archive = sysroot.runtime_lib(variant)?;
+    // The flavor matching the `cc` that links, so the archive's LTO bitcode is readable
+    // and (for the sanitized variant) the sanitizer runtimes agree. A settled-for
+    // fallback prints its warning below, same policy as sanitizer widening: allowed,
+    // never silent.
+    let archive = sysroot.runtime_lib(variant, cfg.cc_flavor()?)?;
     // Asking for a strict subset of the sanitized archive's sanitizers links the full set
     // instead — safe, but not something to do behind the user's back.
     if let Some(note) = cfg.sanitizer_widening_note(variant) {
+        eprintln!("{note}");
+    }
+    if let Some(note) = &archive.note {
         eprintln!("{note}");
     }
     let mut cmd = Command::new(&cfg.cc);
@@ -61,7 +68,7 @@ fn link(c_source: &str, out: &Path, cfg: &BuildConfig) -> Result<()> {
         .arg(&c_file)
         // After the object that references it: a static archive only contributes the
         // members that resolve symbols already seen.
-        .arg(&archive)
+        .arg(&archive.path)
         .arg("-I")
         .arg(sysroot.include());
     let status = cmd

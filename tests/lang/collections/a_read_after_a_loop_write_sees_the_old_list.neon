@@ -1,0 +1,21 @@
+// The order rule of `ir::unique`: a value read after its consuming write must keep
+// showing the old contents — the write clones when anything else can observe the list —
+// so a loop containing such a read must not be rewritten to write in place. This output
+// is the oracle: if the rewrite ever fires here, the left column silently becomes the
+// right column and no sanitizer says a word.
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    let acc = list::repeat(0, 3);
+    let i = 0;
+    while i < 3 {
+        let next = try! list::set(acc, i, i + 1);
+        // Reads the value the write consumed: still the pre-write contents.
+        io::println("#{acc[i]} -> #{next[i]}");
+        acc = next;
+        i = i + 1;
+    };
+    io::println("#{acc[0]} #{acc[1]} #{acc[2]}");
+}

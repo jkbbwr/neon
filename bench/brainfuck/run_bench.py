@@ -52,6 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run brainfuck benchmarks.")
     parser.add_argument("--fast-only", action="store_true", help="Only run languages within 5x the performance of C (based on cache).")
     parser.add_argument("--clear-cache", action="store_true", help="Clear the benchmark cache.")
+    parser.add_argument("--runs", type=int, default=1, help="Number of runs per language to average.")
     args = parser.parse_args()
 
     # Make sure we are in the script's directory
@@ -197,7 +198,8 @@ def main():
         {"name": "Perl", "cmd": ["perl", "perl/main.pl"], "available": perl_ok},
     ]
 
-    console.print("\n[bold blue]Running benchmarks (1 run each to avoid long execution times)...[/bold blue]")
+    runs_str = f"{args.runs} runs" if args.runs > 1 else "1 run"
+    console.print(f"\n[bold blue]Running benchmarks ({runs_str} each, taking average)...[/bold blue]")
     results = {}
     
     for t in targets:
@@ -208,10 +210,10 @@ def main():
         console.print(f"Benchmarking [cyan]{t['name']}[/cyan]...")
         times = []
         try:
-            for _ in range(1):
+            for _ in range(args.runs):
                 elapsed = run_and_time(t["cmd"])
                 times.append(elapsed)
-            results[t["name"]] = min(times)
+            results[t["name"]] = sum(times) / len(times)
         except Exception as e:
             console.print(f"[red]Error running {t['name']}: {e}[/red]")
             results[t["name"]] = None

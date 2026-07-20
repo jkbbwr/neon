@@ -12,6 +12,8 @@
 fn main() {
     let root = std::env::var("DEP_NEON_RT_ROOT")
         .expect("neon-runtime's build script must publish cargo:root");
-    println!("cargo:rustc-env=NEON_RT_LIB_DIR={root}/lib");
+    // The root holds one archive set per compiler flavor (`<root>/<flavor>/lib/`); the
+    // harness appends the flavor matching the `cc` it links with.
+    println!("cargo:rustc-env=NEON_RT_ROOT={root}");
     println!("cargo:rerun-if-env-changed=DEP_NEON_RT_ROOT");
 }

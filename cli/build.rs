@@ -25,20 +25,34 @@ fn main() {
     let sysroot = target_dir();
 
     stage_tree(&rt_include, &sysroot.join("include"));
-    // Every runtime variant, not just the release one. A build links exactly one of these
-    // (`cli/src/buildcfg.rs::runtime_variant`) and never substitutes another, so a variant
-    // missing from the staged sysroot is a build that cannot happen at all — most sharply
-    // the sanitized archive, without which `--sanitize address` must fail rather than
-    // quietly link an uninstrumented runtime. Kept in step with `runtime/CMakeLists.txt`.
-    for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
-        let from = rt_root.join("lib").join(archive);
-        // Re-stage when the archive itself changes, not only when its *path* does.
-        // `rerun-if-env-changed=DEP_NEON_RT_ROOT` alone leaves the staged sysroot stale
-        // whenever the runtime is rebuilt in place: edit runtime C, rebuild, and the
-        // program still links yesterday's archive. That cost an afternoon once -- a
-        // runtime change measured as having no effect, because it was never linked.
-        println!("cargo:rerun-if-changed={}", from.display());
-        stage_file(&from, &sysroot.join("lib").join(archive));
+    // Every runtime variant of every flavor the runtime built (`lib/<flavor>/<archive>`,
+    // one flavor per compiler family present at build time — see `runtime/build.rs`). A
+    // build links exactly one of these (`cli/src/buildcfg.rs::runtime_variant` picks the
+    // variant, `cc_flavor` the flavor) and never substitutes another, so anything missing
+    // from the staged sysroot is a build that cannot happen at all — most sharply the
+    // sanitized archive, without which `--sanitize address` must fail rather than quietly
+    // link an uninstrumented runtime. Kept in step with `runtime/CMakeLists.txt`.
+    //
+    // `lib/` is cleared first so a flavor or archive that stops being built cannot
+    // linger from a previous staging and keep "working".
+    let lib = sysroot.join("lib");
+    let _ = std::fs::remove_dir_all(&lib);
+    for flavor in ["gcc", "clang"] {
+        let from_dir = rt_root.join(flavor).join("lib");
+        if !from_dir.is_dir() {
+            continue;
+        }
+        for archive in ["libneon_rt.a", "libneon_rt_debug.a", "libneon_rt_san.a"] {
+            let from = from_dir.join(archive);
+            // Re-stage when the archive itself changes, not only when its *path* does.
+            // `rerun-if-env-changed=DEP_NEON_RT_ROOT` alone leaves the staged sysroot
+            // stale whenever the runtime is rebuilt in place: edit runtime C, rebuild,
+            // and the program still links yesterday's archive. That cost an afternoon
+            // once -- a runtime change measured as having no effect, because it was
+            // never linked.
+            println!("cargo:rerun-if-changed={}", from.display());
+            stage_file(&from, &lib.join(flavor).join(archive));
+        }
     }
     if stdlib_src.is_dir() {
         stage_tree(&stdlib_src, &sysroot.join("stdlib"));

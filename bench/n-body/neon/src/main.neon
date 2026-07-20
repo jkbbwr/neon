@@ -1,0 +1,192 @@
+// N-body, as a benchmark: the benchmarks-game gravitational integrator. Pure f64
+// arithmetic — the first benchmark to touch float codegen at all — over a
+// `List[Body]` where `Body` is a flat record of seven f64s. A flat float record is an
+// uncounted repr, so the loop's writes take the scalar path, and the pair-update loop
+// in `advance` is exactly the shape `ir::unique` rewrites: the list is loop-carried,
+// every read of a body happens before the write that replaces it, and the error edges
+// are `try!`. Whether the rewrite fires on record elements is half the reason this
+// benchmark exists.
+//
+// The record is rebuilt whole at each write (spread-with-override does not parse
+// today — see TODO), which is what every immutable language in the table does too.
+// Identical operation order makes the two printed energies reproducible to nine
+// decimals across every language; the Result line pins both.
+
+use std::io;
+use std::math;
+use std::fmt;
+use std::collections::list;
+
+record Body {
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    mass: f64,
+}
+
+fn solar_mass() -> f64 { 4.0 * 3.141592653589793 * 3.141592653589793 }
+fn days_per_year() -> f64 { 365.24 }
+
+fn initial() -> List[Body] {
+    let sm = solar_mass();
+    let dpy = days_per_year();
+    [
+        Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: sm },
+        Body {
+            x: 4.84143144246472090e+00,
+            y: -1.16032004402742839e+00,
+            z: -1.03622044471123109e-01,
+            vx: 1.66007664274403694e-03 * dpy,
+            vy: 7.69901118419740425e-03 * dpy,
+            vz: -6.90460016972063023e-05 * dpy,
+            mass: 9.54791938424326609e-04 * sm,
+        },
+        Body {
+            x: 8.34336671824457987e+00,
+            y: 4.12479856412430479e+00,
+            z: -4.03523417114321381e-01,
+            vx: -2.76742510726862411e-03 * dpy,
+            vy: 4.99852801234917238e-03 * dpy,
+            vz: 2.30417297573763929e-05 * dpy,
+            mass: 2.85885980666130812e-04 * sm,
+        },
+        Body {
+            x: 1.28943695621391310e+01,
+            y: -1.51111514016986312e+01,
+            z: -2.23307578892655734e-01,
+            vx: 2.96460137564761618e-03 * dpy,
+            vy: 2.37847173959480950e-03 * dpy,
+            vz: -2.96589568540237556e-05 * dpy,
+            mass: 4.36624404335156298e-05 * sm,
+        },
+        Body {
+            x: 1.53796971148509165e+01,
+            y: -2.59193146099879641e+01,
+            z: 1.79258772950371181e-01,
+            vx: 2.68067772490389322e-03 * dpy,
+            vy: 1.62824170038242295e-03 * dpy,
+            vz: -9.51592254519715870e-05 * dpy,
+            mass: 5.15138902046611451e-05 * sm,
+        },
+    ]
+}
+
+fn offset_momentum(bodies: List[Body]) -> List[Body] {
+    let px = 0.0;
+    let py = 0.0;
+    let pz = 0.0;
+    let i = 0;
+    let n = list::len(bodies);
+    while i < n {
+        let b = bodies[i];
+        px = px + b.vx * b.mass;
+        py = py + b.vy * b.mass;
+        pz = pz + b.vz * b.mass;
+        i = i + 1;
+    };
+    let sun = bodies[0];
+    let sm = solar_mass();
+    try! list::set(bodies, 0, Body {
+        x: sun.x,
+        y: sun.y,
+        z: sun.z,
+        vx: 0.0 - px / sm,
+        vy: 0.0 - py / sm,
+        vz: 0.0 - pz / sm,
+        mass: sun.mass,
+    })
+}
+
+fn advance(bodies: List[Body], dt: f64) -> List[Body] {
+    let n = list::len(bodies);
+    let i = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let bi = bodies[i];
+            let bj = bodies[j];
+            let dx = bi.x - bj.x;
+            let dy = bi.y - bj.y;
+            let dz = bi.z - bj.z;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let mag = dt / (d2 * math::sqrt(d2));
+            bodies = try! list::set(bodies, i, Body {
+                x: bi.x,
+                y: bi.y,
+                z: bi.z,
+                vx: bi.vx - dx * bj.mass * mag,
+                vy: bi.vy - dy * bj.mass * mag,
+                vz: bi.vz - dz * bj.mass * mag,
+                mass: bi.mass,
+            });
+            bodies = try! list::set(bodies, j, Body {
+                x: bj.x,
+                y: bj.y,
+                z: bj.z,
+                vx: bj.vx + dx * bi.mass * mag,
+                vy: bj.vy + dy * bi.mass * mag,
+                vz: bj.vz + dz * bi.mass * mag,
+                mass: bj.mass,
+            });
+            j = j + 1;
+        };
+        i = i + 1;
+    };
+    let k = 0;
+    while k < n {
+        let b = bodies[k];
+        bodies = try! list::set(bodies, k, Body {
+            x: b.x + dt * b.vx,
+            y: b.y + dt * b.vy,
+            z: b.z + dt * b.vz,
+            vx: b.vx,
+            vy: b.vy,
+            vz: b.vz,
+            mass: b.mass,
+        });
+        k = k + 1;
+    };
+    bodies
+}
+
+fn energy(bodies: List[Body]) -> f64 {
+    let e = 0.0;
+    let n = list::len(bodies);
+    let i = 0;
+    while i < n {
+        let bi = bodies[i];
+        e = e + 0.5 * bi.mass * (bi.vx * bi.vx + bi.vy * bi.vy + bi.vz * bi.vz);
+        let j = i + 1;
+        while j < n {
+            let bj = bodies[j];
+            let dx = bi.x - bj.x;
+            let dy = bi.y - bj.y;
+            let dz = bi.z - bj.z;
+            e = e - bi.mass * bj.mass / math::sqrt(dx * dx + dy * dy + dz * dz);
+            j = j + 1;
+        };
+        i = i + 1;
+    };
+    e
+}
+
+fn main() {
+    let n = 20000000;
+    let bodies = offset_momentum(initial());
+
+    let before = fmt::fixed(energy(bodies), 9);
+    io::println(before);
+
+    let i = 0;
+    while i < n {
+        bodies = advance(bodies, 0.01);
+        i = i + 1;
+    };
+
+    let after = fmt::fixed(energy(bodies), 9);
+    io::println(after);
+    io::println("Result: #{before} #{after}");
+}

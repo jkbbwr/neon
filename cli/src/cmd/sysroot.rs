@@ -36,12 +36,20 @@ pub fn run(stdlib_only: bool) -> Result<()> {
     println!("{}", s.root().display());
     println!("  include: {}", s.include().display());
     println!("  stdlib:  {}", s.stdlib().display());
-    // All three runtime variants, present or not: which ones exist decides which builds
-    // this toolchain can do at all (no sanitized archive means no sanitized build).
-    println!("  runtime variants in {}:", s.lib_dir().display());
-    for v in [RuntimeVariant::Release, RuntimeVariant::Debug, RuntimeVariant::Sanitized] {
-        let mark = if s.lib_dir().join(v.archive()).is_file() { "present" } else { "MISSING" };
-        println!("    {:<20} {mark}", v.archive());
+    // Every flavor × variant, present or not: which ones exist decides which builds this
+    // toolchain can do at all (no sanitized archive means no sanitized build with that
+    // compiler family; no flavor at all means release builds fall back with a warning).
+    println!("  runtime archives in {}:", s.lib_dir().display());
+    for flavor in ["gcc", "clang"] {
+        println!("    {flavor}/");
+        for v in [RuntimeVariant::Release, RuntimeVariant::Debug, RuntimeVariant::Sanitized] {
+            let mark = if s.lib_dir().join(flavor).join(v.archive()).is_file() {
+                "present"
+            } else {
+                "MISSING"
+            };
+            println!("      {:<20} {mark}", v.archive());
+        }
     }
     Ok(())
 }

@@ -248,6 +248,13 @@ impl Func {
     pub fn values(&self) -> impl Iterator<Item = Value> + '_ {
         (0..self.values.len() as u32).map(Value)
     }
+    /// Mint a fresh value on a finished function. For passes that rewrite after lowering —
+    /// `ir::unique` is the only caller — where no `Builder` exists any more.
+    pub fn new_value(&mut self, repr: Repr, ty: TyId) -> Value {
+        let v = Value(self.values.len() as u32);
+        self.values.push(ValueData { repr, ty });
+        v
+    }
 }
 
 /// Builds one function incrementally: mint values and blocks, append instructions to

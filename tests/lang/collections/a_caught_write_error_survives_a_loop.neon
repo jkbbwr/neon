@@ -1,0 +1,21 @@
+// A caught `IndexError` from a loop write must stay catchable. The in-place primitive
+// traps where `try!` panics, so `ir::unique` only rewrites writes whose error edge is
+// the `try!` panic — a `catch` shape must keep the generic call. If the rewrite ever
+// fires here, the catch arm becomes unreachable and this program traps instead of
+// printing "caught".
+
+use std::io;
+use std::collections::list;
+
+fn main() {
+    let acc = list::repeat(0, 3);
+    let i = 0;
+    while i < 5 {
+        acc = try list::set(acc, i, i) catch (e) {
+            io::println("caught");
+            acc
+        };
+        i = i + 1;
+    };
+    io::println("#{acc[0]} #{acc[1]} #{acc[2]}");
+}

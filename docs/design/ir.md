@@ -33,6 +33,7 @@ job is to make those facts *explicit and total* — a representation for every t
 typed AST + TypecheckResult
   → lower to SSA            (dispatch resolved; generics monomorphised; reprs assigned)
   → optimise                (IR→IR, a pass pipeline over SSA, to a fixpoint)
+  → sole-ownership rewrite  (IR→IR; qualifying loop writes become in-place stores)
   → insert refcounts        (IR→IR; retain/release made explicit)
   → backend::c::emit        (one C translation unit for the whole program)
 ```
@@ -43,9 +44,14 @@ discover which instances exist.
 
 The order is forced, not chosen, and `ir::compile`'s doc says why. The optimiser must run
 before refcounting because it rewrites control flow and refcount placement is pinned to a
-specific CFG; refcounting must be last because it splits edges and is not idempotent.
-`Stage::Lowered` and `Stage::Optimised` carry no retains or releases at all, so only
-`Stage::Final` is safe to emit — the earlier stages exist for `neon ir` to print.
+specific CFG; refcounting must be last because it splits edges and is not idempotent. The
+sole-ownership rewrite (`ir::unique`, its module doc is the spec) sits between them for
+its own forced reasons: after refcounting, the pass's own retains are indistinguishable
+from a real second reference, and refcount placement must see the rewritten writes to
+give the in-place native its borrow convention. `Stage::Lowered` and `Stage::Optimised`
+carry no retains or releases at all, so only `Stage::Final` is safe to emit — the earlier
+stages exist for `neon ir` to print, and `Stage::Optimised` prints the IR *before* the
+sole-ownership rewrite.
 
 Every pass above `emit` is **backend-independent**. Only the last step knows what a target
 looks like, and that split is the whole portability story.
@@ -419,9 +425,13 @@ sits **on the edge**, with a fresh block spliced onto a `branch`/`switch` edge t
 code, so nothing fires on a path not taken. There is no separate block-boundary rule; the
 edge rule *is* the boundary rule, derived from the same liveness as everything else.
 
-Two exceptions carry their own reasoning. A lambda's environment parameter is **borrowed** —
+Three exceptions carry their own reasoning. A lambda's environment parameter is **borrowed** —
 the closure owns it and may be called again — and `CallClosure` likewise borrows its callee,
-because calling a closure reads it rather than destroying it. And the one `Cast` that is not
+because calling a closure reads it rather than destroying it. The native
+`neon_list_set_inplace` (emitted only by `ir::unique`, never by lowering) also **borrows**
+its arguments: it mutates the buffer but takes no reference and releases nothing, so the
+chain's one owner stays live across it — a retain per write is exactly the traffic that
+rewrite exists to remove, and would leak besides. And the one `Cast` that is not
 a projection is erasure into `any`: it *allocates* a box and the operand's reference moves
 into it, so it is an owner and a consuming use. Treating it as a view leaked the box and
 everything it transitively owned, invisibly for flat records and visibly for recursive ones.
@@ -433,12 +443,14 @@ finite DAG and the last release always runs. A recursive *type* does not change 
 needs an indirection to stay finite, not a runtime cycle. Getting this discipline right once,
 here, keeps every backend from reimplementing it.
 
-Not built: **FBIP reuse** (`rc == 1` at last use, rewrite the memory in place, turning
-`list::set(xs, i, v)` into an O(1) write when `xs` is unshared) and **escape analysis**
-(stack-allocate a value that never escapes, with no header and no count at all). Both are
-described in the deferred section, not here, because the pass does not do them. `neon_map_set`
-does implement the `rc > 1` check on the runtime side, which is the same idea applied by hand
-in one place.
+Adjacent but built elsewhere: the **sole-ownership rewrite** (`ir::unique`) turns a
+qualifying loop's `list::set` calls into in-place stores — the FBIP-shaped win, taken not
+by tracking `rc == 1` per write but by *establishing* it once on the loop's entry edge and
+proving the function creates no second reference inside the loop. It runs before this
+pass, and this pass's only involvement is the borrow exception above. Still not built:
+**escape analysis** (stack-allocate a value that never escapes, with no header and no
+count at all), described in the deferred section. `neon_map_set` implements the `rc > 1`
+check on the runtime side, which is the same idea applied by hand in one place.
 
 ## Optimisation
 
@@ -461,8 +473,9 @@ which exposes more constants. Reusing one purity map across the whole run is sou
 these passes only remove work — a function that was pure cannot become effectful.
 
 **Not built, despite earlier drafts of this document describing them as design:** inlining,
-GVN/CSE, escape analysis, FBIP reuse, refcount-pair cancellation. They are listed under
-deferred. The claim in `decisions.md` that "after monomorphisation and inlining a primitive
+GVN/CSE, escape analysis, refcount-pair cancellation. They are listed under deferred. (The
+loop-write case of FBIP reuse is built, as the sole-ownership rewrite between this pass
+and refcounting — see the pipeline section.) The claim in `decisions.md` that "after monomorphisation and inlining a primitive
 compare is a single instruction" is currently carried by the C compiler's inliner, not the
 IR's.
 
@@ -547,10 +560,12 @@ first, because retrofitting SSA or effects later is a rewrite. What is deferred 
 
 - **Optimisation passes beyond the four always-on ones**: inlining, GVN/CSE, refcount-pair
   cancellation. Each is an addition to `optimize`'s loop, not a redesign.
-- **FBIP in-place reuse and escape analysis.** The two largest wins available to a refcounted
-  immutable language, and both are unbuilt in the IR. Reuse needs the `rc == 1`-at-last-use
-  query the refcount pass already computes liveness for; escape analysis needs a notion of a
-  stack-allocated value the emitter does not have yet.
+- **Escape analysis**, and the rest of in-place reuse. The sole-ownership rewrite
+  (`ir::unique`) now takes the loop-write case of FBIP reuse — `list::set` in a qualifying
+  loop is an O(1) in-place store, worth 35% on the brainfuck benchmark — but only for
+  uncounted elements and only round loops; general reuse (counted elements with a
+  displaced-value release, straight-line writes, maps) is open. Escape analysis needs a
+  notion of a stack-allocated value the emitter does not have yet.
 - **A second backend.** The seam is a module boundary today (see above) and becomes a trait
   when there are two implementations to abstract over. Building LLVM or Cranelift before C
   ran a program end to end would have been speculative.
