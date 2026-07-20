@@ -48,10 +48,13 @@ fn range(from: i64, to: i64) -> List[i64] {
     out
 }
 
-// The built-in collections, nominal and covariant in their arguments. Opaque: the
-// storage is native, reached only through `std::collections::{list, map}`.
-opaque record List[T] {}
-opaque record Map[K, V] {}
+// The built-in collections. They are DECLARED by the modules that implement them --
+// `std::collections::list` and `::map` -- and only re-exported here so `List[T]` needs no
+// `use`. Declaring them at the root instead made the root their opacity owner, and the
+// root is the user's own module path: every program could reach inside its own `List`.
+// See docs/design/opacity.md on the prelude/root path collision.
+use std::collections::list::List;
+use std::collections::map::Map;
 
 // ---- markers ----
 

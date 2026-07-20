@@ -1,0 +1,25 @@
+//@ compile-fail
+//@ error-contains: is opaque, so its field
+
+// The field-read door checks every nominal *leaf* of the base type, not just the
+// single-atom case. A union annotation is a legal flow — `Secret` fits
+// `Secret | {code: i64}` without using its contents — but reading a field through the
+// union projects it across both leaves, and one of them is a foreign opaque record.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    fn go(s: vault::Secret) -> i64 {
+        let v: vault::Secret | { code: i64 } = s;
+        v.code
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

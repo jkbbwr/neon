@@ -91,11 +91,11 @@ fn list_and_map_are_runtime_containers() {
     let mut ty = t();
     let i = ty.i64();
     let s = ty.str();
-    let list_name = ty.name("List");
+    let list_name = ty.name(crate::typecheck::env::Env::LIST);
     let list = ty.nominal(list_name, vec![i], vec![]);
     assert_eq!(repr_of(&ty, list), Repr::List(Box::new(Repr::I64)));
 
-    let map_name = ty.name("Map");
+    let map_name = ty.name(crate::typecheck::env::Env::MAP);
     let map = ty.nominal(map_name, vec![s, i], vec![]);
     assert_eq!(repr_of(&ty, map), Repr::Map(Box::new(Repr::Str), Box::new(Repr::I64)));
 }
@@ -332,7 +332,7 @@ fn normalize_union_reproduces_the_order_repr_of_derives() {
     let mut ty = t();
     let i = ty.i64();
     let s = ty.str();
-    let ln = ty.name("List");
+    let ln = ty.name(crate::typecheck::env::Env::LIST);
     let list = ty.nominal(ln, vec![i], vec![]);
     let tup = ty.tuple(vec![i, s]);
     let u = ty.union(list, tup);

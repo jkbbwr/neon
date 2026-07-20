@@ -1,0 +1,22 @@
+//@ exit: 101
+//
+// `assert` is an intrinsic, not a function, and this is the reason: a failure names the
+// expression that failed and the values it actually saw. A library `assert(cond)` receives
+// a bare `bool` and can only ever say "assertion failed".
+//
+// The passing assert runs first and the program prints, so the golden proves execution got
+// past an assertion that holds before dying on one that does not. "unreachable" must never
+// appear. The message itself goes to stderr, which this harness does not diff — the
+// message's *content* is pinned by `cli/tests/test_verb.rs`, which reads it.
+
+use std::io;
+
+fn double(x: i64) -> i64 { x * 2 }
+
+fn main() {
+    assert(double(21) == 42);
+    io::println("past the assertion that holds");
+
+    assert(1 + 1 == 3);
+    io::println("unreachable");
+}

@@ -5,16 +5,16 @@
 // This is the property that makes the feature usable rather than merely restrictive: a
 // handle travels wherever the program needs it and stays unforgeable the whole way.
 //
-// The rule is not "the declaring module alone". A module nested inside the declaring one
-// may reach in, because an `internal mod` is the implementation of the module around it
-// and cannot be barred from the type it exists to implement — `std::fs` builds its `File`
-// that way. The immediate parent may reach in too, for the mirror arrangement. Note the
-// nested type is never *named* from the root: `vault::inner::Secret`
-// does not resolve there, which is a separate module-path limitation, so `vault` hands
-// out its own single-level `Token` for the parts that need a type annotation.
-//
-// Both directions are exercised: a parent reaching into its child (`mint`), and a child
-// reaching into its parent (`inner::wrap`).
+// The rule is not "the declaring module alone", but it is close: an opaque record is
+// visible within its declaring module's SUBTREE and nowhere else. A module nested inside
+// the declaring one may reach in, because an `internal mod` is the implementation of the
+// module around it and cannot be barred from the type it exists to implement —
+// `std::fs::raw::guard` builds the `File` that `std::fs` declares, and `inner::wrap`
+// below is that same shape. A parent may NOT reach into a type its child declared; it
+// asks through a function the child exposes, exactly as `mint` does with `inner::value`.
+// Note the nested type is never *named* from the root: `vault::inner::Secret` does not
+// resolve there, which is a separate module-path limitation, so `vault` hands out its own
+// single-level `Token` for the parts that need a type annotation.
 
 use std::io;
 
@@ -25,17 +25,24 @@ internal mod vault {
         opaque record Secret { code: i64 }
         fn seal(n: i64) -> Secret { Secret { code: n } }
 
+        // The accessor its parent has to go through: `vault` cannot read `Secret`'s
+        // field itself, because a parent is outside its child's subtree.
+        fn value(s: Secret) -> i64 { s.code }
+
         // A nested module reaching *outward* into the module that contains it. This is
-        // the `internal mod raw` shape: the inner module is the implementation of the
-        // outer one, so it cannot be barred from the type it exists to implement --
-        // `std::fs` builds its `File` exactly here.
+        // the `internal mod raw` shape and the direction the stdlib actually uses: the
+        // inner module is the implementation of the outer one, so it cannot be barred
+        // from the type it exists to implement -- `std::fs::raw::guard` builds the
+        // `File` that `std::fs` declares, exactly here.
         fn wrap(n: i64) -> Token { Token { code: n } }
     }
 
-    // The immediate parent reaches inside its child: the `internal mod raw` shape.
+    // The parent asks through the child's accessor. Reading `s.code` directly here is
+    // rejected: `vault` is outside `vault::inner`'s subtree, and being its parent buys
+    // nothing.
     fn mint(n: i64) -> Token {
         let s = inner::seal(n);
-        Token { code: s.code }
+        Token { code: inner::value(s) }
     }
     fn value(t: Token) -> i64 { t.code }
     fn minted_inside(n: i64) -> Token { inner::wrap(n) }

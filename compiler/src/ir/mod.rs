@@ -47,7 +47,32 @@ pub fn compile(
     libs: &[(Vec<String>, &Module)],
     stage: Stage,
 ) -> Program {
-    let mut program = lower::lower_module(env, result, module, libs);
+    compile_with(env, result, module, libs, stage, false)
+}
+
+/// `compile`, for `neon test`: `test` blocks are lowered as functions instead of stripped.
+///
+/// Everything after lowering is the same pipeline. A test body is ordinary code and gets
+/// the same optimiser and the same refcount placement as any function — running tests
+/// against a program built by a second, gentler pipeline would test the wrong compiler.
+pub fn compile_tests(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &Module,
+    libs: &[(Vec<String>, &Module)],
+) -> Program {
+    compile_with(env, result, module, libs, Stage::Final, true)
+}
+
+fn compile_with(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &Module,
+    libs: &[(Vec<String>, &Module)],
+    stage: Stage,
+    tests: bool,
+) -> Program {
+    let mut program = lower::lower_module_with(env, result, module, libs, tests);
     if stage == Stage::Lowered {
         return program;
     }

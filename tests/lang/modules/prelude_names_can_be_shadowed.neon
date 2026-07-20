@@ -1,0 +1,28 @@
+// The prelude is in scope everywhere, but it does not *own* the namespace: a program may
+// declare its own `List` or `IndexError` and have that name win.
+//
+// This works because the prelude has a module path of its own (`Env::PRELUDE`) that
+// resolution consults LAST, after every scope the caller is actually in. It used to sit
+// at the root -- the program's own module path -- which made shadowing depend on how the
+// prelude happened to get the name: `IndexError` (declared there) could be shadowed,
+// while `List` (re-exported with `use`) could not, because prelude `use` bindings landed
+// in the program's own bucket ahead of the program's own. Both spellings are exercised
+// here, and both must behave the same way.
+//
+// The backend has to agree, and for a while it did not: it derived a type's identity and
+// its runtime tag from the BARE name, so the program's `List` and the stdlib's collided
+// in codegen even once the checker told them apart. Qualifying nominal identity closed
+// that (docs/design/identity.md).
+
+use std::io;
+
+record List { junk: i64 }
+record IndexError { note: str }
+
+fn main() {
+    let a = List { junk: 7 };
+    io::println(to_string(a.junk));
+
+    let b = IndexError { note: "mine" };
+    io::println(b.note);
+}

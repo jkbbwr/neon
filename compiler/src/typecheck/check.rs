@@ -70,6 +70,7 @@ pub fn check_all(
         lambda_returns: vec![],
         lambda_throws: vec![],
         capture_floors: vec![],
+        hidden_cache: std::collections::HashMap::new(),
     };
     for (path, m) in modules {
         c.decls(path, &m.decls);
@@ -148,6 +149,14 @@ struct Checker<'a> {
     /// scope begins. A name found in a frame below the innermost floor was captured,
     /// and assigning to a capture is an error -- the closure holds a private copy.
     capture_floors: Vec<usize>,
+    /// Per viewing module: the `#nominal` tags of opaque records that module may not
+    /// see into, each with its owner. This is `Env::foreign_opaque_tags` memoised —
+    /// the set is a function of the module alone, and the flow gate consults it on
+    /// every checked expression.
+    hidden_cache: std::collections::HashMap<
+        Vec<String>,
+        std::rc::Rc<std::collections::HashMap<super::types::NameId, Vec<String>>>,
+    >,
 }
 
 impl Checker<'_> {
@@ -181,11 +190,351 @@ impl Checker<'_> {
 
     /// `actual <: expected`, unless either is already poison — a checked
     /// expression that already produced a diagnostic must not produce a second.
-    fn assignable(&mut self, actual: TyId, expected: TyId) -> bool {
+    ///
+    /// This is also where opacity is enforced against the *type-directed* routes. The
+    /// syntactic doors (reading a field, building a literal, destructuring) are checked
+    /// where they are written; but `Secret <: {code: i64}` is simply true — nominal
+    /// satisfies structural by design — so a value could walk out through any position
+    /// with a structural expected type: an argument, an annotation, a return, a record
+    /// field, a list element, a lambda's parameter. All of those flows funnel through
+    /// here, so here is where the question is asked a second time with the foreign
+    /// opaque records' contents erased (`Types::seal`): if the subtyping only held by
+    /// using those contents, the flow is the module reaching inside, and it is reported
+    /// as exactly that — once, here, which is why this returns `true` after reporting
+    /// rather than letting the caller add a generic mismatch on top.
+    fn assignable(&mut self, module: &[String], span: &Span, actual: TyId, expected: TyId) -> bool {
         if self.env.is_error(actual) || self.env.is_error(expected) {
             return true;
         }
-        self.env.solver.is_subtype(actual, expected)
+        if !self.env.solver.is_subtype(actual, expected) {
+            return false;
+        }
+        if let Some((record, owner)) = self.opaque_flow(module, actual, expected) {
+            self.report_opacity(
+                module,
+                span.clone(),
+                &record,
+                "it can be viewed as a structural type",
+                owner,
+            );
+        }
+        true
+    }
+
+    /// The tags `module` may not see into, memoised per module.
+    fn hidden(
+        &mut self,
+        module: &[String],
+    ) -> std::rc::Rc<std::collections::HashMap<super::types::NameId, Vec<String>>> {
+        if let Some(h) = self.hidden_cache.get(module) {
+            return h.clone();
+        }
+        let h = std::rc::Rc::new(self.env.foreign_opaque_tags(module));
+        self.hidden_cache.insert(module.to_vec(), h.clone());
+        h
+    }
+
+    /// Whether flowing a value of type `actual` into a position expecting `expected`
+    /// would use the contents of an opaque record `module` may not see into. `None`
+    /// when the flow is clean; otherwise the offending record's name and owner.
+    ///
+    /// The test: seal both sides — erase the hidden records' user fields — and re-ask
+    /// the subtyping. Sealing both sides is what keeps naming the type legal (`Secret`
+    /// flows into `Secret`, sealed into sealed, and the erasure cancels), while a
+    /// structural view fails: the sealed value no longer promises the fields the view
+    /// requires. Contravariance is covered by the same mechanism, because `seal`
+    /// rewrites arrows' parameters too — a `({code: i64}) -> i64` lambda no longer
+    /// passes as a `(Secret) -> i64`.
+    fn opaque_flow(
+        &mut self,
+        module: &[String],
+        actual: TyId,
+        expected: TyId,
+    ) -> Option<(String, Vec<String>)> {
+        let hidden = self.hidden(module);
+        if hidden.is_empty() {
+            return None;
+        }
+        let tags: std::collections::HashSet<super::types::NameId> =
+            hidden.keys().copied().collect();
+        let t = &mut self.env.solver.t;
+        if !t.mentions(actual, &tags) && !t.mentions(expected, &tags) {
+            return None;
+        }
+        let sa = t.seal(actual, &tags);
+        let se = t.seal(expected, &tags);
+        if self.env.solver.is_subtype(sa, se) {
+            return None;
+        }
+        Some(self.offending(&hidden, &tags, actual, expected))
+    }
+
+    /// The cast-shaped variant of `opaque_flow`. A cast may go up *or* down, so the
+    /// sealed requirement is subsumption in either direction — or a newtype bridge that
+    /// still holds once the representations are sealed, which is what keeps `s as Wrap`
+    /// legal for a caller's own `newtype Wrap = vault::Secret` while rejecting the
+    /// laundering `newtype W = {code: i64}; s as W`.
+    ///
+    /// Casting *to* a foreign opaque is its own case, checked first. A value of the
+    /// target type must contain an opaque the module cannot construct, so the source
+    /// has to *already name* it — otherwise the cast is fabricating one. This is what
+    /// the sealed-subsumption test below cannot see: `any as Secret` passes it, because
+    /// `sealed Secret <: any` holds (the branch that legitimately permits the widening
+    /// `s as any`), so the same allowance green-lights the narrowing forge. `mentions`
+    /// on the source is the honest line between recovering a `Secret` you hold — from a
+    /// `Secret | str`, say — and conjuring one from a wildcard `any` or a bare shape.
+    /// The cost is that recovering an opaque from an `any` that has erased its identity
+    /// is refused: carry it as `Secret`, not as `any`.
+    fn opaque_view(
+        &mut self,
+        module: &[String],
+        from: TyId,
+        to: TyId,
+    ) -> Option<(String, Vec<String>, &'static str)> {
+        let hidden = self.hidden(module);
+        if hidden.is_empty() {
+            return None;
+        }
+        let tags: std::collections::HashSet<super::types::NameId> =
+            hidden.keys().copied().collect();
+        // Forgery: the target produces an opaque the source cannot vouch for.
+        //
+        // Two ways a source vouches. It may *name* the opaque — `Secret | str as Secret`
+        // is narrowing a value that provably holds one. Or it may be broad enough to
+        // have legitimately held one: `any` admits every value, and widening an opaque
+        // into `any` is a legal flow, so `(a: any) as List[i64]` is a *recovery* and is
+        // the pinned erased-round-trip idiom (types/list_literal_erased_into_any_-
+        // recovered.neon). A structural source is neither: outside the owner, the
+        // assignable gate refuses `Secret -> {code: i64}`, so a `{code: i64}` value
+        // provably never held a `Secret` and casting it to one is fabrication.
+        //
+        // `seal(to) <: from` is that second test exactly — sealed, so it asks whether the
+        // source admits the opaque's *identity*, not its contents.
+        //
+        // What this deliberately does not do is make an unguarded `(a: any) as Secret`
+        // safe. That cast is unchecked at run time — a general `as`-from-`any` hole, not
+        // an opacity one — and the language's answer is `is` before `as`, where `is`
+        // does compare nominal tags. Closing it belongs with the runtime tag check; see
+        // docs/design/opacity.md.
+        let sealed_to = self.env.solver.t.seal(to, &tags);
+        let recovers = self.env.solver.is_subtype(sealed_to, from);
+        for &tag in &tags {
+            let single: std::collections::HashSet<_> = [tag].into();
+            if self.env.solver.t.mentions(to, &single)
+                && !self.env.solver.t.mentions(from, &single)
+                && !recovers
+            {
+                let record = self.env.solver.t.name_str(tag).to_string();
+                let owner = hidden.get(&tag).cloned().unwrap_or_default();
+                return Some((record, owner, "it can be built"));
+            }
+        }
+        {
+            let t = &self.env.solver.t;
+            if !t.mentions(from, &tags) && !t.mentions(to, &tags) {
+                return None;
+            }
+        }
+        let sf = self.env.solver.t.seal(from, &tags);
+        let st = self.env.solver.t.seal(to, &tags);
+        let ok = self.env.solver.is_subtype(sf, st)
+            || self.env.solver.is_subtype(st, sf)
+            || self.sealed_bridge(from, to, &tags)
+            || self.sealed_bridge(to, from, &tags);
+        if ok {
+            return None;
+        }
+        let (record, owner) = self.offending(&hidden, &tags, from, to);
+        Some((record, owner, "it can be cast to a structural view"))
+    }
+
+    /// `newtype_bridges`, re-asked with both the newtype's representation and the other
+    /// side sealed: the wrap or unwrap is legal only if it does not depend on the hidden
+    /// contents.
+    fn sealed_bridge(
+        &mut self,
+        nt: TyId,
+        other: TyId,
+        tags: &std::collections::HashSet<super::types::NameId>,
+    ) -> bool {
+        let label = self.env.solver.t.name("#inner");
+        // `Present` only: a real newtype declares `#inner` on its one atom. An open
+        // structural type also *projects* the label — its `rest` admits anything, so the
+        // projection comes back `Partial(any)` — and accepting that here made any open
+        // struct a "newtype bridge" to anything, which is exactly the laundering this
+        // check exists to refuse.
+        let Projected::Present(inner) = narrow::project_field(&mut self.env.solver, nt, label)
+        else {
+            return false;
+        };
+        let si = self.env.solver.t.seal(inner, tags);
+        let so = self.env.solver.t.seal(other, tags);
+        self.env.solver.is_subtype(si, so) || self.env.solver.is_subtype(so, si)
+    }
+
+    /// The opacity gate for a dispatched call. Dispatch chooses impls by *overlap* with
+    /// the receiver, not through `assignable`, so a receiver holding a foreign opaque
+    /// record can select an impl written for a structural type — `impl Peek for
+    /// {code: i64}` applies to a `Secret`, and the impl's body then reads the field
+    /// legitimately from its own point of view. The chosen impl's target is a view the
+    /// receiver flows into, so each chosen target gets the member-wise sealed question.
+    fn dispatch_gate(
+        &mut self,
+        module: &[String],
+        span: &Span,
+        sel: &dispatch::Selection,
+        args: &[TyId],
+    ) {
+        let Some(i) = sel.receiver_pos else { return };
+        let Some(&recv) = args.get(i) else { return };
+        let targets: Vec<TyId> = match &sel.resolution {
+            dispatch::Resolution::Direct(id) => {
+                self.env.impls()[id.0].target.into_iter().collect()
+            }
+            dispatch::Resolution::Switch(arms) => arms
+                .iter()
+                .filter_map(|&(_, id)| self.env.impls()[id.0].target)
+                .collect(),
+            dispatch::Resolution::Bound { .. } => vec![],
+        };
+        for target in targets {
+            self.member_gate(
+                module,
+                span,
+                recv,
+                target,
+                "it can satisfy an impl for a structural type",
+            );
+        }
+    }
+
+    /// The opacity gate for a discharged `where T: P` bound: inside the callee the
+    /// bound resolves at run time to whichever impl of `P` covers the concrete type,
+    /// so every covering impl's target is a view the value flows into.
+    fn bound_gate(
+        &mut self,
+        module: &[String],
+        span: &Span,
+        concrete: TyId,
+        pid: super::env::ProtocolId,
+    ) {
+        let targets: Vec<TyId> =
+            self.env.impls_of(pid).filter_map(|(_, i)| i.target).collect();
+        for target in targets {
+            self.member_gate(
+                module,
+                span,
+                concrete,
+                target,
+                "it can satisfy an impl for a structural type",
+            );
+        }
+    }
+
+    /// The member-wise sealed question: may each foreign opaque record among `value`'s
+    /// leaves be seen through `view`?
+    ///
+    /// This is deliberately *not* `seal(value) <: seal(view)`. Where `value` is already
+    /// an intersection — a dispatch arm, a bound's covered part, a narrowed binding —
+    /// the whole-type question is vacuous: `Secret ∧ {code: i64} <: {code: i64}` holds
+    /// sealed or not, because the structural conjunct carries the answer by itself. The
+    /// non-vacuous question is about the opaque *member*: take each hidden-tagged atom
+    /// in `value`'s leaves as the full type it denotes, and require that member, sealed,
+    /// to still fit the sealed view. `Secret` fits `Secret`, `any`, and `Secret | X`;
+    /// it does not fit `{code: i64}` once its contents are erased.
+    fn member_gate(
+        &mut self,
+        module: &[String],
+        span: &Span,
+        value: TyId,
+        view: TyId,
+        what: &str,
+    ) {
+        let hidden = self.hidden(module);
+        if hidden.is_empty() {
+            return;
+        }
+        let tags: std::collections::HashSet<super::types::NameId> =
+            hidden.keys().copied().collect();
+        let members = self.hidden_members(value, &tags);
+        for (tag, member) in members {
+            let meet = self.env.solver.t.intersect(member, view);
+            if self.env.solver.is_empty(meet) {
+                continue;
+            }
+            let sm = self.env.solver.t.seal(member, &tags);
+            let sv = self.env.solver.t.seal(view, &tags);
+            if self.env.solver.is_subtype(sm, sv) {
+                continue;
+            }
+            let record = self.env.solver.t.name_str(tag).to_string();
+            let owner = hidden.get(&tag).cloned().unwrap_or_default();
+            self.report_opacity(module, span.clone(), &record, what, owner);
+        }
+    }
+
+    /// The hidden-tagged record atoms among `ty`'s positive leaves, each as the
+    /// single-atom type it denotes. One entry per distinct atom.
+    fn hidden_members(
+        &mut self,
+        ty: TyId,
+        tags: &std::collections::HashSet<super::types::NameId>,
+    ) -> Vec<(super::types::NameId, TyId)> {
+        let mut atom_ids: Vec<u32> = Vec::new();
+        {
+            let t = &self.env.solver.t;
+            let d = t.data(ty);
+            for (pos, _) in t.rec_bdd.paths(d.records) {
+                for i in pos {
+                    let tag = t.rec_atoms[i as usize].get(t.nominal_label);
+                    let atoms = t.atomset_of(t.data(tag).atoms);
+                    if !atoms.neg
+                        && atoms.names.len() == 1
+                        && tags.contains(&atoms.names[0])
+                        && !atom_ids.contains(&i)
+                    {
+                        atom_ids.push(i);
+                    }
+                }
+            }
+        }
+        atom_ids
+            .into_iter()
+            .map(|i| {
+                let a = self.env.solver.t.rec_atoms[i as usize].clone();
+                let tag = self.env.solver.t.rec_atoms[i as usize].get(self.env.solver.t.nominal_label);
+                let name = {
+                    let t = &self.env.solver.t;
+                    t.atomset_of(t.data(tag).atoms).names[0]
+                };
+                let member = self.env.solver.t.record(a);
+                (name, member)
+            })
+            .collect()
+    }
+
+    /// Which hidden record to blame in a diagnostic: the first one the value's own type
+    /// mentions, or failing that (the contravariant case, where the *expected* side
+    /// names the record) the first the expected type mentions.
+    fn offending(
+        &mut self,
+        hidden: &std::collections::HashMap<super::types::NameId, Vec<String>>,
+        tags: &std::collections::HashSet<super::types::NameId>,
+        actual: TyId,
+        expected: TyId,
+    ) -> (String, Vec<String>) {
+        let t = &self.env.solver.t;
+        // Sorted by name so the blamed record is deterministic when several qualify.
+        let mut names: Vec<_> = tags.iter().copied().collect();
+        names.sort_by_key(|&n| t.name_str(n).to_string());
+        for n in names {
+            let single: std::collections::HashSet<_> = [n].into();
+            if t.mentions(actual, &single) || t.mentions(expected, &single) {
+                let owner = hidden.get(&n).cloned().unwrap_or_default();
+                return (t.name_str(n).to_string(), owner);
+            }
+        }
+        (String::new(), vec![])
     }
 
     // ---- declarations ----
@@ -472,7 +821,10 @@ impl Checker<'_> {
                 match path {
                     Some(q) => self.check_opaque_path(
                         module, p.span.clone(), q, "it can be destructured"),
-                    None => if let Some(n) = self.nominal_of(t) {
+                    // Every nominal leaf, not just the single-atom case: destructuring
+                    // a union or a narrowed intersection projects fields across all of
+                    // its record leaves, exactly like a field read.
+                    None => for n in self.nominal_leaves(t) {
                         self.check_opaque_name(
                             module, p.span.clone(), &n, "it can be destructured")
                     },
@@ -497,6 +849,15 @@ impl Checker<'_> {
                 if self.result.tested(p.id).is_none() {
                     let scope = self.type_scope(module);
                     let tested = self.env.resolve(&scope, spec);
+                    // Same rule as `ExprKind::Is`: a nested structural test on an
+                    // opaque-holding field is introspection.
+                    self.member_gate(
+                        module,
+                        &p.span,
+                        t,
+                        tested,
+                        "it can be tested against a structural view",
+                    );
                     self.result.set_tested(p.id, tested);
                 }
             }
@@ -553,7 +914,7 @@ impl Checker<'_> {
     fn expr(&mut self, module: &[String], e: &Expr, expected: Option<TyId>) -> TyId {
         let t = self.infer(module, e, expected);
         if let Some(want) = expected {
-            if !self.assignable(t, want) {
+            if !self.assignable(module, &e.span, t, want) {
                 let (found, expect) = (self.show(t), self.show(want));
                 self.error(e.span.clone(), TypeErrorKind::Mismatch { expected: expect, found });
             } else if let (Some(a), Some(w)) = (
@@ -613,7 +974,10 @@ impl Checker<'_> {
                         let t = self.expr(module, inner, None);
                         if !self.env.is_error(t) {
                             match dispatch::resolve(self.env, "to_string", None, &[t], None) {
-                                Ok(sel) => self.result.set_call(inner.id, sel.resolution),
+                                Ok(sel) => {
+                                    self.dispatch_gate(module, &inner.span, &sel, &[t]);
+                                    self.result.set_call(inner.id, sel.resolution)
+                                }
                                 Err(err) => self.dispatch_error(inner.span.clone(), err),
                             }
                         }
@@ -671,7 +1035,10 @@ impl Checker<'_> {
                         } else {
                             self.env.solver.t.union_all(&elem_tys)
                         };
-                        let name = self.env.solver.t.name("List");
+                        // A list literal builds the SAME nominal the declaration does, so
+                        // it must use the same qualified identity -- a bare "List" here
+                        // would make `[1,2,3]` a different type from `List[i64]`.
+                        let name = self.env.solver.t.name(super::env::Env::LIST);
                         self.env.solver.t.nominal(name, vec![elem], vec![])
                     }
                 }
@@ -684,9 +1051,21 @@ impl Checker<'_> {
             ExprKind::Block(b) => self.block(module, b, expected),
 
             ExprKind::Is { lhs, ty } => {
-                self.expr(module, lhs, None);
+                let subject = self.expr(module, lhs, None);
                 let scope = self.type_scope(module);
                 let tested = self.env.resolve(&scope, ty);
+                // Testing an opaque value against a structural view is introspection —
+                // and worse, in a match arm the test *narrows*, baking the structural
+                // atom into the binding's type where the flow gate can no longer tell
+                // it from honest knowledge. Naming the record (`is Secret`) stays
+                // legal; probing its shape (`is {code: i64}`) does not.
+                self.member_gate(
+                    module,
+                    &e.span,
+                    subject,
+                    tested,
+                    "it can be tested against a structural view",
+                );
                 // The resolution is the answer lowering needs and cannot compute: the
                 // written path is a head name, and `List[i64]` and `List[str]` share one.
                 self.result.set_tested(e.id, tested);
@@ -711,6 +1090,21 @@ impl Checker<'_> {
                     self.error(e.span.clone(), TypeErrorKind::ImpossibleCast { from: f, to: t });
                     return self.poison();
                 }
+                // A cast is a flow like any other, but `expr`'s gate never sees it: the
+                // legality test above is overlap, not subtyping, and overlap survives
+                // sealing — a sealed `Secret` still meets `{code: i64}`, because open
+                // records always meet. So the opacity question is asked here in the
+                // cast's own terms: sealed, one side must still subsume the other (or a
+                // newtype bridge must still hold on sealed representations). `s as
+                // Secret` and `s as any` pass — the erasure cancels or the target
+                // absorbs it — while `s as {code: i64}` holds only through the contents
+                // and is the module reaching inside.
+                if !self.env.is_error(from) {
+                    if let Some((record, owner, what)) = self.opaque_view(module, from, to) {
+                        self.report_opacity(module, e.span.clone(), &record, what, owner);
+                        return self.poison();
+                    }
+                }
                 to
             }
 
@@ -733,7 +1127,7 @@ impl Checker<'_> {
 
             ExprKind::Throw(x) => {
                 let t = self.expr(module, x, None);
-                self.note_throw(x.span.clone(), t, false);
+                self.note_throw(module, x.span.clone(), t, false);
                 self.env.solver.t.never()
             }
 
@@ -1015,6 +1409,18 @@ impl Checker<'_> {
         // held in a variable still flows by width subtyping -- this excess check is
         // TypeScript's, and it is why a literal differs from a value here.
         if let Some(target_fields) = expected.and_then(|exp| self.record_fields(exp)) {
+            // An anonymous literal filling a nominal expected type *builds* that
+            // nominal — the same act as writing its name, minus the name. For a
+            // foreign opaque record that is forgery by annotation (`let s:
+            // vault::Secret = { code: 99 }`), and it never passes the flow gate:
+            // this branch returns the expected type itself, so `expr` compares
+            // `Secret` to `Secret`. Ask by the target's name here, exactly as the
+            // named-literal path above does.
+            if let Some(exp) = expected {
+                for n in self.nominal_leaves(exp) {
+                    self.check_opaque_name(module, e.span.clone(), &n, "it can be built");
+                }
+            }
             self.check_record_fields(module, e, fields, spread, &target_fields);
             return expected.expect("target present");
         }
@@ -1059,7 +1465,7 @@ impl Checker<'_> {
                     let want = *want;
                     let got = self.infer(module, &f.value, Some(want));
                     self.result.set_ty(f.value.id, got);
-                    if !self.assignable(got, want) {
+                    if !self.assignable(module, &f.value.span, got, want) {
                         let (expected, found) = (self.show(want), self.show(got));
                         self.error(
                             f.value.span.clone(),
@@ -1140,7 +1546,7 @@ impl Checker<'_> {
         for (name, got) in &given {
             if let Some((_, tmpl)) = tfields.iter().find(|(n, _)| n == name) {
                 let want = self.env.solver.t.substitute(*tmpl, &subst);
-                if !self.assignable(*got, want) {
+                if !self.assignable(module, &e.span, *got, want) {
                     let (g, w) = (self.show(*got), self.show(want));
                     self.error(e.span.clone(), TypeErrorKind::Mismatch { expected: w, found: g });
                 }
@@ -1213,7 +1619,7 @@ impl Checker<'_> {
     /// be caught or propagated; from a call outside any `try` it is a bare throwing
     /// call, a compile error; from a `throw` statement outside a `try` it propagates
     /// to the enclosing function's declared `throws`.
-    fn note_throw(&mut self, span: Span, throws: TyId, from_call: bool) {
+    fn note_throw(&mut self, module: &[String], span: Span, throws: TyId, from_call: bool) {
         let never = self.env.solver.t.never();
         if self.env.is_error(throws) || throws == never {
             return;
@@ -1245,7 +1651,7 @@ impl Checker<'_> {
                         Some(Throws::Declared(t)) => t,
                         _ => never,
                     };
-                    if !self.assignable(throws, want) {
+                    if !self.assignable(module, &span, throws, want) {
                         let (t, w) = (self.show(throws), self.show(want));
                         self.error(span, TypeErrorKind::Throws { thrown: t, declared: w });
                     }
@@ -1309,7 +1715,7 @@ impl Checker<'_> {
         match form {
             // Propagate: the errors become the enclosing function's to declare.
             ast::TryForm::Propagate => {
-                self.note_throw(body.span.clone(), caught, false);
+                self.note_throw(module, body.span.clone(), caught, false);
                 val
             }
             // Soften: a failure yields null instead.
@@ -1367,23 +1773,6 @@ impl Checker<'_> {
             && d.records != super::bdd::FALSE
     }
 
-    /// The nominal name of a type, when it is exactly one named record atom. This is
-    /// the same question `ir::repr::nominal_name` asks of a lowered type, asked here of
-    /// a checked one.
-    fn nominal_of(&self, ty: TyId) -> Option<String> {
-        let t = &self.env.solver.t;
-        let d = t.data(ty);
-        match t.rec_bdd.paths(d.records).as_slice() {
-            [(pos, neg)] if neg.is_empty() && pos.len() == 1 => {
-                let tag = t.rec_atoms[pos[0] as usize].get(t.nominal_label);
-                let atoms = t.atomset_of(t.data(tag).atoms);
-                (!atoms.neg && atoms.names.len() == 1)
-                    .then(|| t.name_str(atoms.names[0]).to_string())
-            }
-            _ => None,
-        }
-    }
-
     /// Reject reaching inside an `opaque` record from outside the module that owns it.
     ///
     /// The three ways in are reading a field, building a literal, and destructuring a
@@ -1397,36 +1786,6 @@ impl Checker<'_> {
         self.report_opacity(module, span, name, what, owner);
     }
 
-    /// Whether code in `module` may reach inside a record declared in `owner`.
-    ///
-    /// Three cases, and each is load-bearing:
-    ///
-    /// - the declaring module itself, obviously;
-    /// - **anything nested inside it**, because an `internal mod` is the implementation of
-    ///   the module around it and cannot implement a type it may not touch — `std::fs`
-    ///   builds its `File` inside `internal mod raw`;
-    /// - its **immediate parent**, for the mirror arrangement where the inner module
-    ///   declares the handle and the outer one implements the API over it.
-    ///
-    /// Only one level upward. Opacity that leaked to every ancestor would reach the root,
-    /// where every program's own module lives, and mean nothing.
-    ///
-    /// The root is not a container here, and that exception is the whole reason this is a
-    /// named function rather than an expression. The prelude's module path is `[]`, so
-    /// "nested inside the owner" is true of *every* module in the program — a
-    /// prelude-declared opaque record would be readable everywhere, which is the opposite
-    /// of what it asks for. The cost is that a record declared at a program's own root
-    /// cannot be reached from a module nested in it; the prelude and the user's root
-    /// currently share one path, so there is no way to permit the second without the
-    /// first. Giving the prelude a path of its own removes the exception.
-    fn opacity_permits(module: &[String], owner: &[String]) -> bool {
-        let nested_in_owner =
-            !owner.is_empty() && module.len() >= owner.len() && module[..owner.len()] == *owner;
-        let same = module == owner;
-        let immediate_parent = owner.len() == module.len() + 1 && owner[..module.len()] == *module;
-        same || nested_in_owner || immediate_parent
-    }
-
     /// The same rule for a record the source *names*, where the written path resolves
     /// unambiguously and no fallback is needed.
     fn check_opaque_path(&mut self, module: &[String], span: Span, path: &[String], what: &str) {
@@ -1438,15 +1797,16 @@ impl Checker<'_> {
 
     /// The visibility rule itself, shared by both entry points so they cannot drift.
     ///
-    /// `owner` is the module that declared the record. Access is allowed from that module,
-    /// from anything **nested inside** it, and from its immediate parent — and nowhere
-    /// else, so not from a sibling and not from a grandparent. `opacity_permits` is where
-    /// the three cases are spelled out and justified; this doc previously named only two
-    /// of them, which is the drift that comment is there to prevent.
+    /// `owner` is the module that declared the record. Access is allowed from that module
+    /// and from anything **nested inside** it — its subtree — and nowhere else: not from a
+    /// sibling, not from the root, and **not from its parent**. `opacity_permits` is where
+    /// the two cases are spelled out and justified.
     ///
-    /// Both directions carry weight, and `std::fs` needs each. Its `internal mod raw`
-    /// reaches *outward* to build the `File` its parent declares, and the module above
-    /// reaches *inward* to the descriptor `raw` wraps.
+    /// One direction carries the weight, and it is the *outward* one: `std::fs`'s
+    /// `internal mod raw` reaches out to build the `File` its parent declares. This doc
+    /// used to claim the inward direction too — a parent reaching into its child — and
+    /// credited `std::fs` with it; that was simply wrong about which branch the stdlib
+    /// uses, and the branch has since been removed.
     ///
     /// An empty owner path is the prelude, which has no name to print.
     fn report_opacity(
@@ -1457,7 +1817,7 @@ impl Checker<'_> {
         what: &str,
         owner: Vec<String>,
     ) {
-        if Self::opacity_permits(module, &owner) {
+        if super::env::opacity_permits(module, &owner) {
             return;
         }
         let shown = if owner.is_empty() { "the prelude".to_string() } else { owner.join("::") };
@@ -1473,9 +1833,42 @@ impl Checker<'_> {
 
     /// The field-read entry point: the record is whatever the base expression turned out
     /// to be, so the name has to come from the type rather than from syntax.
+    ///
+    /// Every nominal *leaf* of the type is checked, not just the single-atom case a
+    /// `nominal_of` would catch. A union (`Secret | {code: i64}`) and an intersection
+    /// (what a narrowed match arm binds) both project the field across their record
+    /// leaves, so a foreign opaque record anywhere among them makes the read an
+    /// introspection — reading around it would still reveal which fields it has.
     fn check_opacity(&mut self, module: &[String], span: Span, ty: TyId, field: &str) {
-        let Some(name) = self.nominal_of(ty) else { return };
-        self.check_opaque_name(module, span, &name, &format!("its field `{field}` is readable"));
+        for name in self.nominal_leaves(ty) {
+            self.check_opaque_name(
+                module,
+                span.clone(),
+                &name,
+                &format!("its field `{field}` is readable"),
+            );
+        }
+    }
+
+    /// The nominal names appearing positively among a type's record leaves — one per
+    /// distinct `#nominal` singleton tag, across every union arm and intersection part.
+    fn nominal_leaves(&self, ty: TyId) -> Vec<String> {
+        let t = &self.env.solver.t;
+        let d = t.data(ty);
+        let mut out: Vec<String> = Vec::new();
+        for (pos, _) in t.rec_bdd.paths(d.records) {
+            for i in pos {
+                let tag = t.rec_atoms[i as usize].get(t.nominal_label);
+                let atoms = t.atomset_of(t.data(tag).atoms);
+                if !atoms.neg && atoms.names.len() == 1 {
+                    let n = t.name_str(atoms.names[0]).to_string();
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The declared fields of a record type -- the user-written ones, dropping the
@@ -1616,7 +2009,7 @@ impl Checker<'_> {
             _ => {
                 let l = self.expr(module, lhs, None);
                 let r = self.expr(module, rhs, None);
-                if !self.assignable(r, l) && !self.assignable(l, r) {
+                if !self.assignable(module, &e.span, r, l) && !self.assignable(module, &e.span, l, r) {
                     let (a, b) = (self.show(l), self.show(r));
                     self.error(e.span.clone(), TypeErrorKind::Mismatch { expected: a, found: b });
                     return self.poison();
@@ -1805,6 +2198,17 @@ impl Checker<'_> {
             }
             ast::PatternKind::Is(spec) => {
                 let t = self.env.resolve(&scope, spec);
+                // A structural test on an opaque-holding subject is introspection, and
+                // its narrowing would intersect the structural atom into the binding —
+                // past the point where the flow gate could still see whose contents it
+                // was. See `ExprKind::Is`.
+                self.member_gate(
+                    module,
+                    &arm.pat.span,
+                    subject,
+                    t,
+                    "it can be tested against a structural view",
+                );
                 self.result.set_tested(arm.pat.id, t);
                 Some(narrow::Test::exact(t))
             }
@@ -1951,6 +2355,7 @@ impl Checker<'_> {
 
         match dispatch::resolve(self.env, &name, qualified, &arg_tys, expected) {
             Ok(s) => {
+                self.dispatch_gate(module, &e.span, &s, &arg_tys);
                 if let dispatch::Resolution::Bound { param, protocol } = &s.resolution {
                     let ok = self.bounds.iter().any(|(n, p)| {
                         n == param && self.env.protocol_extends(*p, *protocol)
@@ -1964,7 +2369,7 @@ impl Checker<'_> {
                     }
                 }
                 self.result.set_call(e.id, s.resolution.clone());
-                self.note_throw(e.span.clone(), s.throws, true);
+                self.note_throw(module, e.span.clone(), s.throws, true);
                 s.ret
             }
             Err(err) => {
@@ -2017,7 +2422,7 @@ impl Checker<'_> {
             for a in args.iter().skip(sig.params.len()) {
                 self.expr(module, a, None);
             }
-            self.note_throw(e.span.clone(), sig.throws, true);
+            self.note_throw(module, e.span.clone(), sig.throws, true);
             return sig.ret;
         }
 
@@ -2065,6 +2470,15 @@ impl Checker<'_> {
                     TypeErrorKind::UnsatisfiedBound { ty, protocol: name }
                 };
                 self.error(e.span.clone(), kind);
+            } else if !self.env.protocol(pid).is_marker {
+                // Satisfied — but through which impls? Inside the callee the bound
+                // resolves as `Resolution::Bound` and runs whatever impl covers the
+                // concrete type at run time, so a bound discharged through an impl for
+                // a structural type is the dispatch back door one call further out:
+                // `where T: Peek` with `impl Peek for {code: i64}` accepts a `Secret`
+                // and hands it to that impl. Every covering impl target is a view the
+                // value flows into; gate each.
+                self.bound_gate(module, &e.span, concrete, pid);
             }
         }
         for (a, (_, template)) in args.iter().zip(&sig.params) {
@@ -2075,7 +2489,7 @@ impl Checker<'_> {
             self.expr(module, a, None);
         }
         let throws = self.env.solver.t.substitute(sig.throws, &subst);
-        self.note_throw(e.span.clone(), throws, true);
+        self.note_throw(module, e.span.clone(), throws, true);
         self.env.solver.t.substitute(sig.ret, &subst)
     }
 
@@ -2152,7 +2566,7 @@ impl Checker<'_> {
         }
         // A call through a value throws what its arrow says — same rule as a direct
         // call: bare outside a `try`, it is an error; inside one, it lands in the sink.
-        self.note_throw(e.span.clone(), arrow.throws, true);
+        self.note_throw(module, e.span.clone(), arrow.throws, true);
         arrow.ret
     }
 

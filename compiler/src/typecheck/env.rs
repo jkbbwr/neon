@@ -590,11 +590,18 @@ pub struct Env {
     /// Fully qualified name -> declaration. Flat, so `qualify` and `candidates` are the
     /// only things that know what a module means.
     decls: HashMap<String, TypeDecl>,
-    /// Module key -> (bound name, full path).
-    uses: HashMap<String, Vec<(String, String)>>,
+    /// Module key -> (declaring unit, bound name, full path).
+    ///
+    /// The unit is what keeps one compilation unit's imports out of another's
+    /// resolution. Every module's scope walk bottoms out at `""`, which is the *root
+    /// application's* scope, so without this a program's root `use` was consulted while
+    /// resolving names inside the stdlib: `use mine::List` at a program's root made
+    /// `std::string`'s own `List[str]` resolve to the program's record. See
+    /// `push_scope_candidates`.
+    uses: HashMap<String, Vec<(usize, String, String)>>,
     /// `use x::*` — prefixes whose contents are visible unqualified. Lower priority
     /// than an explicit binding.
-    glob_uses: HashMap<String, Vec<String>>,
+    glob_uses: HashMap<String, Vec<(usize, String)>>,
     protocols: Vec<Protocol>,
     protocol_ids: HashMap<String, ProtocolId>,
     impls: Vec<ImplDef>,
@@ -623,6 +630,10 @@ pub struct Env {
     /// outright — an uncontractive `mu` has no fixed point, so unfolding it would not
     /// terminate — and the declaration has already been reported, so uses stay silent.
     mu_bad: Vec<String>,
+    /// The entry index of the root application — the module compiled at path `[]`. Its
+    /// scope is `""`, which every other module's ancestor walk passes through, so this is
+    /// what lets resolution tell "the program's own root" from "an ancestor scope".
+    root_unit: Option<usize>,
     /// Nesting depth of `instantiate`, against `MAX_DEPTH`. Not the same guard as
     /// `active`: that catches a cycle that returns to the same arguments, this catches
     /// polymorphic recursion, which reaches *fresh* arguments every time and so never
@@ -661,6 +672,7 @@ impl Env {
             internal_modules: vec![],
             module_unit: HashMap::new(),
             mu_bad: vec![],
+            root_unit: None,
             depth: 0,
             error_ty,
             unit: Unit::RootApplication,
@@ -693,6 +705,19 @@ impl Env {
             // The unit's own prefix is claimed first, so a *later* unit declaring a
             // `mod` at that path is the one reported.
             env.module_unit.entry(prefix.join("::")).or_insert(n);
+            if prefix.is_empty() {
+                env.root_unit.get_or_insert(n);
+            }
+            // Claim the ancestors too, so a program cannot squat an intermediate path a
+            // library merely passes through. `std::fs` and `std::path` both imply that
+            // `std` is spoken for, but nothing occupies it alone, so `mod std { .. }` in
+            // a program was accepted -- a namespace claim today, and an access grant the
+            // day anything is declared at that path. All of a library's ancestors share
+            // one owner because the units here are FILES: making them claim `std`
+            // individually just makes the stdlib collide with itself.
+            for k in 1..prefix.len() {
+                env.module_unit.entry(prefix[..k].join("::")).or_insert(Self::LIBRARY_OWNER);
+            }
             env.declare(prefix, &m.decls, n);
         }
         env.check_contractivity();
@@ -993,7 +1018,9 @@ impl Env {
                     if let Some(sym) =
                         r.annotations.iter().find(|a| a.name == "runtime").and_then(|a| a.arg.clone())
                     {
-                        self.solver.t.runtime_types.insert(r.name.clone(), sym);
+                        // Keyed by the qualified name, because `repr.rs` looks it up with
+                        // the `#nominal` tag, which is now qualified.
+                        self.solver.t.runtime_types.insert(qualify(module, &r.name), sym);
                     }
                     self.declare_type(module, d.span.clone(), Sort::Record(r.clone()))
                 }
@@ -1033,8 +1060,14 @@ impl Env {
                     let mut binds = Vec::new();
                     let mut globs = Vec::new();
                     flatten_use(&u.tree, &[], &mut binds, &mut globs);
-                    self.uses.entry(scope.clone()).or_default().extend(binds);
-                    self.glob_uses.entry(scope).or_default().extend(globs);
+                    self.uses
+                        .entry(scope.clone())
+                        .or_default()
+                        .extend(binds.into_iter().map(|(b, f)| (unit, b, f)));
+                    self.glob_uses
+                        .entry(scope)
+                        .or_default()
+                        .extend(globs.into_iter().map(|g| (unit, g)));
                 }
                 ast::DeclKind::Mod(m) => {
                     let mut inner = module.to_vec();
@@ -1076,6 +1109,10 @@ impl Env {
         if path.is_empty() {
             return;
         }
+        // Only the exact path. A library's *ancestor* paths are pre-claimed in
+        // `build_with` under `LIBRARY_OWNER`; claiming them here instead made every
+        // stdlib file fight the others for `std`, since a "unit" at this level is one
+        // source file rather than one library.
         let key = path.join("::");
         match self.module_unit.get(&key) {
             Some(&owner) if owner != unit => {
@@ -1280,11 +1317,17 @@ impl Env {
 
         // `impl Container for Box` names the constructor, not a type, so it has no
         // arguments to resolve and no arity to check.
+        // The RESOLVED key, not the written path. `dispatch::hkt_resolve` matches this
+        // against `nominal_head`, which reads the `#nominal` tag — a qualified identity —
+        // so spelling the head as whatever the author happened to type meant
+        // `impl Mappable for List` produced `"List"` and never matched
+        // `"std::collections::list::List"`. It also meant an impl written with a
+        // qualified path could not match one written bare, for the same reason: two
+        // spellings of one type, compared as strings (TODO lead L4).
         let head = match &i.target.kind {
             ast::TypeSpecKind::Named { path, args } if args.is_empty() => self
                 .lookup(module, path)
-                .filter(|k| !self.decls[k].generics().is_empty())
-                .map(|_| path.join("::")),
+                .filter(|k| !self.decls[k].generics().is_empty()),
             _ => None,
         };
         let target = match head {
@@ -1357,6 +1400,39 @@ impl Env {
         true
     }
 
+    /// The module path the prelude is declared at.
+    ///
+    /// `#` is not an identifier character, so no source can write this path, declare a
+    /// module at it, or claim it — the same trick `#nominal` uses. The prelude used to
+    /// sit at the *root*, `[]`, which is also every program's own module path, and that
+    /// one collision caused four separate defects: a prelude-declared opaque record was
+    /// owned by a path every program shares (so any program could reach inside its own
+    /// `List`), which is why `List` and `Map` had to be moved out to their collection
+    /// modules; and the prelude's `use` bindings landed in the *user's* namespace bucket
+    /// ahead of the user's own, so a prelude name re-exported with `use` could not be
+    /// shadowed while one declared directly still could.
+    ///
+    /// Giving the prelude a path of its own separates "in scope everywhere" from "at the
+    /// root", which were never the same thing.
+    pub const PRELUDE: &'static str = "#prelude";
+
+    /// The qualified identities of the built-in collections.
+    ///
+    /// They are ordinary stdlib declarations, but the compiler still has to *name* them:
+    /// a list literal builds one without going through the declaration table, and the
+    /// backend gives both a representation of their own. Spelled once here so the
+    /// checker, `ordered.rs`, `ir/repr.rs` and the literal path cannot drift apart —
+    /// which they would, silently, since every one of these is a string comparison.
+    /// The owner recorded for a library's *intermediate* module paths — the `std` in
+    /// `std::fs`. Shared by every library because the unit indices here identify source
+    /// files, not libraries, so per-file ownership of a common ancestor is meaningless.
+    /// Distinguishing one library from another at this level is the cross-library
+    /// identity work; see `docs/design/cross-library-identity.md`.
+    const LIBRARY_OWNER: usize = usize::MAX;
+
+    pub const LIST: &'static str = "std::collections::list::List";
+    pub const MAP: &'static str = "std::collections::map::Map";
+
     /// `path` as seen from `module`: an inner module's names shadow an outer's, a `use`
     /// binds its last segment, and a fully qualified path always works. Anything the
     /// caller may not reach is dropped here, so no lookup built on this can return an
@@ -1379,28 +1455,102 @@ impl Env {
     /// same rule with an empty tail.
     fn candidates_raw(&self, module: &[String], path: &[String]) -> Vec<String> {
         let mut out = Vec::new();
+        // Imports are inherited down a module tree but never across compilation units;
+        // `unit_of` is what decides which side of that line a scope's `use` sits on.
+        let unit = self.unit_of(module);
         for n in (0..=module.len()).rev() {
             let scope = module[..n].join("::");
-            if let (Some(first), Some(us)) = (path.first(), self.uses.get(&scope)) {
-                if let Some((_, full)) = us.iter().find(|(bound, _)| bound == first) {
-                    let mut key = full.clone();
-                    for seg in &path[1..] {
-                        key.push_str("::");
-                        key.push_str(seg);
-                    }
-                    out.push(key);
+            self.push_scope_candidates(&scope, path, unit, &mut out);
+        }
+        // The prelude is consulted LAST, after every scope the caller is actually in.
+        // That ordering is the whole point of giving it a path of its own: a name the
+        // program declares or imports wins over the prelude's, uniformly, whether the
+        // prelude got its name from a declaration or from a `use` re-export. While the
+        // prelude sat at the root those two cases behaved differently — `IndexError`
+        // (declared) could be shadowed and `List` (re-exported) could not.
+        self.push_scope_candidates(Self::PRELUDE, path, None, &mut out);
+        out
+    }
+
+    /// The compilation unit a module belongs to: the unit that claimed the longest
+    /// registered prefix of its path. `None` when nothing claims any prefix, which is the
+    /// case for a module built outside `build_with` (tests constructing an `Env` by hand).
+    fn unit_of(&self, module: &[String]) -> Option<usize> {
+        (0..=module.len())
+            .rev()
+            .find_map(|n| self.module_unit.get(&module[..n].join("::")).copied())
+    }
+
+    /// One scope's contribution to `candidates_raw`, in priority order: a `use` binding on
+    /// the first segment, then the plain relative reading, then globs.
+    ///
+    /// `unit` is the unit doing the resolving. A `use` is inherited by the scopes nested
+    /// inside the one that wrote it — deliberate, and coherent with the subtree rule
+    /// opacity uses: a nested module is its parent's implementation, so it sees its
+    /// parent's imports. But that inheritance stops at the unit boundary, because every
+    /// module's walk ends at `""` — the root application's scope — and a program's root
+    /// `use` must not be consulted while resolving a name inside the stdlib. It was:
+    /// `use mine::List` at a program's root made `std::string`'s `List[str]` resolve to
+    /// the program's own `List`, with the error surfacing inside stdlib code the program
+    /// never called. `None` disables the filter, which is how the prelude's re-exports
+    /// reach every unit.
+    fn push_scope_candidates(
+        &self,
+        scope: &str,
+        path: &[String],
+        unit: Option<usize>,
+        out: &mut Vec<String>,
+    ) {
+        // Only the ROOT scope needs a boundary. Every module's ancestor walk ends at
+        // `""` — the root application's scope — so that is the one place another unit's
+        // names are in reach; `std::collections::list` reaching its own `push` at its own
+        // scope is ordinary resolution and must not be filtered. Applying this per *file*
+        // instead isolated every stdlib module from the rest of the stdlib.
+        let root_scope = scope.is_empty();
+        let is_root_app = unit.is_none() || unit == self.root_unit;
+        let same_unit = |_u: usize| !root_scope || is_root_app;
+        if let (Some(first), Some(us)) = (path.first(), self.uses.get(scope)) {
+            if let Some((_, _, full)) =
+                us.iter().find(|(u, bound, _)| bound == first && same_unit(*u))
+            {
+                let mut key = full.clone();
+                for seg in &path[1..] {
+                    key.push_str("::");
+                    key.push_str(seg);
                 }
+                out.push(key);
             }
-            let joined = path.join("::");
+        }
+        let joined = path.join("::");
+        // The plain relative reading — but not when this scope belongs to a *different*
+        // unit. A stdlib module's ancestor walk passes through `""`, the root
+        // application's scope, so without this a program that declares `record List` at
+        // its root hijacks `std::string`'s own `List[str]`: same hijack as the `use`
+        // channel above, through the declaration channel instead. An unclaimed scope is
+        // not foreign — nothing is keyed there — so intermediate paths stay walkable.
+        //
+        // This is only correct because the prelude moved off the root: the stdlib used to
+        // *need* `""` to reach `Display` and `Ordering`, and now reaches them through
+        // `Env::PRELUDE` instead.
+        // Only a SINGLE-segment name is withheld. At the root scope the "relative"
+        // reading is the absolute one -- `std::collections::list::push` resolves from
+        // anywhere precisely because this line pushes the joined key -- so skipping the
+        // scope wholesale broke every qualified path from a library module. What must not
+        // leak is a bare name, because a bare name at the root scope is a *program root
+        // declaration*: `record List` in a program hijacked `std::string`'s own `List[str]`.
+        // Nothing but the program declares at the root, so nothing legitimate is lost.
+        let foreign_scope = root_scope && !is_root_app && path.len() == 1;
+        if !foreign_scope {
             out.push(if scope.is_empty() { joined.clone() } else { format!("{scope}::{joined}") });
-            // A glob makes `prefix::path` reachable, below an explicit binding.
-            if let Some(gs) = self.glob_uses.get(&scope) {
-                for g in gs {
+        }
+        // A glob makes `prefix::path` reachable, below an explicit binding.
+        if let Some(gs) = self.glob_uses.get(scope) {
+            for (u, g) in gs {
+                if same_unit(*u) {
                     out.push(format!("{g}::{joined}"));
                 }
             }
         }
-        out
     }
 
     /// The same candidates without the visibility filter, so a failed lookup can tell
@@ -1516,26 +1666,52 @@ impl Env {
         matches!(&d.sort, Sort::Record(r) if r.opaque).then(|| d.module.as_slice())
     }
 
-    /// The same question asked of a *value's* type, where all that survives is a bare
-    /// nominal name (`#nominal` holds a string and nothing else).
+    /// The same question asked of a *value's* type, where the name comes from the
+    /// `#nominal` tag rather than from syntax.
     ///
-    /// Resolving in scope first is what keeps a user's own `Secret` legal when some other
-    /// module also has an opaque one — scanning alone rejected exactly that. When the name
-    /// does not resolve here, the value came from elsewhere, and the only candidates are
-    /// opaque records of that name; if more than one exists the name is genuinely
-    /// ambiguous and this declines to guess rather than reject the wrong program.
-    pub fn opaque_record_named(&self, module: &[String], name: &str) -> Option<&[String]> {
-        if let Some(key) = self.lookup(module, std::slice::from_ref(&name.to_string())) {
-            if let Some(d) = self.decls.get(&key) {
-                return matches!(&d.sort, Sort::Record(r) if r.opaque).then(|| d.module.as_slice());
+    /// Since identity was qualified (`docs/design/identity.md`) that tag IS the
+    /// declaration key, so this is a direct lookup. It used to be a search: the tag
+    /// carried a bare identifier, so a value's `Secret` could not be told from any other
+    /// module's `Secret`, and this had to resolve the name in scope first and then fall
+    /// back to scanning for a unique opaque of that name — declining to guess when two
+    /// existed. That ambiguity is gone, and with it the residue where a program's own
+    /// same-named record quietly unsealed a foreign one.
+    pub fn opaque_record_named(&self, _module: &[String], key: &str) -> Option<&[String]> {
+        let d = self.decls.get(key)?;
+        matches!(&d.sort, Sort::Record(r) if r.opaque).then(|| d.module.as_slice())
+    }
+
+    /// The `#nominal` tags of every opaque record `module` may *not* see into, each with
+    /// the module that owns it. This is the hidden set `Types::seal` erases — computed
+    /// per viewing module, because opacity is relative to who is asking.
+    ///
+    /// Each candidate name goes through `opaque_record_named`'s resolution discipline
+    /// rather than a bare scan, and for the same reason that function exists: a
+    /// `#nominal` tag carries the bare declaration name, so a user's own `Secret` and a
+    /// foreign opaque `vault::Secret` share a tag. When the name resolves in `module` to
+    /// something the module may use, the tag is not hidden — which keeps the local
+    /// `Secret` flowing freely, at the price that the foreign one of the same name flows
+    /// with it. That trade is already how the syntactic opacity checks behave.
+    pub fn foreign_opaque_tags(
+        &mut self,
+        module: &[String],
+    ) -> HashMap<super::types::NameId, Vec<String>> {
+        // Keyed by the declaration key, which is exactly what the `#nominal` tag now
+        // holds — so a tag identifies one declaration and nothing else.
+        let opaque: Vec<(String, Vec<String>)> = self
+            .decls
+            .iter()
+            .filter(|(_, d)| matches!(&d.sort, Sort::Record(r) if r.opaque))
+            .map(|(k, d)| (k.clone(), d.module.clone()))
+            .collect();
+        let mut out = HashMap::new();
+        for (key, owner) in opaque {
+            if !opacity_permits(module, &owner) {
+                let tag = self.solver.t.name(&key);
+                out.insert(tag, owner);
             }
         }
-        let mut hits = self
-            .decls
-            .values()
-            .filter(|d| matches!(&d.sort, Sort::Record(r) if r.opaque && r.name == name));
-        let first = hits.next()?;
-        hits.next().is_none().then(|| first.module.as_slice())
+        out
     }
 
     /// Whether the compiler has a rule for a marker of this name.
@@ -1558,10 +1734,16 @@ impl Env {
     /// `AmbiguousCall` inside such a module and resolved fine one level up. Every other
     /// lookup (`candidates_raw`) iterates all scopes, and this now agrees with them.
     pub fn imported_method(&self, module: &[String], name: &str) -> Option<ProtocolId> {
+        // Same unit filter as `push_scope_candidates`, and for the same reason: a
+        // program's root import must not decide which protocol a stdlib call resolves to.
+        let unit = self.unit_of(module);
         for n in (0..=module.len()).rev() {
             let scope = module[..n].join("::");
             let Some(us) = self.uses.get(&scope) else { continue };
-            if let Some((_, full)) = us.iter().find(|(bound, _)| bound == name) {
+            if let Some((_, _, full)) = us
+                .iter()
+                .find(|(u, bound, _)| bound == name && unit.is_none_or(|mine| mine == *u))
+            {
                 if let Some((proto, _method)) = full.rsplit_once("::") {
                     let segs: Vec<String> = proto.split("::").map(String::from).collect();
                     if let Some(id) = self.lookup_protocol(&[], &segs) {
@@ -1677,7 +1859,7 @@ impl Env {
                 // is a cycle in the graph rather than an unbounded expansion.
                 let id = self.solver.t.reserve();
                 self.inst.insert(ik.clone(), id);
-                let body = self.record_body(r, &scope, args.clone());
+                let body = self.record_body(r, key, &scope, args.clone());
                 let d = self.solver.t.data(body);
                 self.solver.t.define(id, d);
                 id
@@ -1708,7 +1890,8 @@ impl Env {
                     // A nominal wrapper and nothing else: one hidden field under a
                     // name source cannot write, so the newtype is disjoint from its
                     // representation and from its siblings.
-                    let n = self.solver.t.name(decl.name());
+                    // Qualified, for the same reason `record_body` is.
+                    let n = self.solver.t.name(key);
                     let l = self.solver.t.name("#inner");
                     self.solver.t.nominal(n, args.clone(), vec![(l, inner)])
                 }
@@ -1740,7 +1923,7 @@ impl Env {
     /// Any poisoned field poisons the whole record. A record with one field missing would
     /// otherwise go on to produce a `NoField` at every use of that field, burying the one
     /// diagnostic that named the real problem.
-    fn record_body(&mut self, r: &ast::RecordDecl, scope: &Scope, args: Vec<TyId>) -> TyId {
+    fn record_body(&mut self, r: &ast::RecordDecl, key: &str, scope: &Scope, args: Vec<TyId>) -> TyId {
         let mut fields: Vec<(super::types::NameId, TyId)> = Vec::new();
         let mut poison = false;
         for f in &r.fields {
@@ -1757,7 +1940,11 @@ impl Env {
         if poison {
             return self.error_ty;
         }
-        let n = self.solver.t.name(&r.name);
+        // The identity is the QUALIFIED name, not `r.name`. Interning the bare
+        // identifier made two modules that both declare `record Secret` declare one type
+        // -- `vault::reveal(forge::fake(99))` type-checked -- which defeated `opaque`
+        // outright. See docs/design/identity.md.
+        let n = self.solver.t.name(key);
         self.solver.t.nominal(n, args, fields)
     }
 
@@ -1773,6 +1960,60 @@ fn decl_name(k: &ast::DeclKind) -> &str {
         }
         _ => "",
     }
+}
+
+/// Whether code in `module` may reach inside a record declared in `owner`.
+///
+/// **An opaque record is visible within its declaring module's subtree and nowhere
+/// else** — not its parent, not a sibling, not the root. Two cases:
+///
+/// - the declaring module itself;
+/// - **anything nested inside it**, because an `internal mod` is the implementation of
+///   the module around it and cannot be barred from the type it exists to implement —
+///   `std::fs::raw::guard` builds the `File` that `std::fs` declares.
+///
+/// That second case is the one the stdlib actually relies on, and its direction is
+/// worth being exact about, because this doc used to state it backwards: it is a
+/// *descendant* reaching a type its *ancestor* declared. The reverse — a parent
+/// reaching into a type its child declared — was permitted for one level until
+/// 2026-07-20 and is not any more. Nothing used it: an audit of the stdlib, the corpus
+/// and the examples found exactly one caller, a corpus test written to exercise the
+/// rule itself. It cost the author's mental model ("opaque means hidden from everyone
+/// but me") and made refactoring hazardous, since moving a declaration one level
+/// changed who could see into it. A parent that wants a child's contents asks for them
+/// through a function the child exposes, like any other outsider.
+///
+/// # The precondition: module paths must be un-claimable
+///
+/// "Visible to descendants" is only as strong as the impossibility of *declaring
+/// yourself* a descendant. `mod std { mod fs { mod thief { .. } } }` would make `thief`
+/// a descendant of `File`'s owner and hand it the insides. That is what `claim_module`
+/// exists to stop, and it does: a `mod` whose path another compilation unit introduced
+/// is rejected. This rule and that one are a pair — neither is sound alone.
+///
+/// # Where the pair does not reach
+///
+/// An unclaimed intermediate path can be squatted; harmless while a compilation holds
+/// one untrusted unit, and a real question once `use` loads dependencies. See
+/// `docs/design/cross-library-identity.md`.
+///
+/// The prelude used to be the other gap here: its path was `[]`, which every program's
+/// own root shares, so `same` handed root code the insides of every prelude-declared
+/// opaque. It now lives at `Env::PRELUDE`, a path no source can write, so that case is
+/// closed rather than merely inert.
+///
+/// It lives here rather than in `check.rs` because the checker's syntactic doors and
+/// `Env::foreign_opaque_tags` (the type-directed door) must answer from one rule.
+pub fn opacity_permits(module: &[String], owner: &[String]) -> bool {
+    // No `!owner.is_empty()` guard: it was there because the prelude owned `[]`, so
+    // "nested inside the owner" would have been true of every module in the program.
+    // With the prelude moved to its own path, `[]` means the program's own root and
+    // nothing else, and its subtree — every module the program declares — is exactly
+    // who should see into a record declared there.
+    let nested_in_owner =
+        module.len() >= owner.len() && module[..owner.len()] == *owner;
+    let same = module == owner;
+    same || nested_in_owner
 }
 
 /// The key a name is stored under. The single place a module path becomes a string, so

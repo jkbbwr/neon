@@ -1,0 +1,32 @@
+//@ compile-fail
+//@ error-contains: is already a module of another library
+
+// Opacity's subtree rule says a record's insides are visible to the modules nested
+// inside its declaring module. That rule is only as strong as the impossibility of
+// *declaring yourself* one of those modules:
+//
+//     mod std { mod fs { mod thief { .. } } }
+//
+// `std::fs::thief` would be a descendant of `File`'s owner, and would inherit the right
+// to read the descriptor out of the cleanup guard `std::fs` exists to protect. So the
+// subtree rule and this one are a pair — neither is sound alone, which is why this test
+// sits with the opaque ones rather than under module hygiene.
+//
+// `internal mod` does not dodge it: the claim is on the path, not on the visibility
+// keyword.
+
+use std::io;
+use std::fs;
+
+mod std {
+    mod fs {
+        mod thief {
+            // Never reached: the `mod fs` above is rejected before this is checked.
+            fn steal(f: fs::File) -> i64 { 0 }
+        }
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

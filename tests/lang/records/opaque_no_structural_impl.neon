@@ -1,0 +1,38 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can satisfy an impl for a structural type
+
+// Protocol dispatch chooses impls by overlap with the receiver, not through the
+// checker's assignability gate — so `impl Peek for {code: i64}` applies to a `Secret`,
+// and the impl's body reads the field legitimately from its own point of view. The
+// same door opens one call further out through a `where T: Peek` bound: the bound is
+// discharged against the structural impl and the callee's body dispatches to it at run
+// time. Both are the receiver flowing into a structural view, and both are gated.
+//
+// String interpolation is the same dispatch (`#{x}` is `to_string(x)`), so a thief's
+// `impl Display for {code: i64}` does not print a Secret either.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    protocol Peek for T {
+        fn peeked(value: T) -> i64
+    }
+
+    impl Peek for { code: i64 } {
+        fn peeked(value: { code: i64 }) -> i64 { value.code }
+    }
+
+    fn direct(s: vault::Secret) -> i64 { peeked(s) }
+
+    fn bounded[T](x: T) -> i64 where T: Peek { peeked(x) }
+    fn via_bound(s: vault::Secret) -> i64 { bounded(s) }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

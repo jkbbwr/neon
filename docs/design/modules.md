@@ -62,17 +62,25 @@ reading a field, building a literal, destructuring a pattern
 anywhere: held in a local, passed, returned, stored in another module's record, put in a
 list (`tests/lang/records/opaque_values_still_travel.neon`).
 
-The rule is `check.rs::opacity_permits(module, owner)`, and it admits three cases:
+The rule is `env::opacity_permits(module, owner)`: **an opaque record is visible within
+its declaring module's subtree and nowhere else.** Two cases —
 
 - the declaring module itself;
 - **anything nested inside it** — an `internal mod` is the implementation of the module
-  around it and cannot be barred from the type it exists to implement;
-- the **immediate parent**, for the mirror arrangement: `std::fs`'s inner module declares
-  the handle and the module above implements the public API over it.
+  around it and cannot be barred from the type it exists to implement:
+  `std::fs::raw::guard` builds the `File` that `std::fs` declares.
 
-Siblings and grandparents cannot. An empty owner path is the prelude, which has no name to
-print. There is an exception for the root, because the prelude and the program share it;
-`TODO.md` item 17 notes that moving `List`/`Map` out of the prelude would remove it.
+Not a sibling, not the root, and **not the parent**. A parent reaching into a type its
+child declared was permitted for one level until 2026-07-20; an audit found exactly one
+caller — a corpus test written to exercise the rule — while the stdlib uses the opposite
+direction (a *descendant* reaching an *ancestor's* type). It cost the author's mental
+model and made refactoring hazardous, since moving a declaration one level changed who
+could see in. A parent asks through an accessor the child exposes, like any outsider.
+
+There is no longer a root exception: the prelude has a module path of its own
+(`Env::PRELUDE`), so it no longer shares the program's. Full route enumeration, the
+sealing mechanism that closes the *type-directed* leaks, and the remaining residue are in
+`opacity.md`.
 
 This is what lets a module hold an invariant its callers cannot break — a descriptor that
 must not be forged from an integer, a cleanup guard that must not be disarmed behind the
@@ -118,24 +126,56 @@ Three things this does and does not cover, stated because the boundaries matter:
         mod outer { mod raw { fn hijack() -> i64 { secret() } } }   // still accepted
 
   Self-harm, not a breach: one unit reaching into its own internals.
-- **Only claimed paths collide, and only explicit `mod` claims them.** Intermediate segments
-  established by the file mapping are not registered, so a user `mod std { ... }` is fine on
-  its own — the collision fires on `std::fs`, the path a stdlib unit actually declared. This
-  is exactly the wrinkle an earlier draft of this file predicted would break the stdlib
-  against itself; not claiming implied ancestors is what avoids it.
-- **The root path is exempt**, because the prelude and the program share it by design.
+- **A library owns the paths it passes through**, not only those it occupies. `std::fs`
+  and `std::path` imply `std` is spoken for even though nothing is declared there alone,
+  so `mod std { .. }` is rejected too — it was accepted until 2026-07-20, a namespace
+  claim then and an access grant the day anything is declared at that path. A library's
+  ancestors are pre-claimed under one shared owner, because the "units" here identify
+  source *files*: making each stdlib file claim `std` individually collides the stdlib
+  with itself. Pinned by `modules/cannot_squat_a_library_ancestor_path.neon`.
+- **The root path is no longer exempt.** It was, because the prelude and the program
+  shared it; the prelude now has `Env::PRELUDE` to itself.
 
-## Known-broken
+## Resolution
 
-- **Nominal identity is a bare name, so `opaque` is decoration in the general case.**
-  `typecheck/env.rs::record_body` interns the bare identifier, so two modules declaring
-  `record Secret` declare the **same type** — no cast, no `any`, no module-path forgery
-  needed. Every opacity guarantee above rests on this. Recorded as
-  `tests/lang/types/a_nominal_name_is_not_a_module_identity.neon`, deliberately unlisted in
-  `expected-pass.txt`: unlisted-and-failing is how the ratchet records an open bug. The fix
-  is not local — the name is read back by `dispatch::nominal_head` and matched against
-  `ast_head`'s `path.last()`, and `ordered.rs` matches it against literal `"List"`/`"Map"`.
-  `TODO.md` item 1.
+Names live in one flat table keyed by fully qualified path. A written path is resolved by
+proposing candidates and letting each caller keep the first its own table holds — one rule
+serving types, functions and protocols, which is why they cannot drift apart.
+`candidates_raw` proposes every scope from the current module outwards (at each: a `use`
+binding on the first segment, then the plain relative reading, then globs), and then the
+**prelude, last**.
+
+### `use` binds a scope; it does not re-export
+
+A `use` binds a name in the scope that wrote it, and **that binding is inherited by nested
+scopes** — deliberate, and coherent with opacity's subtree rule: a nested module is its
+parent's implementation, so it sees its parent's imports.
+
+It does *not* make the name a member of the importing module. `a::List` does not resolve
+when `a` merely imported `List`; there is no `pub use`, and the prelude's re-exports work
+by scope inheritance rather than by re-export. See `cross-library-identity.md`.
+
+### Inheritance stops at the unit boundary
+
+Every module's scope walk ends at `""`, the **root application's** scope — so without a
+boundary a program's root names are in scope while resolving inside the stdlib, and they
+were: `use mine::List` at a program's root made `std::string`'s own `List[str]` resolve to
+the program's record, with the error surfacing in stdlib code the program never called.
+Two filters apply there, both keyed on the unit that wrote the thing: a `use` binding is
+only consulted by its own unit, and a **single-segment** name is only read by the root
+application. Multi-segment paths still resolve, because at the root scope the "relative"
+reading *is* the absolute one — `std::collections::list::push` resolves from anywhere
+precisely because of it. Pinned by `modules/imports_do_not_cross_unit_boundaries.neon`.
+
+### The prelude has a path of its own
+
+`Env::PRELUDE` is `#prelude`, which no source can write (`#` is not an identifier
+character, the same trick `#nominal` uses), and resolution consults it **last** — so a
+prelude name is in scope everywhere *and* a program can shadow any of it. It used to be
+declared at the root, which is also the program's own path; that collision made
+prelude-declared opaques reachable from every program, forced `List`/`Map` out to their
+collection modules, and made prelude `use` re-exports unshadowable while declared names
+stayed shadowable. Pinned by `modules/prelude_names_can_be_shadowed.neon`.
 
 ## Not yet
 
@@ -144,7 +184,9 @@ Three things this does and does not cover, stated because the boundaries matter:
   `std::fs::fail` and `std::fs::collect` are the current casualties — helpers that read as
   private and are not.
 - **Packages.** Sealing is enforced per unit, and "unit" today means "one module handed to
-  `Env::build_with`". Defining it properly, and defining what a dependency is, belongs with
-  the package work. `Env::check_coherence` already carries a related gap: one orphan-impl
-  rule from `docs/decisions.md` cannot be written because ownership is a property of the
-  library a declaration came from, and `use` does not load a dependency.
+  `Env::build_with`" — a source *file*, not a library, which is why a library's ancestor
+  paths need a shared sentinel owner. Path ownership is also still first-come, which is
+  sound only while exactly one untrusted unit exists. What must replace it is decided in
+  `cross-library-identity.md`. `Env::check_coherence` carries a related gap: one
+  orphan-impl rule from `docs/decisions.md` cannot be written because ownership is a
+  property of the library a declaration came from, and `use` does not load a dependency.

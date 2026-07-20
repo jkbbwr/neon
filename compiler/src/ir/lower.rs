@@ -348,6 +348,54 @@ pub fn lower_module<'a>(
     module: &'a ast::Module,
     libs: &[(Vec<String>, &'a ast::Module)],
 ) -> Program {
+    lower_module_with(env, result, module, libs, false)
+}
+
+/// One `test "name" { .. }` block, in the order `lower_module_with` emits them.
+///
+/// `symbol` is the IR function name, which the C backend mangles like any other; the test
+/// runner never invents it, so the two sides cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestEntry {
+    pub name: String,
+    pub symbol: String,
+}
+
+/// Every `test` block in a module, in source order, descending into nested `mod`s.
+///
+/// The single source of truth for both what gets lowered and what the runner is told
+/// exists — `neon test` calls this to learn the names, and lowering calls it to decide what
+/// to emit, so an index means the same block on both sides.
+pub fn test_entries(module: &ast::Module) -> Vec<TestEntry> {
+    fn walk(decls: &[Decl], out: &mut Vec<TestEntry>) {
+        for d in decls {
+            match &d.kind {
+                DeclKind::TestBlock(t) if t.kind == ast::TestKind::Test => {
+                    let symbol = format!("__neon_test_{}", out.len());
+                    out.push(TestEntry { name: t.name.clone(), symbol });
+                }
+                DeclKind::Mod(m) => walk(&m.decls, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&module.decls, &mut out);
+    out
+}
+
+/// `lower_module`, with `tests` selecting whether `test` blocks become functions.
+///
+/// Off (a normal build) they are stripped, which is what `test` blocks have always done.
+/// On (`neon test`) each becomes a nullary unit-returning function; nothing calls them from
+/// Neon, so the backend's test entry point is what reaches them.
+pub fn lower_module_with<'a>(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &'a ast::Module,
+    libs: &[(Vec<String>, &'a ast::Module)],
+    tests: bool,
+) -> Program {
     let mut funcs = Vec::new();
     let mut lambda_jobs: Vec<LambdaJob> = Vec::new();
     let mut instance_jobs: Vec<InstanceJob> = Vec::new();
@@ -380,13 +428,27 @@ pub fn lower_module<'a>(
         instance_jobs.extend(i);
     }
 
+    // `test` blocks, in test mode only. Each is a nullary unit function; the entry point
+    // the backend emits is the only caller.
+    if tests {
+        let mut blocks: Vec<(Vec<String>, &'a ast::TestBlock)> = Vec::new();
+        collect_test_blocks(&[], &module.decls, &mut blocks);
+        for (entry, (m, t)) in test_entries(module).into_iter().zip(blocks) {
+            let (func, l, i) = lower_test_block(env, result, &m, t, entry.symbol);
+            lowered.insert(func.name.clone());
+            funcs.push(func);
+            lambda_jobs.extend(l);
+            instance_jobs.extend(i);
+        }
+    }
+
     // Impl methods: correlate each `ImplDef`'s method (which carries the types) with its
     // AST body (which carries the code) through the same mangled name that dispatch uses.
     let mut impl_bodies: std::collections::HashMap<String, &ast::FnDecl> =
         std::collections::HashMap::new();
-    collect_impl_bodies(&module.decls, &mut impl_bodies);
-    for (_, m) in libs {
-        collect_impl_bodies(&m.decls, &mut impl_bodies);
+    collect_impl_bodies(env, &[], &module.decls, &mut impl_bodies);
+    for (prefix, m) in libs {
+        collect_impl_bodies(env, prefix, &m.decls, &mut impl_bodies);
     }
     for impl_def in env.impls() {
         let proto = env.protocols()[impl_def.protocol.0].name.clone();
@@ -650,8 +712,8 @@ fn repr_head(r: &Repr) -> Option<String> {
         Repr::F64 => "f64".into(),
         Repr::Str => "str".into(),
         Repr::Bool => "bool".into(),
-        Repr::List(_) => "List".into(),
-        Repr::Map(_, _) => "Map".into(),
+        Repr::List(_) => crate::typecheck::env::Env::LIST.into(),
+        Repr::Map(_, _) => crate::typecheck::env::Env::MAP.into(),
         _ => return None,
     })
 }
@@ -676,9 +738,21 @@ fn find_impl_method(
 }
 
 /// The head of an impl target written in the AST, matching `impl_head`.
-fn ast_head(ty: &ast::TypeSpec) -> String {
+///
+/// Resolved through the environment rather than read off the syntax. `impl_head` derives
+/// its head from the checked `ImplDef`, whose identity is now the QUALIFIED name, so
+/// taking `path.last()` here produced `Mappable$List$fold` where dispatch called
+/// `Mappable$std::collections::list::List$fold` — the exact "call a symbol nothing
+/// defines" failure the doc above warns about. It also means the two spellings of one
+/// type (`List` and `std::collections::list::List`) now key the same body.
+///
+/// Falls back to the written last segment when the path does not resolve, which happens
+/// only for a target the checker already rejected.
+fn ast_head(env: &Env, module: &[String], ty: &ast::TypeSpec) -> String {
     match &ty.kind {
-        ast::TypeSpecKind::Named { path, .. } => path.last().cloned().unwrap_or_default(),
+        ast::TypeSpecKind::Named { path, .. } => env
+            .lookup(module, path)
+            .unwrap_or_else(|| path.last().cloned().unwrap_or_default()),
         _ => String::new(),
     }
 }
@@ -687,6 +761,8 @@ fn ast_head(ty: &ast::TypeSpec) -> String {
 /// dispatch uses. The `ImplDef`s in the environment carry the types but not the code, and
 /// the AST carries the code but not the resolved types; this key is what correlates them.
 fn collect_impl_bodies<'a>(
+    env: &Env,
+    module: &[String],
     decls: &'a [Decl],
     out: &mut std::collections::HashMap<String, &'a ast::FnDecl>,
 ) {
@@ -694,14 +770,18 @@ fn collect_impl_bodies<'a>(
         match &d.kind {
             DeclKind::Impl(i) => {
                 let proto = i.protocol.last().cloned().unwrap_or_default();
-                let head = ast_head(&i.target);
+                let head = ast_head(env, module, &i.target);
                 for m in &i.methods {
                     if m.body.is_some() {
                         out.insert(mangle_impl(&proto, &head, &m.name), m);
                     }
                 }
             }
-            DeclKind::Mod(m) => collect_impl_bodies(&m.decls, out),
+            DeclKind::Mod(m) => {
+                let mut inner = module.to_vec();
+                inner.push(m.name.clone());
+                collect_impl_bodies(env, &inner, &m.decls, out)
+            }
             _ => {}
         }
     }
@@ -780,6 +860,52 @@ fn lower_fn(
     }
     let (l, i) = (std::mem::take(&mut lo.pending), std::mem::take(&mut lo.instances));
     (lo.b.finish(params), l, i)
+}
+
+/// The `test` blocks of a declaration list, paired with the module path they sit in.
+/// Walked in the same order as `test_entries`, which is what lets the two be zipped.
+fn collect_test_blocks<'a>(
+    module: &[String],
+    decls: &'a [Decl],
+    out: &mut Vec<(Vec<String>, &'a ast::TestBlock)>,
+) {
+    for d in decls {
+        match &d.kind {
+            DeclKind::TestBlock(t) if t.kind == ast::TestKind::Test => {
+                out.push((module.to_vec(), t))
+            }
+            DeclKind::Mod(m) => {
+                let mut inner = module.to_vec();
+                inner.push(m.name.clone());
+                collect_test_blocks(&inner, &m.decls, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Lower one `test` block as a nullary, unit-returning, non-throwing function.
+///
+/// It has no signature in the environment — a test block is not a declaration anything can
+/// name — so unlike `lower_fn` there is nothing to look up: the shape is fixed by
+/// construction. The checker gives the body `never` for both its return and its throws
+/// (`check.rs`), so a `return` or an uncaught throw inside one is already a type error and
+/// this cannot be reached with either.
+fn lower_test_block(
+    env: &Env,
+    result: &TypecheckResult,
+    module: &[String],
+    t: &ast::TestBlock,
+    symbol: String,
+) -> (Func, Vec<LambdaJob>, Vec<InstanceJob>) {
+    let mut lo = Lower::new(env, result, module.to_vec(), symbol, Repr::Unit);
+    lo.b.switch_to(BlockId(0));
+    lo.lower_block(&t.body);
+    if !lo.terminated {
+        lo.b.terminate(Term::Ret(None));
+    }
+    let (l, i) = (std::mem::take(&mut lo.pending), std::mem::take(&mut lo.instances));
+    (lo.b.finish(vec![]), l, i)
 }
 
 /// Lower a lambda's body as its own function. Its first parameter is the environment (a
@@ -1179,8 +1305,121 @@ impl Lower<'_> {
                 // The value of a `return` is never consumed; mint one without emitting.
                 self.b.value(Repr::Never, ty)
             }
+            ExprKind::Assert { kind, args } => self.lower_assert(*kind, args, ty),
             _ => self.unhandled(e, repr, ty),
         }
+    }
+
+    /// `assert(..)`, `assert_eq(..)`, `assert_ne(..)`. A failure calls `neon_panic` with a
+    /// message built here.
+    ///
+    /// This is the whole reason these are intrinsics rather than stdlib functions: the
+    /// compiler still holds the *operands*, so the message can carry both the source text
+    /// of what was asserted and the values it actually saw. A library `assert(cond)` gets a
+    /// bare `bool` and can only ever say "assertion failed".
+    ///
+    /// `assert(a == b)` is therefore not lowered as one opaque condition. When the argument
+    /// is a comparison, its two sides are lowered separately, compared here, and both
+    /// values are reported — so `assert(1 + 1 == 3)` reads the same as `assert_eq(1 + 1, 3)`.
+    fn lower_assert(&mut self, kind: ast::AssertKind, args: &[Expr], ty: TyId) -> Value {
+        if matches!(kind, ast::AssertKind::Throws) {
+            // `assert_throws` needs the argument to be a *throwing* expression, which the
+            // checker rejects outside a `try`; there is no well-typed program that reaches
+            // here. Marked rather than mis-lowered.
+            return self.unhandled_note("assert_throws", Repr::Unit, ty);
+        }
+        let Some(Assertion { cond, operands, text }) = self.assert_condition(kind, args, ty) else {
+            return self.unit(ty);
+        };
+
+        let ok = self.b.new_block();
+        let fail = self.b.new_block();
+        self.b.terminate(Term::Branch {
+            cond,
+            then: Target { to: ok, args: vec![] },
+            els: Target { to: fail, args: vec![] },
+        });
+
+        self.b.switch_to(fail);
+        self.terminated = false;
+        let mut msg = self.b.emit(Op::ConstStr(format!("assertion failed: {text}")), Repr::Str, ty);
+        if let Some((l, r)) = operands {
+            msg = self.append_operand(msg, "\n  left:  ", l, ty);
+            msg = self.append_operand(msg, "\n  right: ", r, ty);
+        }
+        self.b.emit_void(Op::Native { symbol: "neon_panic".into(), args: vec![msg] });
+        self.b.terminate(Term::Unreachable);
+
+        self.b.switch_to(ok);
+        self.terminated = false;
+        self.unit(ty)
+    }
+
+    /// Everything an assertion's failure path needs. `None` when the intrinsic was written
+    /// with too few arguments — a shape the parser accepts and there is nothing to check.
+    fn assert_condition(
+        &mut self,
+        kind: ast::AssertKind,
+        args: &[Expr],
+        ty: TyId,
+    ) -> Option<Assertion> {
+        match kind {
+            ast::AssertKind::Assert => {
+                let a = args.first()?;
+                let text = describe(a);
+                // A comparison is split so both sides can be reported.
+                if let ExprKind::Binary { op, lhs, rhs } = &a.kind {
+                    if let Some(prim) = comparison_prim(*op) {
+                        let l = self.lower_expr(lhs);
+                        let r = self.lower_expr(rhs);
+                        let cond = self.b.emit(Op::Prim(prim, vec![l, r]), Repr::Bool, ty);
+                        return Some(Assertion { cond, operands: Some((l, r)), text });
+                    }
+                }
+                let cond = self.lower_expr(a);
+                Some(Assertion { cond, operands: None, text })
+            }
+            ast::AssertKind::Eq | ast::AssertKind::Ne => {
+                let (le, re) = (args.first()?, args.get(1)?);
+                let l = self.lower_expr(le);
+                let r = self.lower_expr(re);
+                let (prim, op) = match kind {
+                    ast::AssertKind::Eq => (PrimOp::Eq, "=="),
+                    _ => (PrimOp::Ne, "!="),
+                };
+                let cond = self.b.emit(Op::Prim(prim, vec![l, r]), Repr::Bool, ty);
+                let text = format!("{} {} {}", describe(le), op, describe(re));
+                Some(Assertion { cond, operands: Some((l, r)), text })
+            }
+            ast::AssertKind::Throws => None,
+        }
+    }
+
+    /// Append `label` and a rendering of `v` to the message being built. A value whose
+    /// repr has no `to_string` is named rather than faked: claiming a value we cannot
+    /// print would be worse than admitting we cannot.
+    fn append_operand(&mut self, acc: Value, label: &str, v: Value, ty: TyId) -> Value {
+        let lab = self.b.emit(Op::ConstStr(label.into()), Repr::Str, ty);
+        let acc = self.concat_str(acc, lab, ty);
+        let repr = self.b.value_repr(v).clone();
+        let rendered = match &repr {
+            // Quoted, so `""` and `" "` are distinguishable in the report.
+            Repr::Str => {
+                let q = self.b.emit(Op::ConstStr("\"".into()), Repr::Str, ty);
+                let open = self.concat_str(q, v, ty);
+                let q2 = self.b.emit(Op::ConstStr("\"".into()), Repr::Str, ty);
+                self.concat_str(open, q2, ty)
+            }
+            _ => match to_string_symbol(&repr) {
+                Some(sym) => self.b.emit(Op::Native { symbol: sym, args: vec![v] }, Repr::Str, ty),
+                None => self.b.emit(Op::ConstStr("<not displayable>".into()), Repr::Str, ty),
+            },
+        };
+        self.concat_str(acc, rendered, ty)
+    }
+
+    fn concat_str(&mut self, a: Value, b: Value, ty: TyId) -> Value {
+        self.b.emit(Op::Native { symbol: "neon_str_concat".into(), args: vec![a, b] }, Repr::Str, ty)
     }
 
     /// `[a, b, c]` — one `MakeList` with the elements already lowered, left to right.
@@ -2593,6 +2832,115 @@ fn subj_ty(b: &Builder, v: Value) -> TyId {
 
 /// The runtime `to_string` symbol for a primitive repr, for string interpolation. A
 /// `str` needs none (identity); a user type needs a Display dispatch instead.
+/// A lowered assertion: the bool it turns on, the two operands to report when it fails
+/// (absent for an assertion that is not a comparison — there is no "left" and "right" for
+/// `assert(is_ready())`), and the source text to name it by.
+struct Assertion {
+    cond: Value,
+    operands: Option<(Value, Value)>,
+    text: String,
+}
+
+/// The `PrimOp` for a *comparison* binary operator, and `None` for anything else. An
+/// assertion over a comparison reports both of its sides, so it has to recognise exactly
+/// the operators whose two operands are the interesting thing.
+fn comparison_prim(op: BinOp) -> Option<PrimOp> {
+    Some(match op {
+        BinOp::Eq => PrimOp::Eq,
+        BinOp::Ne => PrimOp::Ne,
+        BinOp::Lt => PrimOp::Lt,
+        BinOp::Le => PrimOp::Le,
+        BinOp::Gt => PrimOp::Gt,
+        BinOp::Ge => PrimOp::Ge,
+        _ => return None,
+    })
+}
+
+/// Render an expression back to something that reads like the source the author wrote, for
+/// an assertion's failure message.
+///
+/// Deliberately *not* the formatter: that one prints a whole module against a token stream
+/// and a comment table, and needs the source text. This needs one expression, from the AST
+/// alone, on a single line. Forms that do not appear inside an assertion collapse to a
+/// placeholder rather than growing a second formatter here — a message reading
+/// `assertion failed: <expr>` with the values still attached is the honest failure mode.
+fn describe(e: &Expr) -> String {
+    match &e.kind {
+        ExprKind::Int(n) => n.to_string(),
+        ExprKind::Float(s) => s.clone(),
+        ExprKind::Bool(b) => b.to_string(),
+        ExprKind::Null => "null".into(),
+        ExprKind::Rune(c) => format!("'{c}'"),
+        ExprKind::Atom(a) => format!(":{a}"),
+        ExprKind::Path(p) => p.join("::"),
+        ExprKind::Str(parts) => {
+            let mut s = String::from("\"");
+            for p in parts {
+                match p {
+                    ast::StrPart::Text(t) => s.push_str(t),
+                    ast::StrPart::Interp(i) => s.push_str(&format!("#{{{}}}", describe(i))),
+                }
+            }
+            s.push('"');
+            s
+        }
+        ExprKind::Unary { op, rhs } => {
+            let o = match op {
+                ast::UnOp::Neg => "-",
+                ast::UnOp::Not => "not ",
+                ast::UnOp::Bnot => "bnot ",
+            };
+            format!("{o}{}", describe(rhs))
+        }
+        // Bracketed by the same precedence table the parser and formatter share, so the
+        // message reads back as what the author wrote: `assert(1 + 1 == 3)` reports
+        // `1 + 1 == 3`, not `(1 + 1) == 3`.
+        ExprKind::Binary { op, lhs, rhs } => {
+            format!("{} {} {}", describe_at(lhs, op.prec()), op.text(), describe_at(rhs, op.prec()))
+        }
+        ExprKind::Call { callee, args, .. } => {
+            let a: Vec<String> = args.iter().map(describe).collect();
+            format!("{}({})", describe(callee), a.join(", "))
+        }
+        ExprKind::Index { base, index } => format!("{}[{}]", describe_sub(base), describe(index)),
+        ExprKind::Field { base, name } => format!("{}.{name}", describe_sub(base)),
+        ExprKind::Tuple(elems) => {
+            let a: Vec<String> = elems.iter().map(describe).collect();
+            format!("({})", a.join(", "))
+        }
+        ExprKind::List(elems) => {
+            let a: Vec<String> = elems
+                .iter()
+                .map(|el| match el {
+                    ast::Elem::Value(x) => describe(x),
+                    ast::Elem::Spread(x) => format!("..{}", describe(x)),
+                })
+                .collect();
+            format!("[{}]", a.join(", "))
+        }
+        ExprKind::Is { lhs, .. } => format!("{} is _", describe_sub(lhs)),
+        ExprKind::As { lhs, .. } => format!("{} as _", describe_sub(lhs)),
+        _ => "<expr>".into(),
+    }
+}
+
+/// `describe`, bracketed when the sub-expression binds less tightly than `min_prec`.
+fn describe_at(e: &Expr, min_prec: u8) -> String {
+    match &e.kind {
+        ExprKind::Binary { op, .. } if op.prec() < min_prec => format!("({})", describe(e)),
+        _ => describe(e),
+    }
+}
+
+/// `describe`, bracketed for a position that takes a postfix — `x.f`, `xs[i]`. Anything
+/// operator-shaped needs brackets there whatever its precedence.
+fn describe_sub(e: &Expr) -> String {
+    match &e.kind {
+        ExprKind::Binary { .. } | ExprKind::Unary { .. } => format!("({})", describe(e)),
+        _ => describe(e),
+    }
+}
+
 fn to_string_symbol(r: &Repr) -> Option<String> {
     Some(match r {
         Repr::I64 => "neon_i64_to_string",

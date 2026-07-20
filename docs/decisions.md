@@ -712,11 +712,44 @@ functions: the compiler knows them, so a failure can report the actual values an
 source span. An ordinary function cannot see its argument's source text. `test` and `bench`
 blocks are stripped from normal builds.
 
-*Designed, not yet working end to end.* The keywords, the AST node and the typechecking are
-real, and test blocks genuinely never reach IR. But an `assert` expression has **no
-lowering** — it falls through to a `<todo: assert>` placeholder — and there is no
-`neon test` command, so nothing runs a test block or reports a failure. The reason the
-intrinsic form was chosen still holds; the reporting it was chosen for does not exist yet.
+The reporting is what the choice was for, and it is what a failure prints:
+
+    test arithmetic is broken ... FAILED
+        assertion failed: 1 + 1 == 3
+          left:  2
+          right: 3
+
+`assert(a == b)` is not lowered as one opaque condition. When the argument is a comparison,
+lowering splits it, evaluates both sides, and reports both — so `assert(1 + 1 == 3)` says as
+much as `assert_eq(1 + 1, 3)`. The expression text is reconstructed from the AST (a small
+renderer in `ir/lower.rs`, bracketing off the shared precedence table, not the formatter,
+which needs a token stream and a comment table it does not have here). Values are rendered
+through the same `to_string` symbols string interpolation uses; a repr with no `to_string`
+prints `<not displayable>` rather than a fake.
+
+### One process per test
+
+`neon test` compiles the file once, with `test` blocks lowered as nullary functions and a
+generated entry point that dispatches on `NEON_TEST`, then spawns that binary once per
+block.
+
+*Against a generated `main` that walks a table of every test:* a failed assertion calls
+`neon_panic`, which exits the process, and the language has no way to recover from a panic.
+An in-process harness would report the first failure and then be gone. One process per test
+is what makes "report both, name the failing one" possible at all, and it contains a
+segfault or a corrupted heap exactly as well as it contains an assertion.
+
+It also settles `main`: the entry point of a test build is generated, so a file holding only
+tests compiles and runs. A `main` that *is* present is compiled and never called.
+
+The selector is an environment variable rather than `argv` because every Neon program's
+entry point is `int main(void)`; `getenv` reaches the same information without giving test
+binaries a different entry signature from real ones.
+
+*Not working:* `assert_throws`. Its argument is a throwing call, which the checker rejects
+outside a `try` — there is no well-typed program that reaches its lowering, so it is still a
+`<todo:>` marker. Making it work needs the checker to treat `assert_throws` as a throw sink.
+`bench` blocks are parsed and stripped, and nothing runs them.
 
 ---
 

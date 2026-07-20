@@ -1,0 +1,25 @@
+//@ compile-fail
+//@ error-contains: is already a module of another library
+
+// A library owns the paths it passes through, not only the ones it occupies.
+//
+// `std::fs` and `std::path` both imply that `std` is spoken for, but nothing is declared
+// at `std` alone — so `mod std { .. }` used to be accepted. That is a namespace claim
+// today and an access grant the day anything is declared at that path, since `opaque`
+// decides who may reach inside a record by comparing module paths. The companion to
+// opaque_cannot_graft_into_owner_module.neon, which closes the same door one level down.
+//
+// The submodule here is deliberately a name no library uses: it is the *ancestor* that is
+// being claimed, and that is enough to reject.
+
+use std::io;
+
+mod std {
+    mod totally_new {
+        fn helper() -> i64 { 1 }
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

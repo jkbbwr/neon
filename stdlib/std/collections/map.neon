@@ -6,6 +6,11 @@
 // hold is that the two agree: `keys(m)[i]` and `values(m)[i]` are the same entry. Sort the
 // keys if you need a stable order.
 
+// The map itself: nominal, covariant in its arguments, and opaque -- the storage is
+// native. Declared here rather than in the prelude for the same reason `List` is: the
+// declaring module owns it, and the prelude's path is the root every program shares.
+opaque record Map[K, V] {}
+
 @pure @native("neon_map_new") fn new[K, V]() -> Map[K, V]
 @pure @native("neon_map_len") fn len[K, V](m: Map[K, V]) -> i64
 // Thrown by `get`. A native can build neither the tagged result a throwing function

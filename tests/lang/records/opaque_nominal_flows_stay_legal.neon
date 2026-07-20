@@ -1,0 +1,53 @@
+// The flows the opacity gate must NOT catch: everything that names the record rather
+// than its contents. Holding, passing, returning, listing; narrowing a union by the
+// record's *name*; wrapping in the caller's own newtype and unwrapping again. The gate
+// seals both sides of every flow, so naming the type cancels out — only a view of the
+// contents fails.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+    fn value(s: Secret) -> i64 { s.code }
+}
+
+internal mod courier {
+    // Nominal annotation, argument, return: all name the type, none open it.
+    fn relay(s: vault::Secret) -> vault::Secret {
+        let held: vault::Secret = s;
+        held
+    }
+
+    // Narrowing a union by name. `is vault::Secret` says which member, not what is
+    // inside one.
+    fn tally(x: vault::Secret | str) -> i64 {
+        match x {
+            is vault::Secret => 1,
+            is str => 2,
+        }
+    }
+
+    // The caller's own newtype over the foreign record: wrapping and unwrapping name
+    // the representation, they do not read it.
+    newtype Wrap = vault::Secret
+    fn wrap(s: vault::Secret) -> Wrap { s as Wrap }
+    fn unwrap(w: Wrap) -> vault::Secret { w as vault::Secret }
+}
+
+fn main() {
+    let s = courier::relay(vault::seal(41));
+    io::println(to_string(vault::value(s)));
+
+    io::println(to_string(courier::tally(vault::seal(1))));
+    io::println(to_string(courier::tally("hi")));
+
+    let w = courier::wrap(vault::seal(7));
+    io::println(to_string(vault::value(courier::unwrap(w))));
+
+    // Carried in a list, still sealed the whole way.
+    let many = [vault::seal(1), vault::seal(2)];
+    for item in many {
+        io::println(to_string(vault::value(item)));
+    }
+}

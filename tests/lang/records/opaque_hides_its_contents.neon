@@ -12,7 +12,7 @@
 // and a reachable guard is the same as no guard.
 //
 // `vault` and `thief` are siblings, so neither can see the other's insides. The
-// declaring module and its immediate parent can; see the companion passing test.
+// declaring module and the modules nested inside it can; see the companion passing test.
 
 use std::io;
 

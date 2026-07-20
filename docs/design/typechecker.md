@@ -139,24 +139,22 @@ fix (`dispatch::nominal_head` reads the name back bare, `ordered.rs` matches lit
 `"List"`/`"Map"`). Pinned, deliberately unlisted, as
 `tests/lang/types/a_nominal_name_is_not_a_module_identity.neon`.
 
-**Does not hold — emptiness is not module-relative.** This document used to say `opaque`
-made expansion module-scoped, so the same query could legitimately answer differently in
-two modules. It does not. There is one global arena with no notion of a module, and
-`opaque` is enforced entirely as an *access check* in `check.rs`
-(`check_opaque_name` / `check_opaque_path` / `opacity_permits`): reading a field, building
-a literal, updating via spread and destructuring are rejected outside the declaring
-module, its descendants and its immediate parent.
+**Emptiness is still not module-relative — opacity is enforced at the flows.** This
+document used to say `opaque` made expansion module-scoped, so the same query could
+legitimately answer differently in two modules. It does not: there is one global arena
+with no notion of a module, and `empty.rs` stays context-free and memoised.
 
-That is a simpler design than the one described, and it is worth having stated, because
-it has a consequence nobody wrote down: a **structural annotation walks around it.**
-Verified 2026-07-19:
-
-    internal mod vault { opaque record Secret { code: i64 } ... }
-    fn peek(s: { code: i64 }) -> i64 { s.code }   // accepted, prints 7
-
-`opaque` guards the *name*, not the shape. Undocumented, and not obviously either wrong or
-intended — a set-theoretic system says an opaque record genuinely *is* a `{code: i64}`, so
-the alternative is a real design decision rather than a bug fix.
+`opaque` is enforced in `check.rs`, in two halves. The syntactic doors
+(`check_opaque_name` / `check_opaque_path`, rule in `env::opacity_permits`) reject
+reading a field, building a literal, updating via spread and destructuring outside the
+declaring module, its descendants and its immediate parent. The *type-directed* doors
+— a structural annotation, argument, return, impl target, cast or `is` test, all true
+by nominal-satisfies-structural — are closed by **sealing** (`Types::seal`): erase the
+foreign record's contents, re-ask the subtyping at the flow, and reject if it only
+held through the contents. The module-relative part lives entirely at the gate; the
+solver never sees it. Routes, mechanism and the (small) residue — notably `any`
+laundering — are enumerated in `opacity.md`, and each route is a corpus file under
+`tests/lang/records/opaque_*`.
 
 ## There is no `Erased`, and no way to write one
 

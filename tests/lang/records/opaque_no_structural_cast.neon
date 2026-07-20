@@ -1,0 +1,32 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can be cast to a structural view
+
+// `as` is a flow the ordinary gate never sees: a cast's legality is overlap, not
+// subtyping, and overlap survives sealing — a sealed `Secret` still meets
+// `{code: i64}`, because open records always meet. So the cast has its own sealed
+// question: one side must still subsume the other with the contents erased. Casting to
+// the record's own name, to `any`, or across the caller's own `newtype Wrap =
+// vault::Secret` all still pass; casting to a structural view of the contents does
+// not, and neither does laundering the view through a newtype of it.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    fn direct(s: vault::Secret) -> i64 { (s as { code: i64 }).code }
+
+    // A newtype of the structural view is the same view with a name on it.
+    newtype W = { code: i64 }
+    fn via_newtype(s: vault::Secret) -> i64 {
+        let w = s as W;
+        (w as { code: i64 }).code
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

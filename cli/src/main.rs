@@ -160,6 +160,15 @@ enum Command {
         #[arg(last = true)]
         args: Vec<OsString>,
     },
+    /// Run a file's `test` blocks, one per line of output, and exit non-zero if any failed.
+    Test {
+        file: OsString,
+        /// Run only the tests whose name contains this substring.
+        #[arg(long)]
+        filter: Option<String>,
+        #[command(flatten)]
+        build: BuildOpts,
+    },
     /// Print the resolved sysroot.
     Sysroot {
         /// Print only the stdlib directory, as one bare path. For tools, not people —
@@ -181,6 +190,7 @@ fn main() -> Result<()> {
         Command::Compile { file, output, build } => cmd::compile::run(&file, output, build.into()),
         Command::Build { build } => cmd::build::run(build.into()),
         Command::Run { path, build, args } => cmd::run::run(path, args, build.into()),
+        Command::Test { file, filter, build } => cmd::test::run(&file, filter, build.into()),
         Command::Sysroot { stdlib } => cmd::sysroot::run(stdlib),
     }
 }

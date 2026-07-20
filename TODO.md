@@ -10,59 +10,63 @@ in their own section at the bottom and marked as such.
 
 ## P0 — soundness. These miscompile or accept wrong programs.
 
-### 1. Nominal identity is a bare name, so `opaque` is decoration
+### 1. ~~Nominal identity is a bare name~~ — RESOLVED 2026-07-20
 
-Two modules declaring the same record name declare the **same type**. No cast, no `any`,
-no module-path forgery.
+Was: two modules declaring the same record name declared the **same type**, so
+`vault::reveal(forge::fake(99))` type-checked and printed 99, defeating `opaque`
+outright — including `std::fs`'s cleanup guard.
 
-```neon
-internal mod vault { opaque record Secret { code: i64 }
-                     fn reveal(s: Secret) -> i64 { s.code } }
-internal mod forge { opaque record Secret { code: i64 }
-                     fn fake(n: i64) -> Secret { Secret { code: n } } }
+Identity is now `(declaring module path, name)`: `env.rs::record_body` and the newtype arm
+of `instantiate` intern the qualified declaration key rather than `r.name`. The readback
+sites moved in the same change, which was the reason this was "not local" — `ordered.rs`,
+`ir/repr.rs`, `check.rs`'s list literal, `ctype.rs::tag_name_inner` (the runtime tag), and
+the three head derivations that must agree (`impl_head`, `ast_head`, `repr_head`).
+`List`/`Map` are spelled once as `Env::LIST`/`Env::MAP` so those string comparisons cannot
+drift. Decision and consequences: `docs/design/identity.md`.
 
-vault::reveal(forge::fake(99))   // prints 99
-```
+Fixed alongside, and it was the same bug: **lead L4**. `ImplDef.target_head` held the
+*written* path while `nominal_head` read the tag, so `impl Mappable for List` produced
+`"List"` and never matched — and an impl written with a qualified path could not match one
+written bare. Both now use the resolved key.
 
-`typecheck/env.rs::record_body` interns `t.name(&r.name)` — the bare identifier. Every
-opacity guarantee rests on this, including `std::fs`'s cleanup guard.
+Also retired: the opacity residue where a program's own same-named record quietly unsealed
+a foreign one. A `#nominal` tag is now a declaration key, so `opaque_record_named` is a
+direct lookup instead of a scan that had to decline when two candidates existed.
 
-**Not local.** The name is read back by `dispatch::nominal_head` and matched against
-`ast_head`'s `path.last()`; `ordered.rs` matches it against literal `"List"`/`"Map"`.
-Qualifying the declaration without resolving every written path breaks stdlib dispatch.
-`ImplDef.target_head` is already qualified (`env.rs:1263`) while `nominal_head` is bare —
-see lead L4, which may mean qualified-path impls never match at all.
+`types/a_nominal_name_is_not_a_module_identity.neon` and
+`modules/prelude_names_can_be_shadowed.neon` are green and ratcheted.
 
-Recorded as `tests/lang/types/a_nominal_name_is_not_a_module_identity.neon`, deliberately
-unlisted: unlisted+failing is how this ratchet records an open bug.
+### 1b. ~~`opaque` is also bypassed structurally~~ — RESOLVED 2026-07-19
 
-### 1b. `opaque` is also bypassed structurally — and this one is a design collision
+Was: `fn peek(s: {code: i64}) -> i64 { s.code }` read a foreign `Secret` without ever
+naming it, because nominal-satisfies-structural is true by design and the opacity check
+was syntactic while the leak was type-directed.
 
-You do not need to collide a name. You do not need to forge a module path. You describe the
-shape:
+The decision this item asked for was made, and it is the first option *without* its
+feared cost: an opaque record does not satisfy a structural view **outside its module**,
+and structural-width subtyping for everything else is untouched
+(`structural_param_accepts_nominal.neon` still pins it). Mechanism: `Types::seal` erases
+a foreign opaque record's contents and the checker re-asks each flow's subtyping sealed
+— at `assignable`, at `as`, at `is`, and member-wise at dispatch/`where`-bound targets.
+Design, full route enumeration and residue: `docs/design/opacity.md`. Each route is a
+corpus file under `tests/lang/records/opaque_*`.
 
-```neon
-internal mod vault { opaque record Secret { code: i64 } }
+Also closed since: **construction/forgery** in its direct spellings. `as` to a foreign
+opaque target requires the source to vouch for it — by naming it, or by being broad
+enough to have held one — so `{code:99} as Secret` and the anonymous-literal spellings
+are rejected statically (opaque_no_anonymous_forgery.neon, ratcheted), while recovering
+a held one from a `Secret | str` still works.
 
-fn peek(s: {code: i64}) -> i64 { s.code }   // never names Secret. Prints 7.
-```
+Still open here: **both `any` directions** (opaque_no_any_laundering.neon, unlisted).
+The read is accepted but dead at run time (nominal tags make the structural `is` false);
+the forge — `let a: any = {code:99}; a as Secret` — actually works. Neither closes
+statically: `any` can legitimately hold an opaque, so a cast out of it is
+indistinguishable from the pinned erased-recovery idiom, and a rule strict enough to
+stop the forge broke five corpus files when tried. Both want the same runtime fix — tag
+comparison on `as`-from-`any`, which is a general soundness fix anyway.
 
-`opaque` is an **access check on a name**, in `check.rs`. The type system is **structural** —
-a nominal record is an ordinary record carrying a `#nominal` field, and a structural
-parameter matches it on width. So the check guards the name while the type system routes
-around it.
-
-This is not the same as item 1 and will not be fixed by qualifying nominal identity. It
-needs a decision:
-
-- an opaque record does not satisfy a structural type outside its module (makes `opaque`
-  real, and costs the structural-width subtyping that `structural_param_accepts_nominal.neon`
-  currently pins);
-- or `opaque` is advisory, and `std::fs`'s guard is documentation rather than enforcement —
-  in which case say so, because the resources design leans on it.
-
-Verified today. Both holes together mean the opacity enforcement added this morning stops
-an honest mistake and stops nothing deliberate.
+Item 1 is resolved too, so `opaque` now stops name collision as well as structural escape
+and direct forgery.
 
 ### 2. Interpolating a dispatched call miscompiles
 

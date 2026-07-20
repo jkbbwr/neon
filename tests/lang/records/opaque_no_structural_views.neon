@@ -1,0 +1,66 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can be viewed as a structural type
+
+// The type-directed half of opacity. `Secret <: {code: i64}` is simply true — nominal
+// satisfies structural by design — so without a gate the contents walk out through any
+// position with a structural expected type, none of which is a field read, a literal or
+// a destructuring. The checker seals the foreign record (erases its contents) and
+// re-asks the subtyping at every flow: if it only held through the contents, the flow
+// is the module reaching inside.
+//
+// One behaviour, five spellings of the same flow: an argument, an annotation, a return
+// position, a record field, a list element. A lambda's annotated parameter and a
+// function value's contravariant slot are the same rule and live in this file too.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    fn peek(x: { code: i64 }) -> i64 { x.code }
+
+    // Argument position.
+    fn via_arg(s: vault::Secret) -> i64 { peek(s) }
+
+    // Annotation.
+    fn via_let(s: vault::Secret) -> i64 {
+        let v: { code: i64 } = s;
+        v.code
+    }
+
+    // Return position.
+    fn via_return(s: vault::Secret) -> { code: i64 } { s }
+
+    // A record field of our own record.
+    record Wrapper { inner: { code: i64 } }
+    fn via_field(s: vault::Secret) -> i64 {
+        let w = Wrapper { inner: s };
+        w.inner.code
+    }
+
+    // A list element.
+    fn via_list(s: vault::Secret) -> i64 {
+        let l: List[{ code: i64 }] = [s];
+        l[0].code
+    }
+
+    // A lambda's annotated parameter.
+    fn via_lambda(s: vault::Secret) -> i64 {
+        let f = (x: { code: i64 }) => x.code;
+        f(s)
+    }
+
+    // Contravariance: a function reading the structural view, smuggled into a slot
+    // typed to take the nominal. `seal` rewrites arrow parameters too.
+    fn via_contra(s: vault::Secret) -> i64 {
+        let f: (vault::Secret) -> i64 = (x: { code: i64 }) => x.code;
+        f(s)
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

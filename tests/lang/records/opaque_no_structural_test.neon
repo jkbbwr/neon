@@ -1,0 +1,34 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can be tested against a structural view
+
+// `is` against a structural shape is introspection of an opaque value — and in a match
+// arm it is worse than a probe: the test *narrows*, intersecting the structural atom
+// into the binding's type, where the flow gate could no longer tell it from honest
+// knowledge (`Secret ∧ {code: i64} <: {code: i64}` holds with or without the
+// contents). Naming the record — `is vault::Secret` on a union — stays legal; see the
+// companion passing test.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    fn probe(s: vault::Secret) -> bool { s is { code: i64 } }
+
+    fn narrow_then_read(s: vault::Secret) -> i64 {
+        match s {
+            is { code: i64 } => {
+                let v: { code: i64 } = s;
+                v.code
+            },
+            _ => 0,
+        }
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

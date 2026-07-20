@@ -1,0 +1,32 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can be viewed as a structural type
+
+// Generic instantiation is not a way around the flow gate. `id(s)` binds `T := Secret`
+// and returns a `Secret`, so the structural view is asked for one flow later — and the
+// gate is at every flow, not at any particular syntax. The turbofish asks at the call
+// itself: `T := {code: i64}` makes the parameter a structural view and the argument
+// check rejects it.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn seal(n: i64) -> Secret { Secret { code: n } }
+}
+
+internal mod thief {
+    fn id[T](x: T) -> T { x }
+
+    fn inferred(s: vault::Secret) -> i64 {
+        let v: { code: i64 } = id(s);
+        v.code
+    }
+
+    fn turbofished(s: vault::Secret) -> i64 {
+        id[{ code: i64 }](s).code
+    }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

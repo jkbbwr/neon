@@ -15,10 +15,30 @@ pub fn to_executable(checked: &Checked, out: &Path, cfg: &BuildConfig) -> Result
     let libs: Vec<(Vec<String>, &_)> =
         checked.libs.iter().map(|(p, m)| (p.clone(), m)).collect();
     let program = ir::compile(&checked.env, &checked.result, &checked.module, &libs, Stage::Final);
-    let c_source = c::emit(&program);
+    link(&c::emit(&program), out, cfg)
+}
 
+/// Lower a checked program to a *test* executable: `test` blocks become functions and the
+/// entry point dispatches to one of them, instead of `main` being the entry point. The
+/// build configuration is the ordinary one, so a test runs against the same codegen a real
+/// program gets.
+pub fn to_test_executable(
+    checked: &Checked,
+    tests: &[neon_compiler::ir::lower::TestEntry],
+    out: &Path,
+    cfg: &BuildConfig,
+) -> Result<()> {
+    let libs: Vec<(Vec<String>, &_)> =
+        checked.libs.iter().map(|(p, m)| (p.clone(), m)).collect();
+    let program = ir::compile_tests(&checked.env, &checked.result, &checked.module, &libs);
+    link(&c::emit_tests(&program, tests), out, cfg)
+}
+
+/// Write the emitted C beside `out` and hand it to the configured C compiler along with the
+/// runtime archive.
+fn link(c_source: &str, out: &Path, cfg: &BuildConfig) -> Result<()> {
     let c_file = out.with_extension("c");
-    std::fs::write(&c_file, &c_source).map_err(|e| eyre!("writing {}: {e}", c_file.display()))?;
+    std::fs::write(&c_file, c_source).map_err(|e| eyre!("writing {}: {e}", c_file.display()))?;
 
     // The runtime is a prebuilt archive, not a pile of `.c` files: one variant per build
     // shape, built once by cmake (`runtime/CMakeLists.txt`). A build used to recompile

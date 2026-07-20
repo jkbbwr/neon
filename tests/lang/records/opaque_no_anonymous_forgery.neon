@@ -1,0 +1,41 @@
+//@ compile-fail
+//@ error-contains: is opaque, so it can be built
+
+// Construction has a nameless spelling: an anonymous literal filling a nominal
+// expected type builds that nominal — `let s: vault::Secret = { code: 99 }` is
+// `vault::Secret { code: 99 }` minus the name, in annotation or argument position.
+// The named literal has been checked since opacity landed; the anonymous one built
+// the record and returned the expected type itself, so the flow gate compared
+// `Secret` to `Secret` and saw nothing. Same rule now, asked by the target's name.
+//
+// The cast spelling (`{ code: 99 } as vault::Secret`) is closed by the cast gate's
+// symmetric sealed rule — neither side subsumes the other with the contents erased —
+// and lives in opaque_no_structural_cast.neon's family.
+
+use std::io;
+
+internal mod vault {
+    opaque record Secret { code: i64 }
+    fn value(s: Secret) -> i64 { s.code }
+}
+
+internal mod thief {
+    // Annotation position.
+    fn by_let() -> vault::Secret {
+        let s: vault::Secret = { code: 99 };
+        s
+    }
+
+    // Argument position: the parameter's type is the expected type.
+    fn by_arg() -> i64 { vault::value({ code: 99 }) }
+
+    // The cast spelling of the same fabrication. Closed by `opaque_view`'s forgery rule:
+    // the target names an opaque, and a `{ code: i64 }` source neither names it nor is
+    // broad enough to have held one -- outside `vault` the assignable gate refuses
+    // `Secret -> { code: i64 }`, so a value of that type provably never was a `Secret`.
+    fn by_cast() -> vault::Secret { { code: 99 } as vault::Secret }
+}
+
+fn main() {
+    io::println("this must not compile");
+}

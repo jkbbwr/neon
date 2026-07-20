@@ -31,6 +31,10 @@ pub struct Selection {
     /// and no more.
     pub ret: TyId,
     pub throws: TyId,
+    /// Which argument the dispatch was decided on, when one was. The checker's opacity
+    /// gate needs it: an impl whose target is a structural type is a structural view of
+    /// whatever flows into it, and the receiver is the value that flows.
+    pub receiver_pos: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,10 +122,11 @@ pub fn resolve(
             resolution: Resolution::Bound { param, protocol },
             ret,
             throws,
+            receiver_pos: position,
         });
     }
 
-    applicable(env, protocol, method, receiver)
+    applicable(env, protocol, method, receiver, position)
 }
 
 /// Dispatch for a constructor-subject protocol. The impl is chosen by matching the
@@ -180,7 +185,8 @@ fn hkt_resolve(
             }
         },
     };
-    Ok(Selection { protocol, resolution: Resolution::Direct(impl_id), ret, throws })
+    let receiver_pos = if args.is_empty() { None } else { Some(0) };
+    Ok(Selection { protocol, resolution: Resolution::Direct(impl_id), ret, throws, receiver_pos })
 }
 
 /// The constructor name of a nominal type -- `Box[i64]` → `"Box"` -- read from the
@@ -203,6 +209,7 @@ fn applicable(
     protocol: ProtocolId,
     method: &str,
     receiver: TyId,
+    receiver_pos: Option<usize>,
 ) -> Result<Selection, DispatchError> {
     // An emptiness query per candidate, not a name match.
     let mut hits: Vec<(ImplId, TyId)> = Vec::new();
@@ -247,7 +254,7 @@ fn applicable(
             Resolution::Switch(arms)
         }
     };
-    Ok(Selection { protocol, resolution, ret, throws })
+    Ok(Selection { protocol, resolution, ret, throws, receiver_pos })
 }
 
 /// Drop any impl strictly less specific than another that also applies.

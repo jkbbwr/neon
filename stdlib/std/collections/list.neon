@@ -4,8 +4,14 @@
 // `Map[K, V]` is not a functor over one parameter, so it iterates through
 // `map::values`/`map::keys` first. See docs/design/stdlib.md.
 //
-// The impl below is not an orphan: `List` is declared in the prelude, but this module owns
-// the protocol, and owning either end is enough.
+// The impl below is not an orphan: this module declares `List` and owns the protocol.
+// The list itself: nominal, covariant in `T`, and opaque -- the storage is native, so
+// there is nothing to expose and nothing a caller could correctly build. Declared here
+// rather than in the prelude so that THIS module owns it: opacity is decided by the
+// declaring module's subtree, and the prelude's path is the root, which every program
+// shares. See docs/design/opacity.md.
+opaque record List[T] {}
+
 protocol Mappable for C[_] {
     fn map[T, U](c: C[T], f: (T) -> U) -> C[U]
     fn filter[T](c: C[T], keep: (T) -> bool) -> C[T]

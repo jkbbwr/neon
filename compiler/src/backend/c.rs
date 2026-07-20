@@ -29,6 +29,26 @@ use std::fmt::Write;
 
 /// Emit the whole program as C source.
 pub fn emit(program: &Program) -> String {
+    emit_with(program, None)
+}
+
+/// Emit a test binary: the same translation unit, but the entry point dispatches to one
+/// `test` block instead of calling `main`.
+///
+/// **One test per process, selected by `NEON_TEST`.** The alternative — an entry point that
+/// walks the whole table — cannot survive the first failure, because a failed assertion
+/// calls `neon_panic`, which exits. Running each block in its own process is what lets the
+/// runner report the second test after the first one has died, and it contains a crash or a
+/// leaked global as well as it contains an assertion.
+///
+/// The selector is an environment variable rather than `argv` because the generated entry
+/// point is `int main(void)` for every Neon program; reading `getenv` reaches the same
+/// information without giving test binaries a different entry signature from real ones.
+pub fn emit_tests(program: &Program, tests: &[crate::ir::lower::TestEntry]) -> String {
+    emit_with(program, Some(tests))
+}
+
+fn emit_with(program: &Program, tests: Option<&[crate::ir::lower::TestEntry]>) -> String {
     let types = TypeTable::build(program);
     let mut out = String::new();
     out.push_str("#include \"libneon_rt.h\"\n\n");
@@ -56,13 +76,44 @@ pub fn emit(program: &Program) -> String {
         out.push('\n');
     }
 
-    // The C entry point, if this program has a `main`.
-    if program.funcs.iter().any(|f| f.name == "main") {
-        out.push_str(
-            "int main(void) {\n    neon_rt_init();\n    nl_main();\n    return 0;\n}\n",
-        );
+    match tests {
+        Some(tests) => emit_test_entry(&mut out, tests),
+        // The C entry point, if this program has a `main`.
+        None => {
+            if program.funcs.iter().any(|f| f.name == "main") {
+                out.push_str(
+                    "int main(void) {\n    neon_rt_init();\n    nl_main();\n    return 0;\n}\n",
+                );
+            }
+        }
     }
     reindent(&out)
+}
+
+/// The test binary's entry point: run the one block `NEON_TEST` names, and nothing else.
+///
+/// Exit 0 for a block that returned, 2 for a selector that named no test. A *failed*
+/// assertion never reaches either — `neon_panic` exits the process itself — which is
+/// exactly the split the runner reads: a clean 0 is a pass, anything else is a failure with
+/// the panic's message on stderr.
+fn emit_test_entry(out: &mut String, tests: &[crate::ir::lower::TestEntry]) {
+    // `getenv`/`strtol` and `fputs`; the runtime header does not promise either.
+    out.push_str("#include <stdlib.h>\n#include <stdio.h>\n\n");
+    out.push_str("int main(void) {\n");
+    out.push_str("    const char *which = getenv(\"NEON_TEST\");\n");
+    out.push_str("    if (which == NULL) {\n");
+    out.push_str(
+        "        fputs(\"neon: this is a test binary; set NEON_TEST to a test index\\n\", stderr);\n",
+    );
+    out.push_str("        return 2;\n    }\n");
+    out.push_str("    neon_rt_init();\n");
+    out.push_str("    switch (strtol(which, NULL, 10)) {\n");
+    for (i, t) in tests.iter().enumerate() {
+        let _ = writeln!(out, "    case {i}: {}(); return 0;", mangle(&t.symbol));
+    }
+    out.push_str("    default: break;\n    }\n");
+    out.push_str("    fputs(\"neon: no such test\\n\", stderr);\n");
+    out.push_str("    return 2;\n}\n");
 }
 
 /// Lay out the finished source. Indentation is *derived* here from brace nesting rather

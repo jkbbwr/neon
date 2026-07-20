@@ -11,11 +11,14 @@ use crate::{lexer, parser};
 /// `std/collections/list.neon` → `["std","collections","list"]`.
 pub fn module_path(rel: &str) -> Vec<String> {
     let rel = rel.strip_suffix(".neon").unwrap_or(rel);
-    // The prelude is declared at the root, so `Display`, `Ordering` and the rest
-    // resolve by their short names from any module without a `use` — which is what
-    // being in the prelude means.
+    // The prelude gets a path of its own — one no source can write. Resolution consults
+    // it *last*, after every scope the caller is in, which is what makes `Display`,
+    // `Ordering` and the rest resolve by short name from anywhere while still letting a
+    // program shadow any of them. It used to be declared at the root, `[]`, which is also
+    // every program's own module path; see `Env::PRELUDE` for the four defects that one
+    // collision caused.
     if rel == "prelude" {
-        return Vec::new();
+        return vec![crate::typecheck::env::Env::PRELUDE.to_string()];
     }
     rel.split(['/', '\\']).filter(|s| !s.is_empty()).map(String::from).collect()
 }
@@ -57,8 +60,13 @@ mod tests {
     fn module_path_from_relative() {
         assert_eq!(module_path("std/io.neon"), vec!["std", "io"]);
         assert_eq!(module_path("std/collections/list.neon"), vec!["std", "collections", "list"]);
-        // The prelude declares at the root, so its short names need no `use`.
-        assert_eq!(module_path("prelude.neon"), Vec::<String>::new());
+        // The prelude declares at a path of its own, which resolution consults last so
+        // its short names need no `use` and a program can still shadow any of them. NOT
+        // the root: that is the program's own path, and sharing it made prelude opaques
+        // reachable from every program and prelude `use` re-exports unshadowable.
+        assert_eq!(module_path("prelude.neon"), vec![crate::typecheck::env::Env::PRELUDE]);
+        // Only the toolchain's own `prelude.neon` is special; a file that merely happens
+        // to be named `prelude` inside a library is an ordinary module.
         assert_eq!(module_path("std/prelude.neon"), vec!["std", "prelude"]);
     }
 

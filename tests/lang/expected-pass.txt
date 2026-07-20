@@ -41,6 +41,7 @@ basics/rebinding.neon
 basics/shadowing.neon
 basics/shadowing_changes_type.neon
 basics/str_literals.neon
+basics/test_blocks_do_not_run.neon
 closures/capture_is_by_value_and_sealed.neon
 closures/capture_local.neon
 closures/closure_outlives_its_scope.neon
@@ -100,6 +101,7 @@ control/while_is_guard_on_nullable.neon
 control/while_is_guard_on_record_chain.neon
 control/while_is_guard_still_discriminates.neon
 control/while_loop.neon
+errors/assert_reports_its_operands.neon
 errors/bare_throwing_call_fails.neon
 errors/catch_internal_match.neon
 errors/main_implicitly_throws_error.neon
@@ -153,6 +155,9 @@ match/non_exhaustive_null_fails.neon
 match/null_union.neon
 match/record_pattern_binds_fields.neon
 match/sum_type_destructure.neon
+modules/cannot_squat_a_library_ancestor_path.neon
+modules/imports_do_not_cross_unit_boundaries.neon
+modules/prelude_names_can_be_shadowed.neon
 operators/and_or_precedence.neon
 operators/bitwise.neon
 operators/bool_ops.neon
@@ -210,7 +215,16 @@ records/declare_construct_access.neon
 records/generic.neon
 records/nested.neon
 records/nullable_field.neon
+records/opaque_cannot_graft_into_owner_module.neon
 records/opaque_hides_its_contents.neon
+records/opaque_no_anonymous_forgery.neon
+records/opaque_no_generic_laundering.neon
+records/opaque_no_structural_cast.neon
+records/opaque_no_structural_impl.neon
+records/opaque_no_structural_test.neon
+records/opaque_no_structural_views.neon
+records/opaque_no_union_field_read.neon
+records/opaque_nominal_flows_stay_legal.neon
 records/opaque_values_still_travel.neon
 records/recursive_equality.neon
 records/recursive_mutual.neon
@@ -237,6 +251,7 @@ strings/utf8_find_is_byte_offset.neon
 strings/utf8_len_is_bytes.neon
 strings/utf8_slice_splits_sequence.neon
 types/a_module_path_may_not_be_forged.neon
+types/a_nominal_name_is_not_a_module_identity.neon
 types/alias_is_transparent.neon
 types/an_alias_does_not_rename_a_primitive.neon
 types/any_is_the_only_erasure.neon

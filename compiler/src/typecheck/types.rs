@@ -1115,6 +1115,235 @@ impl Types {
         }
     }
 
+    /// Whether `ty` mentions a record atom whose `#nominal` tag is one of `hidden` —
+    /// anywhere: a field, a generic argument slot, a tuple element, an arrow's
+    /// parameters, positive or negated. The cheap pre-check for `seal`: a type that
+    /// mentions none of the hidden names seals to itself semantically, so the caller
+    /// can skip the rebuild.
+    pub fn mentions(&self, ty: TyId, hidden: &std::collections::HashSet<NameId>) -> bool {
+        if hidden.is_empty() {
+            return false;
+        }
+        let mut visited = std::collections::HashSet::new();
+        self.mentions_rec(ty, hidden, &mut visited)
+    }
+
+    fn mentions_rec(
+        &self,
+        ty: TyId,
+        hidden: &std::collections::HashSet<NameId>,
+        visited: &mut std::collections::HashSet<TyId>,
+    ) -> bool {
+        if !visited.insert(ty) {
+            return false;
+        }
+        let d = self.data(ty);
+        for (pos, neg) in self.rec_bdd.paths(d.records) {
+            for i in pos.iter().chain(&neg) {
+                let a = &self.rec_atoms[*i as usize];
+                if let Some(n) = self.atom_tag(a) {
+                    if hidden.contains(&n) {
+                        return true;
+                    }
+                }
+                if a.fields.iter().any(|&(_, t)| self.mentions_rec(t, hidden, visited))
+                    || self.mentions_rec(a.rest, hidden, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        for (pos, neg) in self.tup_bdd.paths(d.tuples) {
+            for i in pos.iter().chain(&neg) {
+                let a = &self.tup_atoms[*i as usize];
+                if a.elems.iter().any(|&t| self.mentions_rec(t, hidden, visited)) {
+                    return true;
+                }
+            }
+        }
+        for (pos, neg) in self.arrow_bdd.paths(d.arrows) {
+            for i in pos.iter().chain(&neg) {
+                let a = &self.arrow_atoms[*i as usize];
+                if a.params.iter().any(|&t| self.mentions_rec(t, hidden, visited))
+                    || self.mentions_rec(a.throws, hidden, visited)
+                    || self.mentions_rec(a.ret, hidden, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The `#nominal` tag of a record atom, when it is a single positive atom name.
+    fn atom_tag(&self, a: &RecordAtom) -> Option<NameId> {
+        let tag = a.get(self.nominal_label);
+        let td = self.data(tag);
+        let atoms = self.atomset_of(td.atoms);
+        (!atoms.neg && atoms.names.len() == 1).then(|| atoms.names[0])
+    }
+
+    /// `ty` with the contents of every `hidden` nominal record erased.
+    ///
+    /// A record atom whose `#nominal` tag is in `hidden` keeps its identity — the tag and
+    /// the reserved `#`-labelled slots (generic arguments, a newtype's `#inner`), each
+    /// itself sealed — and loses everything its declaration says about user fields:
+    /// they are dropped and `rest` widens to `any_or_undef`, so the sealed atom knows
+    /// *which* type it is but not what is inside one.
+    ///
+    /// This is how opacity gets asked as a subtyping question without threading a module
+    /// into `empty.rs`: `seal(a) <: seal(b)` holds exactly when `a <: b` holds *without
+    /// using the hidden records' contents*. Both sides are sealed so that naming the
+    /// record (`let x: Secret = s`) still checks — the erasure cancels out — while a
+    /// structural view (`let x: {code: i64} = s`) needed the contents and now fails.
+    ///
+    /// Same walk as `substitute`, cycle guard included; see that function for why the
+    /// rebuild goes out to DNF paths and back.
+    pub fn seal(&mut self, ty: TyId, hidden: &std::collections::HashSet<NameId>) -> TyId {
+        if hidden.is_empty() {
+            return ty;
+        }
+        let mut p = Progress::default();
+        self.seal_rec(ty, hidden, &mut p)
+    }
+
+    fn seal_rec(
+        &mut self,
+        ty: TyId,
+        hidden: &std::collections::HashSet<NameId>,
+        p: &mut Progress,
+    ) -> TyId {
+        if let Some(&done) = p.done.get(&ty) {
+            return done;
+        }
+        match p.active.get(&ty) {
+            Some(&Some(r)) => return r,
+            Some(&None) => {
+                let r = self.reserve();
+                p.active.insert(ty, Some(r));
+                return r;
+            }
+            None => {}
+        }
+        p.active.insert(ty, None);
+        let out = self.seal_body(ty, hidden, p);
+        let slot = p.active.remove(&ty).flatten();
+        let out = match slot {
+            Some(r) => {
+                assert!(
+                    !self.undefined.contains(&out),
+                    "seal: a cyclic result was still a deferred boolean op"
+                );
+                let d = self.data(out);
+                self.define(r, d);
+                r
+            }
+            None => out,
+        };
+        p.done.insert(ty, out);
+        out
+    }
+
+    fn seal_body(
+        &mut self,
+        ty: TyId,
+        hidden: &std::collections::HashSet<NameId>,
+        p: &mut Progress,
+    ) -> TyId {
+        let d = self.data(ty);
+        // Base, atoms and variables carry no record contents; only the three shape
+        // kinds are rebuilt.
+        let mut e = self.empty_data();
+        e.base = d.base;
+        e.atoms = d.atoms;
+        e.vars = d.vars;
+        let mut acc = self.intern(e);
+        acc = self.seal_kind(acc, d.records, hidden, Kind::Record, p);
+        acc = self.seal_kind(acc, d.tuples, hidden, Kind::Tuple, p);
+        acc = self.seal_kind(acc, d.arrows, hidden, Kind::Arrow, p);
+        acc
+    }
+
+    fn seal_kind(
+        &mut self,
+        acc: TyId,
+        bdd: BddId,
+        hidden: &std::collections::HashSet<NameId>,
+        kind: Kind,
+        p: &mut Progress,
+    ) -> TyId {
+        let paths = match kind {
+            Kind::Record => self.rec_bdd.paths(bdd),
+            Kind::Tuple => self.tup_bdd.paths(bdd),
+            Kind::Arrow => self.arrow_bdd.paths(bdd),
+        };
+        let mut acc = acc;
+        for (pos, neg) in paths {
+            let mut pt = self.kind_top(kind);
+            for i in pos {
+                let a = self.seal_atom(i, hidden, kind, p);
+                pt = self.intersect(pt, a);
+            }
+            for j in neg {
+                let a = self.seal_atom(j, hidden, kind, p);
+                pt = self.diff(pt, a);
+            }
+            acc = self.union(acc, pt);
+        }
+        acc
+    }
+
+    fn seal_atom(
+        &mut self,
+        idx: u32,
+        hidden: &std::collections::HashSet<NameId>,
+        kind: Kind,
+        p: &mut Progress,
+    ) -> TyId {
+        match kind {
+            Kind::Record => {
+                let a = self.rec_atoms[idx as usize].clone();
+                if self.atom_tag(&a).is_some_and(|n| hidden.contains(&n)) {
+                    // A hidden record: identity stays, contents go. The `#`-labelled
+                    // slots are identity (the tag, generic arguments, `#inner`) and are
+                    // kept — sealed themselves, since a generic argument can carry
+                    // another hidden record. User fields are dropped and `rest` widens,
+                    // so nothing about their presence, absence or type survives.
+                    let fields = a
+                        .fields
+                        .iter()
+                        .filter(|&&(l, _)| self.name_str(l).starts_with('#'))
+                        .map(|&(l, t)| (l, t))
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|(l, t)| (l, self.seal_rec(t, hidden, p)))
+                        .collect();
+                    let rest = self.any_or_undef();
+                    return self.record(RecordAtom { fields, rest });
+                }
+                let fields = a
+                    .fields
+                    .iter()
+                    .map(|&(l, t)| (l, self.seal_rec(t, hidden, p)))
+                    .collect();
+                let rest = self.seal_rec(a.rest, hidden, p);
+                self.record(RecordAtom { fields, rest })
+            }
+            Kind::Tuple => {
+                let a = self.tup_atoms[idx as usize].clone();
+                let elems = a.elems.iter().map(|&t| self.seal_rec(t, hidden, p)).collect();
+                self.tuple(elems)
+            }
+            Kind::Arrow => {
+                let a = self.arrow_atoms[idx as usize].clone();
+                let params = a.params.iter().map(|&t| self.seal_rec(t, hidden, p)).collect();
+                let throws = self.seal_rec(a.throws, hidden, p);
+                let ret = self.seal_rec(a.ret, hidden, p);
+                self.arrow(params, throws, ret)
+            }
+        }
+    }
+
     /// Fold a union, starting from `never` so that the empty slice gives `never` — the
     /// identity, and the right answer for an enum with no variants or a match with no
     /// arms.

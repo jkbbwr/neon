@@ -1,0 +1,30 @@
+// A program's imports are its own. They are inherited *down* its module tree, and they
+// stop at the edge of the compilation unit.
+//
+// Both halves matter, and the second was a real hijack. Every module's scope walk bottoms
+// out at `""` -- the root application's scope -- so a program's root `use` was consulted
+// while resolving names inside the STDLIB. `use mine::List` at a program's root made
+// `std::string`'s own `List[str]` resolve to the program's record, and the error surfaced
+// deep in stdlib code the program never called. `use` bindings now carry the unit that
+// wrote them and are only consulted by that unit (the prelude excepted, which is what
+// makes its re-exports reach everywhere).
+//
+// Here `mine::Marker` shadows nothing of the stdlib's, is inherited by a nested module,
+// and does not disturb the stdlib functions called either side of it.
+
+use std::io;
+use std::string;
+
+record Marker { tag: str }
+
+internal mod inner {
+    // Inherited from the root: no `use std::io` of its own, and `Marker` resolves to the
+    // program's record because a nested module is inside its parent's scope.
+    fn describe(m: Marker) -> str { string::concat("inner sees ", m.tag) }
+}
+
+fn main() {
+    // The stdlib still resolves its own names, unaffected by anything imported here.
+    io::println(string::concat("std ", "intact"));
+    io::println(inner::describe(Marker { tag: "the program's Marker" }));
+}
