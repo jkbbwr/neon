@@ -48,40 +48,41 @@ defmodule Brainfuck do
     end
   end
 
+  # :atomics is 1-indexed, so we offset ptr by 1
   def execute(ops, tape, ptr) do
-    Enum.reduce(ops, {tape, ptr}, fn op, {t, p} ->
+    Enum.reduce(ops, ptr, fn op, p ->
       case op do
         {:add, val} ->
-          curr = :array.get(p, t)
-          {:array.set(p, curr + val, t), p}
+          :atomics.add(tape, p + 1, val)
+          p
         {:move, val} ->
-          {t, p + val}
+          p + val
         {:out} ->
-          IO.write(to_string(:array.get(p, t)))
-          {t, p}
+          IO.write(to_string(:atomics.get(tape, p + 1)))
+          p
         {:in} ->
-          {t, p}
+          p
         {:loop, body} ->
-          loop_execute(body, t, p)
+          loop_execute(body, tape, p)
       end
     end)
   end
 
   defp loop_execute(body, tape, ptr) do
-    if :array.get(ptr, tape) != 0 do
-      {t2, p2} = execute(body, tape, ptr)
-      loop_execute(body, t2, p2)
+    if :atomics.get(tape, ptr + 1) != 0 do
+      p2 = execute(body, tape, ptr)
+      loop_execute(body, tape, p2)
     else
-      {tape, ptr}
+      ptr
     end
   end
 
   def main do
     program = "++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>+<-]<-]<-]<-]<-]<-]<-]<-]"
     ops = parse(program)
-    tape = :array.new(30000, default: 0)
-    {final_tape, _ptr} = execute(ops, tape, 0)
-    val = :array.get(8, final_tape)
+    tape = :atomics.new(30000, signed: true)
+    _ptr = execute(ops, tape, 0)
+    val = :atomics.get(tape, 8 + 1)
     IO.puts("Result: #{val}")
   end
 end

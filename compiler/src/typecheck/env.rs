@@ -496,6 +496,9 @@ pub struct FnSig {
     /// `@pure`: this native has no effect beyond its return value, so a call whose
     /// result is unused may be deleted. Declared, never guessed, and never assumed.
     pub pure: bool,
+    /// `@inline`: emit this function so the C compiler must inline it at every call
+    /// site. See the `Inline` processor in `expand.rs` for when that is worth asking.
+    pub inline: bool,
     pub span: Span,
 }
 
@@ -1283,6 +1286,7 @@ impl Env {
         FnSig {
             name: f.name.clone(),
             pure: f.annotations.iter().any(|a| a.name == "pure"),
+            inline: f.annotations.iter().any(|a| a.name == "inline"),
             module: module.to_vec(),
             generics: f.generics.clone(),
             params,

@@ -110,12 +110,14 @@ fn lookup(name: &str) -> Option<&'static dyn Processor> {
     static DOC: Doc = Doc;
     static RUNTIME: Runtime = Runtime;
     static PURE: Pure = Pure;
+    static INLINE: Inline = Inline;
     match name {
         "native" => Some(&NATIVE),
         "cfg" => Some(&CFG),
         "doc" => Some(&DOC),
         "runtime" => Some(&RUNTIME),
         "pure" => Some(&PURE),
+        "inline" => Some(&INLINE),
         _ => None,
     }
 }
@@ -307,6 +309,44 @@ impl Processor for Pure {
             other => cx.error(
                 ann.span.clone(),
                 format!("`@pure` is only for a `fn`, not a `{}`", other.what()),
+            ),
+        }
+        Decision::Keep
+    }
+}
+
+/// `@inline` — emit the function so the C compiler must inline it at every call site.
+///
+/// A hint would do nothing: measured on the brainfuck benchmark, `__builtin_expect` on the
+/// cold branch, outlining the cold path, and `static` linkage each moved it under 4%, and
+/// only forcing the inline moved it at all (23%). So this is `always_inline`, not `inline`.
+///
+/// It is for a *small wrapper around a primitive* -- `list::set` is a bounds check and a
+/// call -- where the call and its tagged-result return cost more than the body. Asking for
+/// it on anything substantial trades size for nothing, which is why it is opt-in per
+/// declaration rather than a heuristic.
+///
+/// Rejected on an `@native` fn: there is no body to inline, only a declaration of one that
+/// lives in the runtime archive.
+struct Inline;
+impl Processor for Inline {
+    fn run(&self, ann: &Annotation, target: &Target, cx: &mut Context) -> Decision {
+        match target {
+            Target::Fn(f) => {
+                if ann.arg.is_some() {
+                    cx.error(ann.span.clone(), "`@inline` takes no argument");
+                }
+                if f.annotations.iter().any(|a| a.name == "native") {
+                    cx.error(
+                        ann.span.clone(),
+                        "`@inline` is not for an `@native` fn: its body is in the runtime \
+                         archive, and there is nothing here to inline",
+                    );
+                }
+            }
+            other => cx.error(
+                ann.span.clone(),
+                format!("`@inline` is only for a `fn`, not a `{}`", other.what()),
             ),
         }
         Decision::Keep

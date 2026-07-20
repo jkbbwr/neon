@@ -126,6 +126,7 @@ functions/explicit_type_arguments.neon
 functions/generic_calls_generic.neon
 functions/generic_identity.neon
 functions/higher_order.neon
+functions/inline_annotation.neon
 functions/instance_identity_spells_its_arguments.neon
 functions/lambda_in_generic.neon
 functions/mutual_recursion.neon

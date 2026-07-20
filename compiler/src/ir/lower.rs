@@ -510,7 +510,23 @@ pub fn lower_module_with<'a>(
         .filter(|s| s.pure)
         .filter_map(|s| s.native.clone())
         .collect();
-    Program { funcs, recursive, boxed, pure_natives }
+    // `@inline` fns, by the mangled-in name codegen knows them by. A generic fn is
+    // lowered once per instantiation with a suffixed name, so match on the prefix rather
+    // than on equality -- otherwise `list::set` gets it and `list::set$i64` does not,
+    // which is exactly backwards: the instance is what the hot loop calls.
+    // Through `mangle`, because a `FnSig` carries its module separately from its name
+    // while a `Func` carries the two already joined -- comparing the bare `set` against
+    // `std__collections__list__set` matches nothing, silently.
+    let inline_bases: Vec<String> =
+        env.fns().iter().filter(|s| s.inline).map(|s| mangle(&s.module, &s.name)).collect();
+    let inlined = funcs
+        .iter()
+        .map(|f| f.name.clone())
+        .filter(|n| {
+            inline_bases.iter().any(|b| n == b || n.starts_with(&format!("{b}$")))
+        })
+        .collect();
+    Program { funcs, recursive, boxed, pure_natives, inlined }
 }
 
 /// Index every bodied function by `(module path, name)`, descending into nested `mod`s.

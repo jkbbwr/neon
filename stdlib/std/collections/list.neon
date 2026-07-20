@@ -115,6 +115,11 @@ internal mod raw {
     @pure @native("neon_list_set") fn set_unchecked[T](xs: List[T], i: i64, v: T) -> List[T]
 }
 
+// `@inline` on both: each is a bounds check around a primitive, and the call plus the
+// tagged-result return cost more than the body. Measured on the brainfuck benchmark, where
+// `set` is the hot loop's only write: 1.09s -> 0.84s. gcc will not do this on its own --
+// branch hints, outlining the cold error path and `static` linkage each moved it under 4%.
+@inline
 fn get[T](xs: List[T], i: i64) throws IndexError -> T {
     if i < 0 or i >= len(xs) {
         throw IndexError { message: "index #{i} out of range for length #{len(xs)}" };
@@ -122,6 +127,7 @@ fn get[T](xs: List[T], i: i64) throws IndexError -> T {
     xs[i]
 }
 
+@inline
 fn set[T](xs: List[T], i: i64, v: T) throws IndexError -> List[T] {
     if i < 0 or i >= len(xs) {
         throw IndexError { message: "index #{i} out of range for length #{len(xs)}" };

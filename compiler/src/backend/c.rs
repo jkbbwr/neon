@@ -63,7 +63,7 @@ fn emit_with(program: &Program, tests: Option<&[crate::ir::lower::TestEntry]>) -
 
     // Forward declarations, so call order does not matter.
     for f in &program.funcs {
-        let _ = writeln!(out, "{};", signature(&types, f));
+        let _ = writeln!(out, "{};", signature(&types, f, program.inlined.contains(&f.name)));
     }
     out.push('\n');
 
@@ -72,7 +72,7 @@ fn emit_with(program: &Program, tests: Option<&[crate::ir::lower::TestEntry]>) -
     emit_resource_drops(&mut out, &types, program);
 
     for f in &program.funcs {
-        emit_fn(&mut out, &types, f);
+        emit_fn(&mut out, &types, f, program.inlined.contains(&f.name));
         out.push('\n');
     }
 
@@ -174,7 +174,7 @@ fn net_braces(line: &str) -> i32 {
 
 /// A function's C signature (no trailing `;` or body). A lifted lambda's first parameter
 /// is its boxed environment, received as a `neon_header*`.
-fn signature(types: &TypeTable, f: &Func) -> String {
+fn signature(types: &TypeTable, f: &Func, inlined: bool) -> String {
     let params: Vec<String> = f
         .params
         .iter()
@@ -188,7 +188,12 @@ fn signature(types: &TypeTable, f: &Func) -> String {
         })
         .collect();
     let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
-    format!("{} {}({})", fn_ret_type(types, f), mangle(&f.name), params)
+    // `static inline` as well as the attribute: `always_inline` on an externally visible
+    // function still forces an out-of-line copy to exist, and gcc warns when it cannot
+    // reconcile the two. Internal linkage is correct here anyway -- the whole program is
+    // one translation unit, so nothing outside it can call these.
+    let qual = if inlined { "static inline __attribute__((always_inline)) " } else { "" };
+    format!("{qual}{} {}({})", fn_ret_type(types, f), mangle(&f.name), params)
 }
 
 /// A function's C return type. A throwing function returns its tagged result rather than
@@ -215,8 +220,8 @@ fn c_ret_type(types: &TypeTable, r: &Repr) -> String {
 /// (a `switch` arm) sit inside braces that a declaration would not escape. Block
 /// parameters need this too: `emit_jump` assigns them on the edge, before the jump, which
 /// is only possible if the parameter's storage outlives the block that owns it.
-fn emit_fn(out: &mut String, types: &TypeTable, f: &Func) {
-    let _ = writeln!(out, "{} {{", signature(types, f));
+fn emit_fn(out: &mut String, types: &TypeTable, f: &Func, inlined: bool) {
+    let _ = writeln!(out, "{} {{", signature(types, f, inlined));
 
     // Declare every value as a function-scoped local, except the parameters (already in
     // the signature). Assignments below give each its value before use.
