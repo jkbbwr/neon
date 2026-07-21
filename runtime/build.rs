@@ -22,8 +22,14 @@ fn main() {
     // safe here in a way it never is for a shipped archive. `NEON_RT_NATIVE` in the
     // environment turns it on; the release CI that packages downloadable archives leaves it
     // unset. `CMakeLists.txt` still probes that the compiler accepts the flag.
+    //
+    // Set-but-falsey is off, not on: `NEON_RT_NATIVE=0` reads as "no" everywhere else, and
+    // a build flag that ignores its own value is how someone ends up shipping an archive
+    // they thought they had turned off.
     println!("cargo:rerun-if-env-changed=NEON_RT_NATIVE");
-    let native = std::env::var_os("NEON_RT_NATIVE").is_some();
+    let native = std::env::var("NEON_RT_NATIVE").is_ok_and(|v| {
+        !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "no" | "off" | "false")
+    });
 
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let mut built: Vec<&str> = Vec::new();

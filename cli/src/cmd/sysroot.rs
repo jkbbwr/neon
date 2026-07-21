@@ -1,6 +1,6 @@
 use crate::buildcfg::RuntimeVariant;
 use crate::sysroot::Sysroot;
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{Context, Result};
 
 /// Print the stdlib directory alone, one absolute path on one line, nothing else.
 ///
@@ -12,18 +12,11 @@ use color_eyre::eyre::{bail, Context, Result};
 ///
 /// It goes through `stdlib_dir` rather than `find`, deliberately: type-checking needs only
 /// the stdlib source, so demanding `lib/libneon_rt.a` here would make the editor useless on
-/// a toolchain whose runtime has not been built. The directory is verified to exist,
-/// because `stdlib_dir` composes a path without probing and a phantom path handed to the
-/// LSP would come back as "every stdlib name is unknown" rather than as an error.
+/// a toolchain whose runtime has not been built. `stdlib_dir` probes for a directory that
+/// exists and errors when there is none, which is what this command needs: a phantom path
+/// handed to the LSP comes back as "every stdlib name is unknown" rather than as an error.
 fn print_stdlib() -> Result<()> {
     let dir = Sysroot::stdlib_dir().wrap_err("failed to locate the toolchain")?;
-    if !dir.is_dir() {
-        bail!(
-            "no stdlib directory at '{}'.\n\
-             Set NEON_SYSROOT to a sysroot containing `stdlib/`.",
-            dir.display()
-        );
-    }
     println!("{}", dir.display());
     Ok(())
 }

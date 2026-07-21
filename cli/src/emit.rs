@@ -52,7 +52,8 @@ fn link(c_source: &str, out: &Path, cfg: &BuildConfig) -> Result<()> {
     // and (for the sanitized variant) the sanitizer runtimes agree. A settled-for
     // fallback prints its warning below, same policy as sanitizer widening: allowed,
     // never silent.
-    let archive = sysroot.runtime_lib(variant, cfg.cc_flavor()?)?;
+    let flavor = cfg.cc_flavor()?;
+    let archive = sysroot.runtime_lib(variant, flavor)?;
     // Asking for a strict subset of the sanitized archive's sanitizers links the full set
     // instead — safe, but not something to do behind the user's back.
     if let Some(note) = cfg.sanitizer_widening_note(variant) {
@@ -61,20 +62,29 @@ fn link(c_source: &str, out: &Path, cfg: &BuildConfig) -> Result<()> {
     if let Some(note) = &archive.note {
         eprintln!("{note}");
     }
-    // The build passes `-flto` but the archive it links carries no LTO material for this
-    // `cc` to inline through. Correct, just slow — and otherwise silent, which is exactly
-    // how a no-LTO runtime once shipped on Apple Clang (which rejected the fat-objects
-    // flag the archive was built with). A warning, never a failure: same policy as above.
-    if cfg.uses_lto() && !crate::sysroot::archive_has_lto(&archive.path) {
-        eprintln!(
-            "warning: this build passes `-flto`, but the runtime archive at {} carries no \
-             LTO bitcode, so the runtime's primitives (`neon_list_at`, retain/release, \
-             element writes) stay un-inlinable in hot loops — measured ~2.5x on tight code. \
-             Rebuild or reinstall the toolchain so its archive for `{}` carries LTO \
-             material (a from-source `cargo build --release` on this machine does).",
-            archive.path.display(),
-            cfg.cc,
-        );
+    // The build passes `-flto` but the archive it links carries no LTO material *this*
+    // family can inline through — LTO does not cross families, so a gcc archive's
+    // `.gnu.lto_` is no use to a clang `cc`. Correct, just slow, and otherwise silent,
+    // which is exactly how a no-LTO runtime once shipped on Apple Clang (which rejected
+    // the fat-objects flag the archive was built with). A warning, never a failure: same
+    // policy as above. Skipped when a flavor fallback already printed its note — that note
+    // says the same thing about the same archive.
+    if cfg.uses_lto() && archive.note.is_none() {
+        if let Some(contents) = crate::sysroot::inspect_archive(&archive.path) {
+            if !contents.lto_for(flavor) {
+                eprintln!(
+                    "warning: this build passes `-flto`, but the runtime archive at {} carries no \
+                     LTO material `{}` can read, so the runtime's primitives (`neon_list_at`, \
+                     retain/release, element writes) stay un-inlinable in hot loops — measured \
+                     ~2.5x on tight code. Rebuild or reinstall the toolchain so its `{}` archive \
+                     carries LTO material (a from-source `cargo build --release` on this machine \
+                     does).",
+                    archive.path.display(),
+                    cfg.cc,
+                    flavor.dir(),
+                );
+            }
+        }
     }
     let mut cmd = Command::new(&cfg.cc);
     cmd.args(cfg.cc_args(variant))

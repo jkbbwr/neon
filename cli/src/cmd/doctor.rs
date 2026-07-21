@@ -81,10 +81,30 @@ pub fn run() -> Result<()> {
             if missing.is_empty() {
                 r.ok(&format!("{flavor}/: all three variants present"));
             } else if missing.len() == variants.len() {
+                // `Sysroot::runtime_lib` stands the other flavor's archive in only when it
+                // carries machine code: a bitcode-only one (plain `-flto`, which is the
+                // macOS shape) it refuses, because the other family's linker cannot read a
+                // bitcode member at all. Report whichever of the two this toolchain is —
+                // "loses LTO" and "cannot build" are very different things to plan around.
+                let other = if flavor == "gcc" { "clang" } else { "gcc" };
+                let stand_in = s.lib_dir().join(other).join(RuntimeVariant::Release.archive());
+                let linkable =
+                    crate::sysroot::inspect_archive(&stand_in).is_none_or(|c| c.native_code);
                 r.warn(&format!(
-                    "{flavor}/: no archives — a {flavor} `cc` falls back to another \
-                     flavor's release/debug archive (losing LTO) and cannot do \
-                     sanitized builds"
+                    "{flavor}/: no archives — {}",
+                    if linkable {
+                        format!(
+                            "a {flavor} `cc` falls back to the {other} release/debug archive \
+                             (losing LTO) and cannot do sanitized builds"
+                        )
+                    } else {
+                        format!(
+                            "the {other} archives are LTO bitcode with no machine code in \
+                             them, so a {flavor} `cc` cannot link here at all. Build with \
+                             {other} (`--cc`/`$CC`), or rebuild the toolchain on a machine \
+                             with {flavor} installed"
+                        )
+                    }
                 ));
             } else {
                 r.fail(&format!(

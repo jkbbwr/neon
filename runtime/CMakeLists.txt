@@ -45,6 +45,13 @@ set(NEON_RT_SOURCES
 #     flavor split already provides. So: fat objects when available, plain `-flto` when only
 #     that is (still family-locked, still linkable), no LTO only when neither is.
 #
+#     The one place the flavor split does not hold is `Sysroot::runtime_lib`'s fallback,
+#     which links the other family's archive when a family is missing entirely (on macOS
+#     only `clang` is staged at all, so a mac user with real gcc lands there). A plain
+#     `-flto` archive has no machine code for that link to fall back to, so the CLI checks
+#     for it and refuses with an explanation rather than handing bitcode to a linker that
+#     cannot read it.
+#
 #     The one residual is cross-*version* within a family, in the prebuilt-download install
 #     path: CI's clang builds the archive and the user's clang links it. LLVM bitcode
 #     auto-upgrades across versions, so this degrades gracefully rather than hard-failing
@@ -78,12 +85,15 @@ else()
 endif()
 
 # `-march=native` only when a from-source build opts in (see the note above): safe because
-# such a build targets the machine compiling it, never safe for a shipped archive.
+# such a build targets the machine compiling it, never safe for a shipped archive. Its own
+# variable, not appended to `NEON_RT_LTO`: they are independent switches, and one that
+# hides inside the other's name is one nobody finds again.
 option(NEON_RT_NATIVE "Build the runtime archives with -march=native (from-source only)" OFF)
+set(NEON_RT_ARCH)
 if(NEON_RT_NATIVE)
     check_c_compiler_flag("-march=native" NEON_RT_HAS_NATIVE)
     if(NEON_RT_HAS_NATIVE)
-        list(APPEND NEON_RT_LTO -march=native)
+        set(NEON_RT_ARCH -march=native)
     endif()
 endif()
 
@@ -98,7 +108,9 @@ endfunction()
 
 # `release`: what `Mode::Release` implies, minus `-flto` (above). Also what `OptRelease`
 # links.
-neon_rt_variant(neon_rt -O3 ${NEON_RT_LTO})
+# `-march=native` (when opted in) rides on this variant alone: the other two exist to be
+# debugged, where the build machine's widest instructions buy nothing.
+neon_rt_variant(neon_rt -O3 ${NEON_RT_LTO} ${NEON_RT_ARCH})
 # `debug`: `Mode::Debug`. `NEON_DEBUG` turns on the runtime's own assertions.
 neon_rt_variant(neon_rt_debug -O0 -g -DNEON_DEBUG)
 # `sanitized`: the only variant that carries instrumentation. ASan does not see a
