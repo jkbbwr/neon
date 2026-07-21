@@ -115,7 +115,7 @@ if(NEON_RT_TESTS)
     include(FetchContent)
     FetchContent_Declare(
         minunit
-        GIT_REPOSITORY https://github.com/nanolith/minunit
+        GIT_REPOSITORY https://github.com/jkbbwr/minunit
         GIT_TAG        master
     )
     FetchContent_MakeAvailable(minunit)
